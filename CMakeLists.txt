@@ -8,14 +8,40 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(SAQ_BUILD_SAMPLES "Build SAQ sample programs" ON)
+option(SAQ_REQUIRE_AVX512 "Require AVX-512 support" ON)
+option(SAQ_BUILD_TESTS "Build SAQ test programs" OFF)
+
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+include(FetchContent)
+FetchContent_Declare(
+  taocpp-json
+  GIT_REPOSITORY https://github.com/taocpp/json.git
+  GIT_TAG        1.0.0-beta.14
+)
+FetchContent_MakeAvailable(taocpp-json)
 
 add_library(saq STATIC)
 target_include_directories(saq
   PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
+target_link_libraries(saq
+  PUBLIC
+    taocpp::json
+)
 
-if(SAQ_BUILD_SAMPLES)
-  add_executable(saq_sample sample/saq_sample.cpp)
-  target_link_libraries(saq_sample PRIVATE saq)
+if(SAQ_REQUIRE_AVX512)
+  if(MSVC)
+    target_compile_options(saq PRIVATE /arch:AVX512)
+  else()
+    target_compile_options(saq PRIVATE -mavx512f -mavx512bw -mavx512dq -mavx512vl)
+  endif()
+  target_compile_definitions(saq PUBLIC SAQ_REQUIRE_AVX512=1)
 endif()
+
+if(SAQ_BUILD_TESTS)
+  add_subdirectory(tests)
+endif()
+
+add_subdirectory(src)
