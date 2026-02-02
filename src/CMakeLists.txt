@@ -6,4 +6,5 @@ target_sources(saq
     ${CMAKE_CURRENT_SOURCE_DIR}/bit_allocation_dp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/caq_code_adjustment.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/distance_estimator.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/saq_quantizer.cpp
 )
