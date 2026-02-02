@@ -3,4 +3,5 @@ target_sources(saq
     ${CMAKE_CURRENT_SOURCE_DIR}/quantization_plan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/pca_projection.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dimension_segmentation.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/bit_allocation_dp.cpp
 )
