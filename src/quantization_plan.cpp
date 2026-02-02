@@ -1,3 +1,6 @@
+/// @file quantization_plan.cpp
+/// @brief Implementation of QuantizationPlan serialization.
+
 #include "saq/quantization_plan.h"
 
 #include <cstring>
@@ -7,7 +10,8 @@ namespace saq {
 
 namespace {
 
-constexpr uint32_t kBinaryMagic = 0x53515150; // "SAQP"
+/// Binary format magic number: "PQSA" in little-endian.
+constexpr uint32_t kBinaryMagic = 0x53515150;
 
 void WriteU32(std::vector<uint8_t>* out, uint32_t v) {
   out->push_back(static_cast<uint8_t>(v & 0xFFu));
@@ -16,10 +20,12 @@ void WriteU32(std::vector<uint8_t>* out, uint32_t v) {
   out->push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
 }
 
+/// Write a single byte.
 void WriteU8(std::vector<uint8_t>* out, uint8_t v) {
   out->push_back(v);
 }
 
+/// Read a 32-bit unsigned integer in little-endian format.
 bool ReadU32(const std::vector<uint8_t>& in, size_t* offset, uint32_t* v) {
   if (*offset + 4 > in.size()) { return false; }
   *v = static_cast<uint32_t>(in[*offset]) |
@@ -30,6 +36,7 @@ bool ReadU32(const std::vector<uint8_t>& in, size_t* offset, uint32_t* v) {
   return true;
 }
 
+/// Read a single byte.
 bool ReadU8(const std::vector<uint8_t>& in, size_t* offset, uint8_t* v) {
   if (*offset + 1 > in.size()) { return false; }
   *v = in[*offset];
@@ -37,6 +44,7 @@ bool ReadU8(const std::vector<uint8_t>& in, size_t* offset, uint8_t* v) {
   return true;
 }
 
+/// Write a 32-bit float as a little-endian uint32.
 void WriteF32(std::vector<uint8_t>* out, float v) {
   static_assert(sizeof(float) == 4, "float must be 4 bytes");
   uint32_t u;
@@ -44,6 +52,7 @@ void WriteF32(std::vector<uint8_t>* out, float v) {
   WriteU32(out, u);
 }
 
+/// Read a 32-bit float from little-endian uint32.
 bool ReadF32(const std::vector<uint8_t>& in, size_t* offset, float* v) {
   uint32_t u = 0;
   if (!ReadU32(in, offset, &u)) { return false; }
@@ -51,6 +60,7 @@ bool ReadF32(const std::vector<uint8_t>& in, size_t* offset, float* v) {
   return true;
 }
 
+/// Write a length-prefixed array of floats.
 void WriteF32Array(std::vector<uint8_t>* out, const std::vector<float>& data) {
   WriteU32(out, static_cast<uint32_t>(data.size()));
   for (float f : data) {
@@ -58,7 +68,9 @@ void WriteF32Array(std::vector<uint8_t>* out, const std::vector<float>& data) {
   }
 }
 
-bool ReadF32Array(const std::vector<uint8_t>& in, size_t* offset, std::vector<float>* data) {
+/// Read a length-prefixed array of floats.
+bool ReadF32Array(const std::vector<uint8_t>& in, size_t* offset,
+                  std::vector<float>* data) {
   uint32_t count = 0;
   if (!ReadU32(in, offset, &count)) { return false; }
   data->clear();
@@ -71,7 +83,9 @@ bool ReadF32Array(const std::vector<uint8_t>& in, size_t* offset, std::vector<fl
   return true;
 }
 
-// Convert float vector to JSON array
+// --- JSON serialization helpers ---
+
+/// Convert float vector to JSON array of doubles.
 tao::json::value FloatVecToJson(const std::vector<float>& vec) {
   tao::json::value arr = tao::json::empty_array;
   for (float f : vec) {
@@ -80,7 +94,7 @@ tao::json::value FloatVecToJson(const std::vector<float>& vec) {
   return arr;
 }
 
-// Convert JSON array to float vector
+/// Convert JSON array of numbers to float vector.
 std::vector<float> JsonToFloatVec(const tao::json::value& v) {
   std::vector<float> result;
   if (v.is_array()) {
@@ -92,6 +106,7 @@ std::vector<float> JsonToFloatVec(const tao::json::value& v) {
   return result;
 }
 
+/// Serialize PCAParams to JSON object.
 tao::json::value ToJson(const PCAParams& p) {
   tao::json::value v = tao::json::empty_object;
   v["input_dim"] = static_cast<std::uint64_t>(p.input_dim);
@@ -102,6 +117,7 @@ tao::json::value ToJson(const PCAParams& p) {
   return v;
 }
 
+/// Serialize Segment to JSON object.
 tao::json::value ToJson(const Segment& s) {
   tao::json::value v = tao::json::empty_object;
   v["id"] = static_cast<std::uint64_t>(s.id);
@@ -111,6 +127,7 @@ tao::json::value ToJson(const Segment& s) {
   return v;
 }
 
+/// Serialize Codebook to JSON object.
 tao::json::value ToJson(const Codebook& c) {
   tao::json::value v = tao::json::empty_object;
   v["segment_id"] = static_cast<std::uint64_t>(c.segment_id);
@@ -121,6 +138,7 @@ tao::json::value ToJson(const Codebook& c) {
   return v;
 }
 
+/// Deserialize PCAParams from JSON object.
 bool FromJson(const tao::json::value& v, PCAParams* p) {
   if (!v.is_object()) { return false; }
   p->input_dim = static_cast<uint32_t>(v.at("input_dim").as<std::uint64_t>());
@@ -131,6 +149,7 @@ bool FromJson(const tao::json::value& v, PCAParams* p) {
   return true;
 }
 
+/// Deserialize Segment from JSON object.
 bool FromJson(const tao::json::value& v, Segment* s) {
   if (!v.is_object()) { return false; }
   s->id = static_cast<uint32_t>(v.at("id").as<std::uint64_t>());
@@ -140,6 +159,7 @@ bool FromJson(const tao::json::value& v, Segment* s) {
   return true;
 }
 
+/// Deserialize Codebook from JSON object.
 bool FromJson(const tao::json::value& v, Codebook* c) {
   if (!v.is_object()) { return false; }
   c->segment_id = static_cast<uint32_t>(v.at("segment_id").as<std::uint64_t>());
@@ -150,7 +170,7 @@ bool FromJson(const tao::json::value& v, Codebook* c) {
   return true;
 }
 
-}  // namespace
+}  // anonymous namespace
 
 bool QuantizationPlan::Validate(std::string* error) const {
   if (dimension == 0) {
