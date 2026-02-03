@@ -11,8 +11,12 @@
 /// Architecture follows the RaBitQ-Library pattern:
 /// - FlatInitializer: brute-force centroid search for K < 20,000
 /// - HNSWInitializer: HNSW-based centroid search for K >= 20,000
+///
+/// Optionally supports FastScan for accelerated distance estimation
+/// when all segments use uniform bit allocation (4-bit or 8-bit).
 
 #include "saq/distance_estimator.h"
+#include "index/fast_scan/fast_scan.h"
 #include "saq/quantization_plan.h"
 #include "saq/saq_quantizer.h"
 
@@ -36,6 +40,9 @@ struct IVFConfig {
 
   /// Whether to use HNSW for centroid search (auto-selected based on K).
   bool use_hnsw_initializer = false;
+
+  /// Enable FastScan for distance estimation (requires uniform bit allocation).
+  bool use_fast_scan = true;
 
   /// HNSW M parameter (edges per node).
   uint32_t hnsw_m = 16;
@@ -92,6 +99,7 @@ struct Cluster {
   std::vector<uint32_t> global_ids;      ///< Original vector indices.
   std::vector<uint32_t> codes;           ///< Encoded data (num_vectors × num_segments).
   std::vector<float> residuals;          ///< Residuals from centroid (optional).
+  FastScanCodes packed_codes;            ///< FastScan-packed codes (if enabled).
 };
 
 /// @brief Abstract base class for centroid initialization/search.
@@ -275,6 +283,9 @@ class IVFIndex {
   /// @brief Get the quantization plan.
   const QuantizationPlan& GetPlan() const { return plan_; }
 
+  /// @brief Check if FastScan is enabled.
+  bool UseFastScan() const { return use_fast_scan_; }
+
   /// @brief Get cluster statistics.
   /// @param min_size Output minimum cluster size.
   /// @param max_size Output maximum cluster size.
@@ -287,6 +298,13 @@ class IVFIndex {
   void ScanCluster(const Cluster& cluster, const DistanceTable& table,
                    uint32_t k, std::vector<IVFSearchResult>& heap) const;
 
+  /// @brief Scan a cluster using FastScan.
+  void ScanClusterFastScan(const Cluster& cluster, const FastScanLUT& lut,
+                            uint32_t k, std::vector<IVFSearchResult>& heap) const;
+
+  /// @brief Pack LUT for FastScan.
+  void PackLUTForFastScan(const DistanceTable& table, FastScanLUT& lut) const;
+
   /// @brief Assign a vector to a cluster.
   ClusterAssignment AssignToCluster(const float* vector) const;
 
@@ -296,6 +314,8 @@ class IVFIndex {
 
   // Index state
   bool built_ = false;
+  bool use_fast_scan_ = false;
+  uint32_t fast_scan_bits_ = 0;
   uint32_t num_vectors_ = 0;
   uint32_t dim_ = 0;
   uint32_t num_segments_ = 0;

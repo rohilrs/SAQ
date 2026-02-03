@@ -1,7 +1,8 @@
 /// @file ivf_index.cpp
 /// @brief Implementation of IVF Index for scalable SAQ search.
 
-#include "saq/ivf_index.h"
+#include "index/ivf_index.h"
+#include "index/fast_scan/fast_scan.h"
 #include "saq/simd_kernels.h"
 
 #include <algorithm>
@@ -582,6 +583,52 @@ std::string IVFIndex::Build(const float* data, uint32_t n_vectors,
     }
   }
 
+  // Step 5: Determine if FastScan can be used and pack codes
+  use_fast_scan_ = config.ivf.use_fast_scan;
+  if (use_fast_scan_) {
+    // Check if all segments have uniform centroid counts suitable for FastScan
+    std::vector<uint32_t> centroids_per_segment(num_segments_);
+    uint32_t max_centroids = 0;
+    for (uint32_t s = 0; s < num_segments_; ++s) {
+      // Number of centroids = 2^bits or from codebook
+      centroids_per_segment[s] = plan_.codebooks[s].centroids;
+      max_centroids = std::max(max_centroids, centroids_per_segment[s]);
+    }
+
+    if (!CanUseFastScan(centroids_per_segment.data(), num_segments_)) {
+      // Fall back to standard scanning
+      use_fast_scan_ = false;
+    } else {
+      fast_scan_bits_ = RecommendedFastScanBits(max_centroids);
+      if (fast_scan_bits_ == 0) {
+        use_fast_scan_ = false;
+      }
+    }
+  }
+
+  if (use_fast_scan_) {
+    // Pack codes for each cluster into FastScan layout
+    for (uint32_t c = 0; c < num_clusters; ++c) {
+      Cluster& cluster = clusters_[c];
+      if (cluster.num_vectors == 0) continue;
+
+      bool pack_ok = false;
+      if (fast_scan_bits_ == 4) {
+        pack_ok = PackCodes4bit(cluster.codes.data(), cluster.num_vectors,
+                                 num_segments_, cluster.packed_codes);
+      } else if (fast_scan_bits_ == 8) {
+        pack_ok = PackCodes8bit(cluster.codes.data(), cluster.num_vectors,
+                                 num_segments_, cluster.packed_codes);
+      }
+
+      if (!pack_ok) {
+        // If packing fails, disable FastScan for this index
+        use_fast_scan_ = false;
+        break;
+      }
+    }
+  }
+
   built_ = true;
   return "";
 }
@@ -611,10 +658,20 @@ void IVFIndex::Search(const float* query, uint32_t k,
   std::vector<IVFSearchResult> heap;
   heap.reserve(k);
 
+  // Prepare FastScan LUT if enabled
+  FastScanLUT fast_lut;
+  if (use_fast_scan_) {
+    PackLUTForFastScan(table, fast_lut);
+  }
+
   // Scan each candidate cluster
   for (const auto& candidate : candidates) {
     const Cluster& cluster = clusters_[candidate.id];
-    ScanCluster(cluster, table, k, heap);
+    if (use_fast_scan_ && cluster.packed_codes.num_vectors > 0) {
+      ScanClusterFastScan(cluster, fast_lut, k, heap);
+    } else {
+      ScanCluster(cluster, table, k, heap);
+    }
   }
 
   // Sort final results
@@ -659,6 +716,61 @@ void IVFIndex::ScanCluster(const Cluster& cluster, const DistanceTable& table,
       heap.back() = {global_id, dist};
       std::push_heap(heap.begin(), heap.end());
     }
+  }
+}
+
+void IVFIndex::ScanClusterFastScan(const Cluster& cluster, 
+                                    const FastScanLUT& lut,
+                                    uint32_t k,
+                                    std::vector<IVFSearchResult>& heap) const {
+  // Compute all distances using FastScan
+  std::vector<float> distances(cluster.num_vectors);
+  
+  if (fast_scan_bits_ == 4) {
+    FastScanEstimate4bit(cluster.packed_codes, lut, distances.data());
+  } else if (fast_scan_bits_ == 8) {
+    FastScanEstimate8bit(cluster.packed_codes, lut, distances.data());
+  }
+
+  // Update heap with results
+  for (uint32_t i = 0; i < cluster.num_vectors; ++i) {
+    float dist = distances[i];
+    uint32_t global_id = cluster.global_ids[i];
+
+    if (heap.size() < k) {
+      heap.push_back({global_id, dist});
+      std::push_heap(heap.begin(), heap.end());
+    } else if (dist < heap[0].distance) {
+      std::pop_heap(heap.begin(), heap.end());
+      heap.back() = {global_id, dist};
+      std::push_heap(heap.begin(), heap.end());
+    }
+  }
+}
+
+void IVFIndex::PackLUTForFastScan(const DistanceTable& table, 
+                                   FastScanLUT& lut) const {
+  // Prepare table pointers and centroid counts
+  std::vector<const float*> table_ptrs(table.segment_tables.size());
+  std::vector<uint32_t> centroids_per_seg(table.segment_tables.size());
+  
+  for (size_t s = 0; s < table.segment_tables.size(); ++s) {
+    table_ptrs[s] = table.segment_tables[s].distances.data();
+    centroids_per_seg[s] = table.segment_tables[s].num_centroids;
+  }
+
+  if (fast_scan_bits_ == 4) {
+    // Use variable centroid count version for SAQ compatibility
+    PackLUT4bitVariable(table_ptrs.data(), 
+                         static_cast<uint32_t>(table.segment_tables.size()),
+                         centroids_per_seg.data(),
+                         lut);
+  } else if (fast_scan_bits_ == 8) {
+    // Use variable centroid count version for SAQ compatibility
+    PackLUT8bitVariable(table_ptrs.data(), 
+                         static_cast<uint32_t>(table.segment_tables.size()),
+                         centroids_per_seg.data(),
+                         lut);
   }
 }
 
@@ -845,6 +957,45 @@ std::string IVFIndex::Load(const std::string& filename) {
 
   if (!in.good()) {
     return "Error reading file";
+  }
+
+  // Repack codes for FastScan if applicable
+  use_fast_scan_ = false;
+  fast_scan_bits_ = 0;
+  
+  // Check if FastScan can be used
+  std::vector<uint32_t> centroids_per_segment(num_segments_);
+  uint32_t max_centroids = 0;
+  for (uint32_t s = 0; s < num_segments_; ++s) {
+    // Number of centroids from codebook
+    centroids_per_segment[s] = plan_.codebooks[s].centroids;
+    max_centroids = std::max(max_centroids, centroids_per_segment[s]);
+  }
+
+  if (CanUseFastScan(centroids_per_segment.data(), num_segments_)) {
+    fast_scan_bits_ = RecommendedFastScanBits(max_centroids);
+    if (fast_scan_bits_ != 0) {
+      use_fast_scan_ = true;
+
+      // Pack codes for each cluster
+      for (auto& cluster : clusters_) {
+        if (cluster.num_vectors == 0) continue;
+
+        bool pack_ok = false;
+        if (fast_scan_bits_ == 4) {
+          pack_ok = PackCodes4bit(cluster.codes.data(), cluster.num_vectors,
+                                   num_segments_, cluster.packed_codes);
+        } else if (fast_scan_bits_ == 8) {
+          pack_ok = PackCodes8bit(cluster.codes.data(), cluster.num_vectors,
+                                   num_segments_, cluster.packed_codes);
+        }
+
+        if (!pack_ok) {
+          use_fast_scan_ = false;
+          break;
+        }
+      }
+    }
   }
 
   built_ = true;
