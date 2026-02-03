@@ -2,6 +2,7 @@
 /// @brief Implementation of asymmetric distance estimation.
 
 #include "saq/distance_estimator.h"
+#include "saq/simd_kernels.h"
 
 #include <algorithm>
 #include <cmath>
@@ -9,29 +10,6 @@
 #include <limits>
 
 namespace saq {
-
-namespace {
-
-/// @brief Compute squared L2 distance between two vectors.
-float SquaredL2(const float* a, const float* b, uint32_t dim) {
-  float sum = 0.0f;
-  for (uint32_t i = 0; i < dim; ++i) {
-    float diff = a[i] - b[i];
-    sum += diff * diff;
-  }
-  return sum;
-}
-
-/// @brief Compute inner product between two vectors.
-float InnerProduct(const float* a, const float* b, uint32_t dim) {
-  float sum = 0.0f;
-  for (uint32_t i = 0; i < dim; ++i) {
-    sum += a[i] * b[i];
-  }
-  return sum;
-}
-
-}  // namespace
 
 bool DistanceEstimator::Initialize(const std::vector<Codebook>& codebooks,
                                     const std::vector<Segment>& segments,
@@ -97,16 +75,16 @@ DistanceTable DistanceEstimator::ComputeDistanceTable(const float* query,
 
     const float* query_seg = query + seg.start_dim;
 
-    // Compute distance from query segment to each centroid
-    for (uint32_t c = 0; c < cb.centroids; ++c) {
-      const float* centroid = cb.data.data() +
-                               static_cast<size_t>(c) * cb.dim_count;
-
-      if (metric_ == DistanceMetric::kL2) {
-        seg_table.distances[c] = SquaredL2(query_seg, centroid, cb.dim_count);
-      } else {
-        // For inner product, we want max IP, so store negative
-        seg_table.distances[c] = -InnerProduct(query_seg, centroid, cb.dim_count);
+    // Use SIMD-optimized batch distance computation
+    if (metric_ == DistanceMetric::kL2) {
+      simd::L2DistancesBatch(query_seg, cb.data.data(), cb.centroids,
+                              cb.dim_count, seg_table.distances.data());
+    } else {
+      // For inner product, compute and negate (we want max IP via min search)
+      simd::InnerProductsBatch(query_seg, cb.data.data(), cb.centroids,
+                                cb.dim_count, seg_table.distances.data());
+      for (uint32_t c = 0; c < cb.centroids; ++c) {
+        seg_table.distances[c] = -seg_table.distances[c];
       }
     }
   }
@@ -185,11 +163,11 @@ float DistanceEstimator::ComputeExactDistance(const float* query,
     return std::numeric_limits<float>::max();
   }
 
-  // Compute distance
+  // Compute distance using SIMD kernels
   if (metric_ == DistanceMetric::kL2) {
-    return SquaredL2(query, reconstructed.data(), total_dim_);
+    return simd::L2DistanceSquared(query, reconstructed.data(), total_dim_);
   } else {
-    return -InnerProduct(query, reconstructed.data(), total_dim_);
+    return -simd::InnerProduct(query, reconstructed.data(), total_dim_);
   }
 }
 

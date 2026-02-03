@@ -8,4 +8,5 @@ target_sources(saq
     ${CMAKE_CURRENT_SOURCE_DIR}/distance_estimator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/saq_quantizer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ivf_index.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/simd_kernels.cpp
 )

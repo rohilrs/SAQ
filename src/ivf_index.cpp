@@ -2,6 +2,7 @@
 /// @brief Implementation of IVF Index for scalable SAQ search.
 
 #include "saq/ivf_index.h"
+#include "saq/simd_kernels.h"
 
 #include <algorithm>
 #include <cassert>
@@ -14,29 +15,6 @@
 #include <random>
 
 namespace saq {
-
-namespace {
-
-/// @brief Compute squared L2 distance.
-float SquaredL2Distance(const float* a, const float* b, uint32_t dim) {
-  float sum = 0.0f;
-  for (uint32_t i = 0; i < dim; ++i) {
-    float diff = a[i] - b[i];
-    sum += diff * diff;
-  }
-  return sum;
-}
-
-/// @brief Compute inner product.
-float InnerProduct(const float* a, const float* b, uint32_t dim) {
-  float sum = 0.0f;
-  for (uint32_t i = 0; i < dim; ++i) {
-    sum += a[i] * b[i];
-  }
-  return sum;
-}
-
-}  // namespace
 
 // ============================================================================
 // FlatInitializer Implementation
@@ -72,10 +50,14 @@ void FlatInitializer::FindNearestClusters(
   nprobe = std::min(nprobe, num_clusters_);
   std::vector<ClusterCandidate> all_candidates(num_clusters_);
 
+  // Compute all distances using SIMD batch operation
+  std::vector<float> distances(num_clusters_);
+  simd::L2DistancesBatch(query, centroids_.data(), num_clusters_, dim_, 
+                          distances.data());
+
   for (uint32_t i = 0; i < num_clusters_; ++i) {
     all_candidates[i].id = i;
-    all_candidates[i].distance = SquaredL2Distance(
-        query, centroids_.data() + static_cast<size_t>(i) * dim_, dim);
+    all_candidates[i].distance = distances[i];
   }
 
   std::partial_sort(all_candidates.begin(),
@@ -85,6 +67,7 @@ void FlatInitializer::FindNearestClusters(
   candidates.assign(all_candidates.begin(),
                     all_candidates.begin() + nprobe);
 }
+
 
 std::vector<uint8_t> FlatInitializer::Serialize() const {
   // Format: [num_clusters][dim][centroids_data]
@@ -165,7 +148,7 @@ struct HNSWInitializer::HNSWGraph {
   }
 
   float Distance(uint32_t id, const float* query) const {
-    return SquaredL2Distance(data + static_cast<size_t>(id) * dim, query, dim);
+    return simd::L2DistanceSquared(data + static_cast<size_t>(id) * dim, query, dim);
   }
 
   void Insert(uint32_t id) {
@@ -318,14 +301,15 @@ struct HNSWInitializer::HNSWGraph {
     scored.reserve(neighbors.size());
 
     for (uint32_t n : neighbors) {
-      float d = SquaredL2Distance(node_data,
-                                   data + static_cast<size_t>(n) * dim, dim);
+      float d = simd::L2DistanceSquared(node_data,
+                                         data + static_cast<size_t>(n) * dim, dim);
       scored.emplace_back(d, n);
     }
 
     std::partial_sort(scored.begin(),
                       scored.begin() + max_m,
                       scored.end());
+
 
     neighbors.clear();
     neighbors.reserve(max_m);
