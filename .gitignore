@@ -38,3 +38,12 @@ tests/
 
 # github
 .github/
+
+# datasets
+data/datasets/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.conda/

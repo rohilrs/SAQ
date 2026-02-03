@@ -44,4 +44,8 @@ if(SAQ_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
+if(SAQ_BUILD_SAMPLES)
+  add_subdirectory(samples)
+endif()
+
 add_subdirectory(src)
