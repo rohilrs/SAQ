@@ -103,8 +103,11 @@ std::string SAQQuantizer::Train(const float* data, uint32_t n_vectors,
   const float* work_ptr = data;
   uint32_t work_dim = dim;
 
-  // Step 1: Optional PCA dimensionality reduction
-  if (config.use_pca && config.pca_dim > 0 && config.pca_dim < dim) {
+  // Step 1: Optional PCA projection (full rotation when pca_dim == dim,
+  //         dimensionality reduction when pca_dim < dim).
+  //         The paper uses PCA to order dimensions by eigenvalue for
+  //         effective DP bit allocation, even without reducing dim.
+  if (config.use_pca && config.pca_dim > 0) {
     if (!pca_.Train(data, n_vectors, dim, config.pca_dim)) {
       return "PCA training failed";
     }
@@ -513,14 +516,36 @@ void SAQQuantizer::Search(
   std::vector<float> rotated_query(work_dim);
   ApplyRotation(work_query, rotated_query.data());
 
-  // Max-heap of (distance, index) — keeps k smallest distances.
-  // We use negative inner product as distance (larger IP = closer).
+  // Precompute ||q_rotated||² (rotation preserves norms)
+  float query_norm_sq = 0.0f;
+  for (uint32_t d = 0; d < work_dim; ++d) {
+    query_norm_sq += rotated_query[d] * rotated_query[d];
+  }
+
+  // Max-heap of (distance, index) — keeps k smallest L2 distances.
   using Entry = std::pair<float, uint32_t>;
   std::priority_queue<Entry> top_k;
 
   for (uint32_t v = 0; v < n_vectors; ++v) {
-    float ip = EstimateInnerProduct(rotated_query.data(), encoded_db[v]);
-    float dist = -ip;  // Negate so smaller = better match
+    const auto& enc = encoded_db[v];
+    float ip = EstimateInnerProduct(rotated_query.data(), enc);
+
+    // Compute ||ō||² from codes (same approach as IVF index)
+    float norm_sq = 0.0f;
+    for (const auto& seg : plan_.segments) {
+      if (seg.bits == 0) continue;
+      uint32_t levels = 1u << seg.bits;
+      float delta = (2.0f * enc.v_max) / static_cast<float>(levels);
+      for (uint32_t d = 0; d < seg.dim_count; ++d) {
+        uint32_t idx = seg.start_dim + d;
+        float recon = delta * (static_cast<float>(enc.codes[idx]) + 0.5f)
+                      - enc.v_max;
+        norm_sq += recon * recon;
+      }
+    }
+
+    // L2: ||q - ō||² = ||q||² - 2<q,ō> + ||ō||²
+    float dist = query_norm_sq - 2.0f * ip + norm_sq;
 
     if (top_k.size() < k) {
       top_k.emplace(dist, v);
