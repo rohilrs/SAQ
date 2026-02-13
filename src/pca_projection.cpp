@@ -8,6 +8,10 @@
 #include <numeric>
 #include <random>
 
+#ifdef SAQ_USE_OPENMP
+#include <omp.h>
+#endif
+
 namespace saq {
 
 namespace {
@@ -33,8 +37,11 @@ void ComputeMean(const float* data, uint32_t n_samples, uint32_t dim,
 void ComputeCovariance(const float* centered, uint32_t n_samples, uint32_t dim,
                        float* cov) {
   const float inv_n = 1.0f / static_cast<float>(n_samples - 1);
-  
+
   // cov[i][j] = sum_k(centered[k][i] * centered[k][j]) / (n-1)
+#ifdef SAQ_USE_OPENMP
+  #pragma omp parallel for schedule(dynamic)
+#endif
   for (uint32_t i = 0; i < dim; ++i) {
     for (uint32_t j = i; j < dim; ++j) {
       double sum = 0.0;
@@ -228,6 +235,9 @@ void PCAProjection::ProjectBatch(const float* input, float* output,
     return;
   }
 
+#ifdef SAQ_USE_OPENMP
+  #pragma omp parallel for schedule(static)
+#endif
   for (uint32_t i = 0; i < n; ++i) {
     Project(input + i * input_dim_, output + i * output_dim_);
   }

@@ -1,11 +1,12 @@
 #pragma once
 
 /// @file bit_allocation_dp.h
-/// @brief Dynamic programming bit allocation for SAQ segments.
+/// @brief Joint dimension segmentation and bit allocation via dynamic programming.
 ///
-/// Implements the optimal bit allocation algorithm from the SAQ paper.
-/// Given a bit budget and segment variances, finds the allocation that
-/// minimizes total quantization distortion using rate-distortion theory.
+/// Implements Algorithm 2 from the SAQ paper (arXiv:2509.12086).
+/// Given per-dimension variances and a bit budget, jointly determines
+/// optimal segment boundaries and bits-per-dimension for each segment.
+/// Uses the paper's distortion model: ERROR(Seg, B) = (1/(2^B * pi)) * sum(sigma_i^2).
 
 #include "saq/quantization_plan.h"
 
@@ -16,50 +17,73 @@
 
 namespace saq {
 
-/// @brief Configuration for bit allocation.
-struct BitAllocationConfig {
-  /// Total bit budget per vector (across all segments).
+/// @brief Configuration for joint segmentation and bit allocation.
+struct JointAllocationConfig {
+  /// Total bit budget per vector (sum of B_seg * |Seg| across all segments).
   uint32_t total_bits = 64;
 
-  /// Minimum bits per segment (0 means segment can be skipped).
-  uint32_t min_bits_per_segment = 0;
+  /// Minimum bits per dimension within a segment (0 = segment can be skipped).
+  uint32_t min_bits_per_dim = 0;
 
-  /// Maximum bits per segment (caps individual allocations).
-  uint32_t max_bits_per_segment = 16;
+  /// Maximum bits per dimension within a segment.
+  uint32_t max_bits_per_dim = 8;
 
-  /// Regularization factor for distortion (higher = more uniform allocation).
-  float lambda = 0.0f;
+  /// Minimum number of dimensions per segment.
+  uint32_t min_dims_per_segment = 1;
+
+  /// Maximum number of dimensions per segment (0 = no limit).
+  uint32_t max_dims_per_segment = 0;
 };
 
-/// @brief Result of bit allocation optimization.
-struct BitAllocationResult {
-  /// Bit allocations per segment (indices match input segments).
-  std::vector<uint32_t> bits_per_segment;
+/// @brief Result of joint segmentation and bit allocation.
+struct JointAllocationResult {
+  /// Segments determined by the DP (with bits_per_dim set in Segment.bits).
+  std::vector<Segment> segments;
 
-  /// Expected distortion per segment given allocation.
+  /// Expected distortion per segment.
   std::vector<float> distortion_per_segment;
 
   /// Total expected distortion across all segments.
   float total_distortion = 0.0f;
 
-  /// Total bits allocated (should equal budget if successful).
+  /// Total bits used (should equal budget).
   uint32_t total_bits_used = 0;
 
   /// Error message if allocation failed.
   std::string error;
 
+  bool IsValid() const { return error.empty() && !segments.empty(); }
+};
+
+// --- Legacy types (kept at namespace scope for backward compatibility) ---
+
+/// @brief Configuration for segment-level bit allocation (legacy).
+struct BitAllocationConfig {
+  uint32_t total_bits = 64;
+  uint32_t min_bits_per_segment = 0;
+  uint32_t max_bits_per_segment = 16;
+  float lambda = 0.0f;
+};
+
+/// @brief Result of segment-level bit allocation (legacy).
+struct BitAllocationResult {
+  std::vector<uint32_t> bits_per_segment;
+  std::vector<float> distortion_per_segment;
+  float total_distortion = 0.0f;
+  uint32_t total_bits_used = 0;
+  std::string error;
   bool IsValid() const { return error.empty() && !bits_per_segment.empty(); }
 };
 
-/// @brief Optimal bit allocation using dynamic programming.
+/// @brief Joint dimension segmentation and bit allocation optimizer.
 ///
-/// Uses rate-distortion theory to minimize quantization distortion.
-/// The distortion model assumes that for a segment with variance σ²
-/// and b bits allocated, the expected distortion is approximately:
-///   D(σ², b) ≈ σ² * 2^(-2b)
+/// Implements the SAQ paper's Algorithm 2: a DP over dimensions that
+/// jointly determines segment boundaries and per-dimension bit allocation.
 ///
-/// The DP finds the allocation that minimizes total distortion subject
-/// to the bit budget constraint.
+/// State: dp[d][Q] = min distortion covering dims [0..d-1] with Q total bits.
+/// Transition: extend with segment [d..d'] using B bits/dim, cost = B*(d'-d).
+///
+/// Distortion model: ERROR(Seg, B) = (1 / (2^B * pi)) * sum_{i in Seg} sigma_i^2
 class BitAllocatorDP {
  public:
   BitAllocatorDP() = default;
@@ -71,37 +95,53 @@ class BitAllocatorDP {
   BitAllocatorDP(BitAllocatorDP&&) = default;
   BitAllocatorDP& operator=(BitAllocatorDP&&) = default;
 
-  /// @brief Compute optimal bit allocation for segments.
-  /// @param segment_variances Total variance for each segment.
-  /// @param segment_dims Number of dimensions in each segment.
-  /// @param config Allocation configuration.
-  /// @return Allocation result (check IsValid()).
+  /// @brief Joint segmentation and bit allocation over dimensions.
+  ///
+  /// This is the primary API matching the SAQ paper's Algorithm 2.
+  /// Given per-dimension variances (from PCA-projected data), determines
+  /// both segment boundaries and bits-per-dimension for each segment.
+  ///
+  /// @param dim_variances Per-dimension variance, size D (working dimension).
+  /// @param config Joint allocation configuration.
+  /// @return Joint result with segments, bits, and distortion.
+  JointAllocationResult AllocateJoint(const std::vector<float>& dim_variances,
+                                      const JointAllocationConfig& config);
+
+  /// @brief Compute distortion for a segment with given total variance and bits.
+  ///
+  /// Uses SAQ paper formula: ERROR = (1 / (2^B * pi)) * sum(sigma_i^2).
+  ///
+  /// @param segment_variance Sum of per-dimension variances in the segment.
+  /// @param bits_per_dim Bits per dimension (B in the paper).
+  /// @return Expected quantization distortion.
+  static float ComputeDistortion(float segment_variance, uint32_t bits_per_dim);
+
+  // --- Legacy API (for backward compatibility during transition) ---
+
+  /// @brief Legacy: Allocate bits to pre-defined segments.
   BitAllocationResult Allocate(const std::vector<float>& segment_variances,
                                const std::vector<uint32_t>& segment_dims,
                                const BitAllocationConfig& config);
 
-  /// @brief Apply allocation result to segment definitions.
-  /// @param result Allocation result from Allocate().
-  /// @param segments Segments to update (bits field will be set).
-  /// @return True if segments were updated successfully.
+  /// @brief Legacy: Apply allocation result to segment definitions.
   static bool ApplyAllocation(const BitAllocationResult& result,
                               std::vector<Segment>& segments);
 
-  /// @brief Compute distortion for a given variance and bit allocation.
-  /// @param variance Segment variance (sum across dimensions).
-  /// @param dim_count Number of dimensions in segment.
-  /// @param bits Bits allocated to segment.
-  /// @return Expected quantization distortion.
-  static float ComputeDistortion(float variance, uint32_t dim_count,
-                                 uint32_t bits);
-
  private:
-  /// @brief Greedy allocation as fallback when DP is infeasible.
+  /// @brief Joint DP implementation.
+  JointAllocationResult AllocateJointDP(const std::vector<float>& dim_variances,
+                                        const JointAllocationConfig& config);
+
+  /// @brief Greedy fallback for joint allocation.
+  JointAllocationResult AllocateJointGreedy(const std::vector<float>& dim_variances,
+                                            const JointAllocationConfig& config);
+
+  /// @brief Legacy: Greedy allocation fallback.
   BitAllocationResult AllocateGreedy(const std::vector<float>& segment_variances,
                                      const std::vector<uint32_t>& segment_dims,
                                      const BitAllocationConfig& config);
 
-  /// @brief Full DP allocation for optimal solution.
+  /// @brief Legacy: DP allocation for pre-fixed segments.
   BitAllocationResult AllocateDP(const std::vector<float>& segment_variances,
                                  const std::vector<uint32_t>& segment_dims,
                                  const BitAllocationConfig& config);

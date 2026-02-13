@@ -170,6 +170,24 @@ bool FromJson(const tao::json::value& v, Codebook* c) {
   return true;
 }
 
+/// Serialize SegmentRotation to JSON object.
+tao::json::value ToJson(const SegmentRotation& r) {
+  tao::json::value v = tao::json::empty_object;
+  v["segment_id"] = static_cast<std::uint64_t>(r.segment_id);
+  v["dim_count"] = static_cast<std::uint64_t>(r.dim_count);
+  v["matrix"] = FloatVecToJson(r.matrix);
+  return v;
+}
+
+/// Deserialize SegmentRotation from JSON object.
+bool FromJson(const tao::json::value& v, SegmentRotation* r) {
+  if (!v.is_object()) { return false; }
+  r->segment_id = static_cast<uint32_t>(v.at("segment_id").as<std::uint64_t>());
+  r->dim_count = static_cast<uint32_t>(v.at("dim_count").as<std::uint64_t>());
+  r->matrix = JsonToFloatVec(v.at("matrix"));
+  return true;
+}
+
 }  // anonymous namespace
 
 bool QuantizationPlan::Validate(std::string* error) const {
@@ -181,7 +199,9 @@ bool QuantizationPlan::Validate(std::string* error) const {
     if (error) { *error = "segment_count does not match segments size"; }
     return false;
   }
-  if (codebook_count != codebooks.size()) {
+  // For version 2 (scalar quantization), codebooks may be empty.
+  // For version 1 (legacy), codebook_count must match.
+  if (version < 2 && codebook_count != codebooks.size()) {
     if (error) { *error = "codebook_count does not match codebooks size"; }
     return false;
   }
@@ -222,6 +242,16 @@ std::vector<uint8_t> QuantizationPlan::SerializeBinary() const {
     WriteU32(&out, c.centroids);
     WriteU32(&out, c.dim_count);
     WriteF32Array(&out, c.data);
+  }
+
+  // Version 2+: write per-segment rotation matrices.
+  if (version >= 2) {
+    WriteU32(&out, static_cast<uint32_t>(rotations.size()));
+    for (const auto& r : rotations) {
+      WriteU32(&out, r.segment_id);
+      WriteU32(&out, r.dim_count);
+      WriteF32Array(&out, r.matrix);
+    }
   }
 
   return out;
@@ -308,6 +338,30 @@ bool QuantizationPlan::DeserializeBinary(const std::vector<uint8_t>& data, std::
     codebooks.push_back(std::move(c));
   }
 
+  // Version 2+: read per-segment rotation matrices.
+  if (version >= 2 && offset < data.size()) {
+    uint32_t rot_count = 0;
+    if (!ReadU32(data, &offset, &rot_count)) {
+      if (error) { *error = "truncated rotations count"; }
+      return false;
+    }
+    rotations.clear();
+    rotations.reserve(rot_count);
+    for (uint32_t i = 0; i < rot_count; ++i) {
+      SegmentRotation r;
+      if (!ReadU32(data, &offset, &r.segment_id) ||
+          !ReadU32(data, &offset, &r.dim_count)) {
+        if (error) { *error = "truncated rotation entry"; }
+        return false;
+      }
+      if (!ReadF32Array(data, &offset, &r.matrix)) {
+        if (error) { *error = "truncated rotation matrix data"; }
+        return false;
+      }
+      rotations.push_back(std::move(r));
+    }
+  }
+
   if (segment_count != segments.size()) {
     segment_count = static_cast<uint32_t>(segments.size());
   }
@@ -340,6 +394,12 @@ std::string QuantizationPlan::SerializeJson(bool pretty) const {
     cbs.emplace_back(ToJson(c));
   }
   v["codebooks"] = std::move(cbs);
+
+  tao::json::value rots = tao::json::empty_array;
+  for (const auto& r : rotations) {
+    rots.emplace_back(ToJson(r));
+  }
+  v["rotations"] = std::move(rots);
 
   return pretty ? tao::json::to_string(v, 2) : tao::json::to_string(v);
 }
@@ -383,6 +443,19 @@ bool QuantizationPlan::DeserializeJson(const std::string& json, std::string* err
         return false;
       }
       codebooks.push_back(std::move(cb));
+    }
+
+    // Read rotations (optional, present in version 2+).
+    rotations.clear();
+    if (v.find("rotations") != nullptr) {
+      for (const auto& r : v.at("rotations").get_array()) {
+        SegmentRotation rot;
+        if (!FromJson(r, &rot)) {
+          if (error) { *error = "invalid rotation entry"; }
+          return false;
+        }
+        rotations.push_back(std::move(rot));
+      }
     }
 
     if (segment_count != segments.size()) {

@@ -12,11 +12,10 @@
 /// - FlatInitializer: brute-force centroid search for K < 20,000
 /// - HNSWInitializer: HNSW-based centroid search for K >= 20,000
 ///
-/// Optionally supports FastScan for accelerated distance estimation
-/// when all segments use uniform bit allocation (4-bit or 8-bit).
+/// Uses scalar quantization with per-dimension codes and per-vector
+/// v_max scaling factors.
 
 #include "saq/distance_estimator.h"
-#include "index/fast_scan/fast_scan.h"
 #include "saq/quantization_plan.h"
 #include "saq/saq_quantizer.h"
 
@@ -40,9 +39,6 @@ struct IVFConfig {
 
   /// Whether to use HNSW for centroid search (auto-selected based on K).
   bool use_hnsw_initializer = false;
-
-  /// Enable FastScan for distance estimation (requires uniform bit allocation).
-  bool use_fast_scan = true;
 
   /// HNSW M parameter (edges per node).
   uint32_t hnsw_m = 16;
@@ -92,14 +88,14 @@ struct IVFSearchResult {
   }
 };
 
-/// @brief A single cluster containing encoded vectors.
+/// @brief A single cluster containing scalar-encoded vectors.
 struct Cluster {
   uint32_t id = 0;                       ///< Cluster ID.
   uint32_t num_vectors = 0;              ///< Number of vectors in cluster.
   std::vector<uint32_t> global_ids;      ///< Original vector indices.
-  std::vector<uint32_t> codes;           ///< Encoded data (num_vectors × num_segments).
-  std::vector<float> residuals;          ///< Residuals from centroid (optional).
-  FastScanCodes packed_codes;            ///< FastScan-packed codes (if enabled).
+  std::vector<uint8_t> codes;            ///< Scalar codes (num_vectors × working_dim).
+  std::vector<float> v_maxs;             ///< Per-vector v_max scaling factors.
+  std::vector<float> norms_sq;           ///< Per-vector ||ō||² for L2 distance.
 };
 
 /// @brief Abstract base class for centroid initialization/search.
@@ -281,10 +277,10 @@ class IVFIndex {
   bool IsBuilt() const { return built_; }
 
   /// @brief Get the quantization plan.
-  const QuantizationPlan& GetPlan() const { return plan_; }
+  const QuantizationPlan& GetPlan() const { return quantizer_.Plan(); }
 
-  /// @brief Check if FastScan is enabled.
-  bool UseFastScan() const { return use_fast_scan_; }
+  /// @brief Get the quantizer.
+  const SAQQuantizer& GetQuantizer() const { return quantizer_; }
 
   /// @brief Get cluster statistics.
   /// @param min_size Output minimum cluster size.
@@ -294,37 +290,27 @@ class IVFIndex {
                        float& avg_size) const;
 
  private:
-  /// @brief Scan a single cluster for nearest neighbors.
-  void ScanCluster(const Cluster& cluster, const DistanceTable& table,
-                   uint32_t k, std::vector<IVFSearchResult>& heap) const;
-
-  /// @brief Scan a cluster using FastScan.
-  void ScanClusterFastScan(const Cluster& cluster, const FastScanLUT& lut,
-                            uint32_t k, std::vector<IVFSearchResult>& heap) const;
-
-  /// @brief Pack LUT for FastScan.
-  void PackLUTForFastScan(const DistanceTable& table, FastScanLUT& lut) const;
+  /// @brief Scan a cluster using scalar distance estimation.
+  void ScanClusterScalar(const Cluster& cluster,
+                         const ScalarQueryTable& table,
+                         float query_norm_sq, uint32_t k,
+                         std::vector<IVFSearchResult>& heap) const;
 
   /// @brief Assign a vector to a cluster.
   ClusterAssignment AssignToCluster(const float* vector) const;
 
-  /// @brief Compute residual vector.
-  void ComputeResidual(const float* vector, const float* centroid,
-                       float* residual) const;
-
   // Index state
   bool built_ = false;
-  bool use_fast_scan_ = false;
-  uint32_t fast_scan_bits_ = 0;
   uint32_t num_vectors_ = 0;
   uint32_t dim_ = 0;
-  uint32_t num_segments_ = 0;
+  uint32_t working_dim_ = 0;
   uint32_t default_nprobe_ = 32;
+  DistanceMetric metric_ = DistanceMetric::kL2;
 
   // Components
   std::unique_ptr<CentroidInitializer> initializer_;
   std::vector<Cluster> clusters_;
-  QuantizationPlan plan_;
+  SAQQuantizer quantizer_;
   DistanceEstimator distance_estimator_;
 
   // For reconstruction: map global_id -> (cluster_id, local_idx)

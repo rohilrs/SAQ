@@ -1,0 +1,61 @@
+=== IVF Scalar Quantization Benchmark ===
+
+=== IVF Scalar Search Benchmark ===
+Vectors: 10000, Dim: 128, Clusters: 100
+Queries: 100, k: 10, nprobe: 10
+Total bits: 64
+
+Generating data... done
+Clustering... done
+Computing ground truth... done
+Building IVF index... done (5.6233 ms)
+
+Searching... done
+
+=== Results ===
+
+Build Time: 5.62 ms
+
+Search Time (100 queries): 0.76 ms
+Queries Per Second: 131891.32 QPS
+Recall@10: 5.80%
+
+=== IVF Scalar Search Benchmark ===
+Vectors: 50000, Dim: 128, Clusters: 256
+Queries: 100, k: 10, nprobe: 20
+Total bits: 64
+
+Generating data... done
+Clustering... done
+Computing ground truth... done
+Building IVF index... done (24.23 ms)
+
+Searching... done
+
+=== Results ===
+
+Build Time: 24.23 ms
+
+Search Time (100 queries): 3.75 ms
+Queries Per Second: 26642.51 QPS
+Recall@10: 4.80%
+
+=== IVF Scalar Search Benchmark ===
+Vectors: 100000, Dim: 128, Clusters: 512
+Queries: 100, k: 10, nprobe: 32
+Total bits: 64
+
+Generating data... done
+Clustering... done
+Computing ground truth... done
+Building IVF index... done (50.63 ms)
+
+Searching... done
+
+=== Results ===
+
+Build Time: 50.63 ms
+
+Search Time (100 queries): 5.75 ms
+Queries Per Second: 17394.63 QPS
+Recall@10: 4.10%

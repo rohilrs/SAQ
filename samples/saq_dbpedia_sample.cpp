@@ -4,7 +4,7 @@
 /// Demonstrates:
 /// - Loading vectors from .fvecs format
 /// - K-means clustering for IVF
-/// - Building SAQ-IVF index with FastScan
+/// - Building SAQ-IVF index with scalar quantization
 /// - Search with varying nprobe
 /// - Computing recall, QPS, and error metrics
 
@@ -286,7 +286,7 @@ void WriteResults(const std::string& filename,
                   const std::vector<BenchmarkResult>& results,
                   uint32_t n_base, uint32_t n_queries, uint32_t dim,
                   uint32_t total_bits, uint32_t num_clusters,
-                  double build_time_s, bool use_fast_scan) {
+                  double build_time_s) {
   std::ofstream out(filename);
   if (!out.is_open()) {
     std::cerr << "Cannot write results to: " << filename << std::endl;
@@ -305,7 +305,6 @@ void WriteResults(const std::string& filename,
   out << "Index Configuration:\n";
   out << "  Clusters (K):    " << num_clusters << "\n";
   out << "  Total bits:      " << total_bits << "\n";
-  out << "  FastScan:        " << (use_fast_scan ? "enabled" : "disabled") << "\n";
   out << "  Compression:     " << std::fixed << std::setprecision(1) 
       << ComputeRatio(dim, total_bits) << "x\n";
   out << "  Build time:      " << std::fixed << std::setprecision(2) 
@@ -415,9 +414,7 @@ int main(int argc, char* argv[]) {
   IVFTrainConfig config;
   config.ivf.num_clusters = num_clusters;
   config.ivf.nprobe = 32;
-  config.ivf.use_fast_scan = true;
   config.saq.total_bits = total_bits;
-  config.saq.num_segments = 16;  // 16 segments x 4 bits = 64 bits
   config.seed = 42;
   
   auto build_start = Clock::now();
@@ -433,7 +430,7 @@ int main(int argc, char* argv[]) {
   double build_time = std::chrono::duration<double>(build_end - build_start).count();
   std::cout << "  Build time: " << std::fixed << std::setprecision(2) 
             << build_time << " seconds\n";
-  std::cout << "  FastScan enabled: " << (index.UseFastScan() ? "yes" : "no") << "\n\n";
+  std::cout << std::endl;
   
   // Benchmark with varying nprobe
   std::cout << "[4/5] Running search benchmarks...\n";
@@ -494,8 +491,7 @@ int main(int argc, char* argv[]) {
   
   std::string results_file = results_dir + "/dbpedia_100k_results.txt";
   WriteResults(results_file, results, n_base, n_queries, dim,
-               total_bits, num_clusters, build_time + cluster_time,
-               index.UseFastScan());
+               total_bits, num_clusters, build_time + cluster_time);
   
   std::cout << "\n================================================================================\n";
   std::cout << "Sample completed successfully!\n";

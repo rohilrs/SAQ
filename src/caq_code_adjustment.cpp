@@ -1,5 +1,9 @@
 /// @file caq_code_adjustment.cpp
-/// @brief Implementation of CAQ code adjustment.
+/// @brief Implementation of CAQ per-dimension code adjustment (Algorithm 1).
+///
+/// Refines scalar codes by trying +/-1 adjustments per dimension,
+/// accepting changes that improve cosine similarity.  Uses incremental
+/// dot-product and norm updates for O(R * D) per-vector complexity.
 
 #include "saq/caq_code_adjustment.h"
 
@@ -7,81 +11,25 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <numeric>
 #include <vector>
+
+#ifdef SAQ_USE_OPENMP
+#include <omp.h>
+#endif
 
 namespace saq {
 
-namespace {
+// ---------------------------------------------------------------------------
+// Initialization
+// ---------------------------------------------------------------------------
 
-/// @brief Compute squared L2 distance between two vectors.
-float SquaredL2(const float* a, const float* b, uint32_t dim) {
-  float sum = 0.0f;
-  for (uint32_t i = 0; i < dim; ++i) {
-    float diff = a[i] - b[i];
-    sum += diff * diff;
-  }
-  return sum;
-}
-
-/// @brief Compute squared L2 norm of a vector.
-float SquaredNorm(const float* v, uint32_t dim) {
-  float sum = 0.0f;
-  for (uint32_t i = 0; i < dim; ++i) {
-    sum += v[i] * v[i];
-  }
-  return sum;
-}
-
-/// @brief Add vector b to vector a: a += b.
-void VectorAdd(float* a, const float* b, uint32_t dim) {
-  for (uint32_t i = 0; i < dim; ++i) {
-    a[i] += b[i];
-  }
-}
-
-/// @brief Subtract vector b from vector a: a -= b.
-void VectorSub(float* a, const float* b, uint32_t dim) {
-  for (uint32_t i = 0; i < dim; ++i) {
-    a[i] -= b[i];
-  }
-}
-
-}  // namespace
-
-bool CAQAdjuster::Initialize(const std::vector<Codebook>& codebooks,
-                              const std::vector<Segment>& segments) {
-  if (codebooks.empty() || segments.empty()) {
+bool CAQAdjuster::Initialize(const std::vector<Segment>& segments) {
+  if (segments.empty()) {
     return false;
   }
 
-  if (codebooks.size() != segments.size()) {
-    return false;
-  }
-
-  // Validate codebook-segment correspondence
-  for (size_t i = 0; i < codebooks.size(); ++i) {
-    if (codebooks[i].segment_id != segments[i].id) {
-      return false;
-    }
-    if (codebooks[i].dim_count != segments[i].dim_count) {
-      return false;
-    }
-    if (codebooks[i].centroids == 0) {
-      return false;
-    }
-    // Validate data size
-    size_t expected_size = static_cast<size_t>(codebooks[i].centroids) *
-                           static_cast<size_t>(codebooks[i].dim_count);
-    if (codebooks[i].data.size() != expected_size) {
-      return false;
-    }
-  }
-
-  codebooks_ = codebooks;
   segments_ = segments;
 
-  // Compute total dimensionality
   total_dim_ = 0;
   for (const auto& seg : segments_) {
     total_dim_ += seg.dim_count;
@@ -90,270 +38,180 @@ bool CAQAdjuster::Initialize(const std::vector<Codebook>& codebooks,
   return true;
 }
 
-EncodedVector CAQAdjuster::EncodeGreedy(const float* vector, uint32_t dim) const {
-  EncodedVector result;
+bool CAQAdjuster::Initialize(const std::vector<Codebook>& /*codebooks*/,
+                              const std::vector<Segment>& segments) {
+  return Initialize(segments);
+}
 
-  if (!IsInitialized() || dim != total_dim_) {
-    result.distortion = std::numeric_limits<float>::max();
-    return result;
-  }
+// ---------------------------------------------------------------------------
+// Scalar reconstruction
+// ---------------------------------------------------------------------------
 
-  result.codes.resize(segments_.size());
-  result.distortion = 0.0f;
-
-  // For each segment, find the nearest centroid
-  for (size_t seg_idx = 0; seg_idx < segments_.size(); ++seg_idx) {
-    const Segment& seg = segments_[seg_idx];
-    const Codebook& cb = codebooks_[seg_idx];
-
-    const float* seg_vector = vector + seg.start_dim;
-    uint32_t best_code = 0;
-    float best_dist = std::numeric_limits<float>::max();
-
-    // Linear search through centroids
-    for (uint32_t c = 0; c < cb.centroids; ++c) {
-      const float* centroid = cb.data.data() + static_cast<size_t>(c) * cb.dim_count;
-      float dist = SquaredL2(seg_vector, centroid, cb.dim_count);
-
-      if (dist < best_dist) {
-        best_dist = dist;
-        best_code = c;
+void CAQAdjuster::ReconstructScalar(const uint8_t* codes, float v_max,
+                                    float* output) const {
+  for (const auto& seg : segments_) {
+    if (seg.bits == 0) {
+      for (uint32_t d = 0; d < seg.dim_count; ++d) {
+        output[seg.start_dim + d] = 0.0f;
       }
+      continue;
     }
 
-    result.codes[seg_idx] = best_code;
-    result.distortion += best_dist;
-  }
-
-  return result;
-}
-
-bool CAQAdjuster::Reconstruct(const std::vector<uint32_t>& codes,
-                               float* output) const {
-  if (!IsInitialized()) {
-    return false;
-  }
-
-  if (codes.size() != segments_.size()) {
-    return false;
-  }
-
-  // Validate codes and reconstruct
-  for (size_t seg_idx = 0; seg_idx < segments_.size(); ++seg_idx) {
-    const Segment& seg = segments_[seg_idx];
-    const Codebook& cb = codebooks_[seg_idx];
-    uint32_t code = codes[seg_idx];
-
-    if (code >= cb.centroids) {
-      return false;
-    }
-
-    const float* centroid = cb.data.data() + static_cast<size_t>(code) * cb.dim_count;
-    std::memcpy(output + seg.start_dim, centroid, cb.dim_count * sizeof(float));
-  }
-
-  return true;
-}
-
-float CAQAdjuster::ComputeDistortion(const float* vector, uint32_t dim,
-                                      const std::vector<uint32_t>& codes) const {
-  if (!IsInitialized() || dim != total_dim_) {
-    return std::numeric_limits<float>::max();
-  }
-
-  if (codes.size() != segments_.size()) {
-    return std::numeric_limits<float>::max();
-  }
-
-  float total_dist = 0.0f;
-
-  for (size_t seg_idx = 0; seg_idx < segments_.size(); ++seg_idx) {
-    const Segment& seg = segments_[seg_idx];
-    const Codebook& cb = codebooks_[seg_idx];
-    uint32_t code = codes[seg_idx];
-
-    if (code >= cb.centroids) {
-      return std::numeric_limits<float>::max();
-    }
-
-    const float* seg_vector = vector + seg.start_dim;
-    const float* centroid = cb.data.data() + static_cast<size_t>(code) * cb.dim_count;
-    total_dist += SquaredL2(seg_vector, centroid, cb.dim_count);
-  }
-
-  return total_dist;
-}
-
-uint32_t CAQAdjuster::FindBestCode(const float* vector, uint32_t segment_idx,
-                                    std::vector<uint32_t>& current_codes,
-                                    std::vector<float>& residual) const {
-  const Segment& seg = segments_[segment_idx];
-  const Codebook& cb = codebooks_[segment_idx];
-
-  // Get the current centroid contribution for this segment
-  uint32_t old_code = current_codes[segment_idx];
-  const float* old_centroid = cb.data.data() +
-                               static_cast<size_t>(old_code) * cb.dim_count;
-
-  // Compute target: what this segment should approximate
-  // target = original[seg] = residual[seg] + old_centroid
-  std::vector<float> target(seg.dim_count);
-  for (uint32_t d = 0; d < seg.dim_count; ++d) {
-    target[d] = residual[seg.start_dim + d] + old_centroid[d];
-  }
-
-  // Find the centroid that minimizes ||target - centroid||²
-  uint32_t best_code = old_code;
-  float best_dist = SquaredL2(target.data(), old_centroid, seg.dim_count);
-
-  for (uint32_t c = 0; c < cb.centroids; ++c) {
-    const float* centroid = cb.data.data() + static_cast<size_t>(c) * cb.dim_count;
-    float dist = SquaredL2(target.data(), centroid, seg.dim_count);
-
-    if (dist < best_dist) {
-      best_dist = dist;
-      best_code = c;
-    }
-  }
-
-  // Only update residual if code changed
-  if (best_code != old_code) {
-    const float* new_centroid = cb.data.data() +
-                                 static_cast<size_t>(best_code) * cb.dim_count;
-    for (uint32_t d = 0; d < seg.dim_count; ++d) {
-      // residual = original - centroid
-      // new_residual = original - new_centroid = (residual + old_centroid) - new_centroid
-      residual[seg.start_dim + d] = target[d] - new_centroid[d];
-    }
-  }
-
-  return best_code;
-}
-
-EncodedVector CAQAdjuster::RefineCAQ(const float* vector, uint32_t dim,
-                                      const EncodedVector& initial,
-                                      const CAQConfig& config) const {
-  EncodedVector result;
-
-  if (!IsInitialized() || dim != total_dim_) {
-    result.distortion = std::numeric_limits<float>::max();
-    return result;
-  }
-
-  if (initial.codes.size() != segments_.size()) {
-    result.distortion = std::numeric_limits<float>::max();
-    return result;
-  }
-
-  // Start with initial codes
-  result.codes = initial.codes;
-
-  // Compute initial residual: original - reconstruction
-  std::vector<float> residual(total_dim_);
-  std::memcpy(residual.data(), vector, total_dim_ * sizeof(float));
-
-  // Subtract all current centroids
-  for (size_t seg_idx = 0; seg_idx < segments_.size(); ++seg_idx) {
-    const Segment& seg = segments_[seg_idx];
-    const Codebook& cb = codebooks_[seg_idx];
-    uint32_t code = result.codes[seg_idx];
-    const float* centroid = cb.data.data() + static_cast<size_t>(code) * cb.dim_count;
+    uint32_t levels = 1u << seg.bits;
+    float delta = (2.0f * v_max) / static_cast<float>(levels);
 
     for (uint32_t d = 0; d < seg.dim_count; ++d) {
-      residual[seg.start_dim + d] -= centroid[d];
+      uint32_t idx = seg.start_dim + d;
+      output[idx] = delta * (static_cast<float>(codes[idx]) + 0.5f) - v_max;
     }
   }
-
-  float prev_distortion = SquaredNorm(residual.data(), total_dim_);
-
-  // Iterative refinement
-  for (uint32_t iter = 0; iter < config.max_iterations; ++iter) {
-    bool any_changed = false;
-
-    // Cycle through segments and optimize each
-    for (size_t seg_idx = 0; seg_idx < segments_.size(); ++seg_idx) {
-      uint32_t old_code = result.codes[seg_idx];
-      uint32_t new_code = FindBestCode(vector, static_cast<uint32_t>(seg_idx),
-                                        result.codes, residual);
-
-      if (new_code != old_code) {
-        result.codes[seg_idx] = new_code;
-        any_changed = true;
-      }
-    }
-
-    if (!any_changed) {
-      break;  // Converged - no codes changed
-    }
-
-    // Check convergence by distortion
-    float current_distortion = SquaredNorm(residual.data(), total_dim_);
-    float improvement = (prev_distortion - current_distortion) / 
-                        (prev_distortion + 1e-10f);
-
-    if (improvement < config.convergence_threshold) {
-      break;  // Converged - small improvement
-    }
-
-    prev_distortion = current_distortion;
-  }
-
-  // Compute final distortion using the same method as EncodeGreedy
-  result.distortion = ComputeDistortion(vector, dim, result.codes);
-
-  // Ensure we never return worse than initial (numerical safety)
-  if (result.distortion > initial.distortion) {
-    return initial;
-  }
-
-  return result;
 }
 
-std::vector<EncodedVector> CAQAdjuster::EncodeBatch(
-    const float* vectors, uint32_t n_vectors, uint32_t dim,
-    const CAQConfig& config, CAQStats* stats) const {
-  std::vector<EncodedVector> results;
-  results.reserve(n_vectors);
+// ---------------------------------------------------------------------------
+// Per-dimension CAQ refinement (Algorithm 1)
+// ---------------------------------------------------------------------------
 
-  if (!IsInitialized() || dim != total_dim_) {
-    return results;
+uint64_t CAQAdjuster::RefineScalar(const float* original, uint8_t* codes,
+                                   float v_max,
+                                   const CAQConfig& config) const {
+  if (!IsInitialized() || original == nullptr || codes == nullptr) {
+    return 0;
   }
 
-  float initial_total = 0.0f;
-  float final_total = 0.0f;
-  uint64_t codes_changed = 0;
+  if (v_max < 1e-30f) {
+    return 0;  // Zero vector, nothing to adjust
+  }
 
-  for (uint32_t i = 0; i < n_vectors; ++i) {
-    const float* vec = vectors + static_cast<size_t>(i) * dim;
+  // Compute initial reconstruction and running statistics
+  // x_dot_o = <original, o_bar>
+  // o_norm_sq = ||o_bar||^2
+  // x_norm_sq = ||original||^2  (constant throughout)
+  float x_norm_sq = 0.0f;
+  float x_dot_o = 0.0f;
+  float o_norm_sq = 0.0f;
 
-    // Greedy initial encoding
-    EncodedVector initial = EncodeGreedy(vec, dim);
-    initial_total += initial.distortion;
+  for (const auto& seg : segments_) {
+    if (seg.bits == 0) {
+      // Zero-bit dimensions contribute to x_norm_sq but not to reconstruction
+      for (uint32_t d = 0; d < seg.dim_count; ++d) {
+        uint32_t idx = seg.start_dim + d;
+        x_norm_sq += original[idx] * original[idx];
+      }
+      continue;
+    }
 
-    // Refine with CAQ
-    EncodedVector refined = RefineCAQ(vec, dim, initial, config);
-    final_total += refined.distortion;
+    uint32_t levels = 1u << seg.bits;
+    float delta = (2.0f * v_max) / static_cast<float>(levels);
 
-    // Count changed codes
-    for (size_t s = 0; s < initial.codes.size(); ++s) {
-      if (initial.codes[s] != refined.codes[s]) {
-        codes_changed++;
+    for (uint32_t d = 0; d < seg.dim_count; ++d) {
+      uint32_t idx = seg.start_dim + d;
+      float x_i = original[idx];
+      float o_i = delta * (static_cast<float>(codes[idx]) + 0.5f) - v_max;
+
+      x_norm_sq += x_i * x_i;
+      x_dot_o += x_i * o_i;
+      o_norm_sq += o_i * o_i;
+    }
+  }
+
+  float x_norm = std::sqrt(x_norm_sq);
+  if (x_norm < 1e-30f) {
+    return 0;  // Zero original vector
+  }
+
+  uint64_t total_changes = 0;
+
+  for (uint32_t round = 0; round < config.num_rounds; ++round) {
+    uint64_t round_changes = 0;
+
+    for (const auto& seg : segments_) {
+      if (seg.bits == 0) {
+        continue;
+      }
+
+      uint32_t levels = 1u << seg.bits;
+      float delta = (2.0f * v_max) / static_cast<float>(levels);
+      auto max_code = static_cast<uint8_t>(levels - 1);
+
+      for (uint32_t d = 0; d < seg.dim_count; ++d) {
+        uint32_t idx = seg.start_dim + d;
+        uint8_t cur_code = codes[idx];
+        float x_i = original[idx];
+
+        // Current reconstruction for this dimension
+        float cur_o_i = delta * (static_cast<float>(cur_code) + 0.5f) - v_max;
+
+        // Current cosine = x_dot_o / (x_norm * sqrt(o_norm_sq))
+        // Since x_norm is constant, maximizing cosine is equivalent to
+        // maximizing x_dot_o / sqrt(o_norm_sq).
+        // We compare (x_dot_o_new)^2 * o_norm_sq_old vs
+        //            (x_dot_o_old)^2 * o_norm_sq_new
+        // to avoid sqrt.  But for simplicity and correctness,
+        // use the full cosine comparison.
+
+        float best_cosine = (o_norm_sq > 0.0f)
+            ? x_dot_o / (x_norm * std::sqrt(o_norm_sq))
+            : -1.0f;
+        uint8_t best_code = cur_code;
+        float best_x_dot_o = x_dot_o;
+        float best_o_norm_sq = o_norm_sq;
+
+        // Try c[i] + 1
+        if (cur_code < max_code) {
+          float new_o_i = cur_o_i + delta;
+          float new_x_dot_o = x_dot_o + delta * x_i;
+          float new_o_norm_sq =
+              o_norm_sq + 2.0f * delta * cur_o_i + delta * delta;
+
+          if (new_o_norm_sq > 0.0f) {
+            float new_cosine =
+                new_x_dot_o / (x_norm * std::sqrt(new_o_norm_sq));
+            if (new_cosine > best_cosine) {
+              best_cosine = new_cosine;
+              best_code = cur_code + 1;
+              best_x_dot_o = new_x_dot_o;
+              best_o_norm_sq = new_o_norm_sq;
+            }
+          }
+        }
+
+        // Try c[i] - 1 (always from original state, not from +1)
+        if (cur_code > 0) {
+          float new_o_i = cur_o_i - delta;
+          float new_x_dot_o = x_dot_o - delta * x_i;
+          float new_o_norm_sq =
+              o_norm_sq - 2.0f * delta * cur_o_i + delta * delta;
+
+          if (new_o_norm_sq > 0.0f) {
+            float new_cosine =
+                new_x_dot_o / (x_norm * std::sqrt(new_o_norm_sq));
+            if (new_cosine > best_cosine) {
+              best_cosine = new_cosine;
+              best_code = cur_code - 1;
+              best_x_dot_o = new_x_dot_o;
+              best_o_norm_sq = new_o_norm_sq;
+            }
+          }
+        }
+
+        // Apply best change
+        if (best_code != cur_code) {
+          codes[idx] = best_code;
+          x_dot_o = best_x_dot_o;
+          o_norm_sq = best_o_norm_sq;
+          round_changes++;
+        }
       }
     }
 
-    results.push_back(std::move(refined));
+    total_changes += round_changes;
+
+    if (round_changes == 0) {
+      break;  // Converged
+    }
   }
 
-  if (stats != nullptr) {
-    stats->iterations = config.max_iterations;  // Conservative estimate
-    stats->initial_distortion = initial_total;
-    stats->final_distortion = final_total;
-    stats->codes_changed = codes_changed;
-    stats->converged = (final_total < initial_total * 0.999f) || 
-                       (codes_changed == 0);
-  }
-
-  return results;
+  return total_changes;
 }
 
 }  // namespace saq

@@ -2,7 +2,7 @@
 /// @brief Implementation of IVF Index for scalable SAQ search.
 
 #include "index/ivf_index.h"
-#include "index/fast_scan/fast_scan.h"
+#include "saq/saq_quantizer.h"
 #include "saq/simd_kernels.h"
 
 #include <algorithm>
@@ -14,6 +14,10 @@
 #include <numeric>
 #include <queue>
 #include <random>
+
+#ifdef SAQ_USE_OPENMP
+#include <omp.h>
+#endif
 
 namespace saq {
 
@@ -496,20 +500,17 @@ std::string IVFIndex::Build(const float* data, uint32_t n_vectors,
     cluster_vectors[cid].push_back(i);
   }
 
-  // Step 3: Train SAQ on a sample of vectors (or all if small enough)
+  // Step 3: Train SAQ quantizer on a sample of vectors
   std::vector<float> training_data;
   std::vector<uint32_t> sample_indices;
   const uint32_t max_training = 100000;
 
   if (n_vectors <= max_training) {
-    // Use all vectors
     training_data.assign(data, data + static_cast<size_t>(n_vectors) * dim);
   } else {
-    // Subsample
     sample_indices.reserve(max_training);
     std::mt19937 rng(config.seed);
 
-    // Sample proportionally from each cluster
     for (uint32_t c = 0; c < num_clusters; ++c) {
       const auto& vecs = cluster_vectors[c];
       uint32_t n_sample = std::max(1u, static_cast<uint32_t>(
@@ -533,34 +534,35 @@ std::string IVFIndex::Build(const float* data, uint32_t n_vectors,
     }
   }
 
-  // Train SAQ quantizer
-  SAQQuantizer quantizer;
   uint32_t training_size = n_vectors <= max_training
       ? n_vectors
       : static_cast<uint32_t>(sample_indices.size());
 
-  std::string train_err = quantizer.Train(training_data.data(), training_size,
-                                           dim, config.saq);
+  std::string train_err = quantizer_.Train(training_data.data(), training_size,
+                                            dim, config.saq);
   if (!train_err.empty()) {
     return "SAQ training failed: " + train_err;
   }
 
-  plan_ = quantizer.Plan();
-  num_segments_ = plan_.segment_count;
+  working_dim_ = quantizer_.WorkingDim();
 
-  // Initialize distance estimator
-  if (!distance_estimator_.Initialize(plan_.codebooks, plan_.segments,
-                                       config.ivf.metric)) {
+  // Initialize scalar distance estimator
+  if (!distance_estimator_.InitializeScalar(quantizer_.Plan().segments,
+                                             config.ivf.metric)) {
     return "Failed to initialize distance estimator";
   }
 
-  // Step 4: Encode all vectors into clusters
+  // Step 4: Encode all vectors into clusters using scalar quantization
   clusters_.clear();
   clusters_.resize(num_clusters);
   id_to_location_.resize(n_vectors);
 
+  metric_ = config.ivf.metric;
+
   SAQEncodeConfig encode_config;
   encode_config.use_caq = true;
+
+  const auto& segments = quantizer_.Plan().segments;
 
   for (uint32_t c = 0; c < num_clusters; ++c) {
     const auto& vec_ids = cluster_vectors[c];
@@ -568,64 +570,51 @@ std::string IVFIndex::Build(const float* data, uint32_t n_vectors,
     cluster.id = c;
     cluster.num_vectors = static_cast<uint32_t>(vec_ids.size());
     cluster.global_ids = vec_ids;
-    cluster.codes.resize(vec_ids.size() * num_segments_);
+    cluster.codes.resize(static_cast<size_t>(vec_ids.size()) * working_dim_);
+    cluster.v_maxs.resize(vec_ids.size());
+    cluster.norms_sq.resize(vec_ids.size());
 
+    bool encode_ok = true;
+#ifdef SAQ_USE_OPENMP
+    #pragma omp parallel for schedule(dynamic)
+#endif
     for (size_t i = 0; i < vec_ids.size(); ++i) {
       uint32_t global_id = vec_ids[i];
       const float* vec = data + static_cast<size_t>(global_id) * dim;
 
-      if (!quantizer.Encode(vec, cluster.codes.data() + i * num_segments_,
-                             encode_config)) {
-        return "Failed to encode vector " + std::to_string(global_id);
-      }
+      ScalarEncodedVector encoded;
+      if (!quantizer_.Encode(vec, encoded, encode_config)) {
+        encode_ok = false;
+      } else {
+        // Copy per-dimension codes into contiguous cluster storage
+        std::memcpy(cluster.codes.data() + i * working_dim_,
+                    encoded.codes.data(), working_dim_);
+        cluster.v_maxs[i] = encoded.v_max;
 
-      id_to_location_[global_id] = {c, static_cast<uint32_t>(i)};
-    }
-  }
-
-  // Step 5: Determine if FastScan can be used and pack codes
-  use_fast_scan_ = config.ivf.use_fast_scan;
-  if (use_fast_scan_) {
-    // Check if all segments have uniform centroid counts suitable for FastScan
-    std::vector<uint32_t> centroids_per_segment(num_segments_);
-    uint32_t max_centroids = 0;
-    for (uint32_t s = 0; s < num_segments_; ++s) {
-      // Number of centroids = 2^bits or from codebook
-      centroids_per_segment[s] = plan_.codebooks[s].centroids;
-      max_centroids = std::max(max_centroids, centroids_per_segment[s]);
-    }
-
-    if (!CanUseFastScan(centroids_per_segment.data(), num_segments_)) {
-      // Fall back to standard scanning
-      use_fast_scan_ = false;
-    } else {
-      fast_scan_bits_ = RecommendedFastScanBits(max_centroids);
-      if (fast_scan_bits_ == 0) {
-        use_fast_scan_ = false;
+        // Compute ||ō||² from codes for L2 distance estimation
+        float norm_sq = 0.0f;
+        for (const auto& seg : segments) {
+          if (seg.bits == 0) continue;
+          float delta = 2.0f * encoded.v_max /
+                        static_cast<float>(1u << seg.bits);
+          for (uint32_t d = 0; d < seg.dim_count; ++d) {
+            uint32_t idx = seg.start_dim + d;
+            float recon = delta * (static_cast<float>(encoded.codes[idx]) + 0.5f)
+                          - encoded.v_max;
+            norm_sq += recon * recon;
+          }
+        }
+        cluster.norms_sq[i] = norm_sq;
       }
     }
-  }
 
-  if (use_fast_scan_) {
-    // Pack codes for each cluster into FastScan layout
-    for (uint32_t c = 0; c < num_clusters; ++c) {
-      Cluster& cluster = clusters_[c];
-      if (cluster.num_vectors == 0) continue;
+    if (!encode_ok) {
+      return "Failed to encode vectors in cluster " + std::to_string(c);
+    }
 
-      bool pack_ok = false;
-      if (fast_scan_bits_ == 4) {
-        pack_ok = PackCodes4bit(cluster.codes.data(), cluster.num_vectors,
-                                 num_segments_, cluster.packed_codes);
-      } else if (fast_scan_bits_ == 8) {
-        pack_ok = PackCodes8bit(cluster.codes.data(), cluster.num_vectors,
-                                 num_segments_, cluster.packed_codes);
-      }
-
-      if (!pack_ok) {
-        // If packing fails, disable FastScan for this index
-        use_fast_scan_ = false;
-        break;
-      }
+    // Update id_to_location_ sequentially (not thread-safe for shared map)
+    for (size_t i = 0; i < vec_ids.size(); ++i) {
+      id_to_location_[vec_ids[i]] = {c, static_cast<uint32_t>(i)};
     }
   }
 
@@ -647,31 +636,34 @@ void IVFIndex::Search(const float* query, uint32_t k,
   }
   nprobe = std::min(nprobe, static_cast<uint32_t>(clusters_.size()));
 
-  // Find nearest clusters
+  // Find nearest clusters (using original-space query for centroid L2 search)
   std::vector<ClusterCandidate> candidates;
   initializer_->FindNearestClusters(query, dim_, nprobe, candidates);
 
-  // Precompute distance table
-  DistanceTable table = distance_estimator_.ComputeDistanceTable(query, dim_);
+  // Transform query to rotated space for scalar distance estimation
+  std::vector<float> rotated_query(working_dim_);
+  if (!quantizer_.TransformQuery(query, rotated_query.data())) {
+    return;
+  }
 
-  // Vector used as heap for k-NN results
+  // Precompute scalar query table
+  ScalarQueryTable table =
+      distance_estimator_.PrecomputeScalarQuery(rotated_query.data());
+
+  // Compute ||q||² for L2 distance (in rotated space)
+  float query_norm_sq = 0.0f;
+  for (uint32_t d = 0; d < working_dim_; ++d) {
+    query_norm_sq += rotated_query[d] * rotated_query[d];
+  }
+
+  // Max-heap for k-NN results
   std::vector<IVFSearchResult> heap;
   heap.reserve(k);
-
-  // Prepare FastScan LUT if enabled
-  FastScanLUT fast_lut;
-  if (use_fast_scan_) {
-    PackLUTForFastScan(table, fast_lut);
-  }
 
   // Scan each candidate cluster
   for (const auto& candidate : candidates) {
     const Cluster& cluster = clusters_[candidate.id];
-    if (use_fast_scan_ && cluster.packed_codes.num_vectors > 0) {
-      ScanClusterFastScan(cluster, fast_lut, k, heap);
-    } else {
-      ScanCluster(cluster, table, k, heap);
-    }
+    ScanClusterScalar(cluster, table, query_norm_sq, k, heap);
   }
 
   // Sort final results
@@ -690,22 +682,36 @@ void IVFIndex::SearchBatch(const float* queries, uint32_t n_queries,
     return;
   }
 
-  // Process each query
+#ifdef SAQ_USE_OPENMP
+  #pragma omp parallel for schedule(dynamic)
+#endif
   for (uint32_t q = 0; q < n_queries; ++q) {
     const float* query = queries + static_cast<size_t>(q) * dim_;
     Search(query, k, results[q], nprobe);
   }
 }
 
-void IVFIndex::ScanCluster(const Cluster& cluster, const DistanceTable& table,
-                            uint32_t k,
-                            std::vector<IVFSearchResult>& heap) const {
-  // Using vector as pseudo-heap with reordering
+void IVFIndex::ScanClusterScalar(const Cluster& cluster,
+                                  const ScalarQueryTable& table,
+                                  float query_norm_sq, uint32_t k,
+                                  std::vector<IVFSearchResult>& heap) const {
   for (uint32_t i = 0; i < cluster.num_vectors; ++i) {
-    const uint32_t* codes = cluster.codes.data() +
-                            static_cast<size_t>(i) * num_segments_;
+    const uint8_t* codes = cluster.codes.data() +
+                            static_cast<size_t>(i) * working_dim_;
+    float v_max = cluster.v_maxs[i];
 
-    float dist = distance_estimator_.EstimateDistance(table, codes);
+    // Estimate inner product using the SAQ paper formula
+    float ip = distance_estimator_.EstimateScalarIP(table, codes, v_max);
+
+    float dist;
+    if (metric_ == DistanceMetric::kL2) {
+      // L2: ||q - ō||² = ||q||² - 2<q,ō> + ||ō||²
+      dist = query_norm_sq - 2.0f * ip + cluster.norms_sq[i];
+    } else {
+      // IP: use negative IP (larger IP = closer = lower distance)
+      dist = -ip;
+    }
+
     uint32_t global_id = cluster.global_ids[i];
 
     if (heap.size() < k) {
@@ -716,61 +722,6 @@ void IVFIndex::ScanCluster(const Cluster& cluster, const DistanceTable& table,
       heap.back() = {global_id, dist};
       std::push_heap(heap.begin(), heap.end());
     }
-  }
-}
-
-void IVFIndex::ScanClusterFastScan(const Cluster& cluster, 
-                                    const FastScanLUT& lut,
-                                    uint32_t k,
-                                    std::vector<IVFSearchResult>& heap) const {
-  // Compute all distances using FastScan
-  std::vector<float> distances(cluster.num_vectors);
-  
-  if (fast_scan_bits_ == 4) {
-    FastScanEstimate4bit(cluster.packed_codes, lut, distances.data());
-  } else if (fast_scan_bits_ == 8) {
-    FastScanEstimate8bit(cluster.packed_codes, lut, distances.data());
-  }
-
-  // Update heap with results
-  for (uint32_t i = 0; i < cluster.num_vectors; ++i) {
-    float dist = distances[i];
-    uint32_t global_id = cluster.global_ids[i];
-
-    if (heap.size() < k) {
-      heap.push_back({global_id, dist});
-      std::push_heap(heap.begin(), heap.end());
-    } else if (dist < heap[0].distance) {
-      std::pop_heap(heap.begin(), heap.end());
-      heap.back() = {global_id, dist};
-      std::push_heap(heap.begin(), heap.end());
-    }
-  }
-}
-
-void IVFIndex::PackLUTForFastScan(const DistanceTable& table, 
-                                   FastScanLUT& lut) const {
-  // Prepare table pointers and centroid counts
-  std::vector<const float*> table_ptrs(table.segment_tables.size());
-  std::vector<uint32_t> centroids_per_seg(table.segment_tables.size());
-  
-  for (size_t s = 0; s < table.segment_tables.size(); ++s) {
-    table_ptrs[s] = table.segment_tables[s].distances.data();
-    centroids_per_seg[s] = table.segment_tables[s].num_centroids;
-  }
-
-  if (fast_scan_bits_ == 4) {
-    // Use variable centroid count version for SAQ compatibility
-    PackLUT4bitVariable(table_ptrs.data(), 
-                         static_cast<uint32_t>(table.segment_tables.size()),
-                         centroids_per_seg.data(),
-                         lut);
-  } else if (fast_scan_bits_ == 8) {
-    // Use variable centroid count version for SAQ compatibility
-    PackLUT8bitVariable(table_ptrs.data(), 
-                         static_cast<uint32_t>(table.segment_tables.size()),
-                         centroids_per_seg.data(),
-                         lut);
   }
 }
 
@@ -781,10 +732,16 @@ bool IVFIndex::Reconstruct(uint32_t global_id, float* output) const {
 
   auto [cluster_id, local_idx] = id_to_location_[global_id];
   const Cluster& cluster = clusters_[cluster_id];
-  const uint32_t* codes = cluster.codes.data() +
-                          static_cast<size_t>(local_idx) * num_segments_;
 
-  return distance_estimator_.Reconstruct(codes, output);
+  // Build ScalarEncodedVector from contiguous cluster storage
+  ScalarEncodedVector encoded;
+  encoded.codes.assign(
+      cluster.codes.data() + static_cast<size_t>(local_idx) * working_dim_,
+      cluster.codes.data() +
+          static_cast<size_t>(local_idx + 1) * working_dim_);
+  encoded.v_max = cluster.v_maxs[local_idx];
+
+  return quantizer_.Decode(encoded, output);
 }
 
 void IVFIndex::GetClusterStats(uint32_t& min_size, uint32_t& max_size,
@@ -820,14 +777,14 @@ bool IVFIndex::Save(const std::string& filename) const {
 
   // Magic number and version
   const uint32_t magic = 0x53415149;  // "SAQI"
-  const uint32_t version = 1;
+  const uint32_t version = 2;
   out.write(reinterpret_cast<const char*>(&magic), sizeof(uint32_t));
   out.write(reinterpret_cast<const char*>(&version), sizeof(uint32_t));
 
   // Metadata
   out.write(reinterpret_cast<const char*>(&num_vectors_), sizeof(uint32_t));
   out.write(reinterpret_cast<const char*>(&dim_), sizeof(uint32_t));
-  out.write(reinterpret_cast<const char*>(&num_segments_), sizeof(uint32_t));
+  out.write(reinterpret_cast<const char*>(&working_dim_), sizeof(uint32_t));
   out.write(reinterpret_cast<const char*>(&default_nprobe_), sizeof(uint32_t));
 
   uint32_t num_clusters = static_cast<uint32_t>(clusters_.size());
@@ -843,20 +800,29 @@ bool IVFIndex::Save(const std::string& filename) const {
   out.write(reinterpret_cast<const char*>(init_data.data()), init_size);
 
   // Quantization plan
-  auto plan_data = plan_.SerializeBinary();
+  auto plan_data = quantizer_.Plan().SerializeBinary();
   uint32_t plan_size = static_cast<uint32_t>(plan_data.size());
   out.write(reinterpret_cast<const char*>(&plan_size), sizeof(uint32_t));
   out.write(reinterpret_cast<const char*>(plan_data.data()), plan_size);
 
-  // Clusters
+  // Distance metric
+  uint8_t metric_byte = (metric_ == DistanceMetric::kL2) ? 0 : 1;
+  out.write(reinterpret_cast<const char*>(&metric_byte), sizeof(uint8_t));
+
+  // Clusters: global_ids, uint8_t codes, float v_maxs, float norms_sq
   for (const auto& cluster : clusters_) {
     out.write(reinterpret_cast<const char*>(&cluster.id), sizeof(uint32_t));
-    out.write(reinterpret_cast<const char*>(&cluster.num_vectors), sizeof(uint32_t));
+    out.write(reinterpret_cast<const char*>(&cluster.num_vectors),
+              sizeof(uint32_t));
 
     out.write(reinterpret_cast<const char*>(cluster.global_ids.data()),
               cluster.global_ids.size() * sizeof(uint32_t));
     out.write(reinterpret_cast<const char*>(cluster.codes.data()),
-              cluster.codes.size() * sizeof(uint32_t));
+              cluster.codes.size());
+    out.write(reinterpret_cast<const char*>(cluster.v_maxs.data()),
+              cluster.v_maxs.size() * sizeof(float));
+    out.write(reinterpret_cast<const char*>(cluster.norms_sq.data()),
+              cluster.norms_sq.size() * sizeof(float));
   }
 
   // ID to location map
@@ -882,7 +848,7 @@ std::string IVFIndex::Load(const std::string& filename) {
   if (magic != 0x53415149) {
     return "Invalid file format";
   }
-  if (version != 1) {
+  if (version != 2) {
     return "Unsupported version: " + std::to_string(version);
   }
 
@@ -890,7 +856,7 @@ std::string IVFIndex::Load(const std::string& filename) {
   uint32_t num_clusters;
   in.read(reinterpret_cast<char*>(&num_vectors_), sizeof(uint32_t));
   in.read(reinterpret_cast<char*>(&dim_), sizeof(uint32_t));
-  in.read(reinterpret_cast<char*>(&num_segments_), sizeof(uint32_t));
+  in.read(reinterpret_cast<char*>(&working_dim_), sizeof(uint32_t));
   in.read(reinterpret_cast<char*>(&default_nprobe_), sizeof(uint32_t));
   in.read(reinterpret_cast<char*>(&num_clusters), sizeof(uint32_t));
 
@@ -923,15 +889,28 @@ std::string IVFIndex::Load(const std::string& filename) {
   std::vector<uint8_t> plan_data(plan_size);
   in.read(reinterpret_cast<char*>(plan_data.data()), plan_size);
 
+  QuantizationPlan plan;
   std::string plan_error;
-  if (!plan_.DeserializeBinary(plan_data, &plan_error)) {
+  if (!plan.DeserializeBinary(plan_data, &plan_error)) {
     return "Failed to deserialize quantization plan: " + plan_error;
   }
 
-  // Initialize distance estimator
-  if (!distance_estimator_.Initialize(plan_.codebooks, plan_.segments)) {
+  // Load quantizer from plan (restores PCA, rotations, segments)
+  std::string load_err = quantizer_.LoadPlan(plan);
+  if (!load_err.empty()) {
+    return "Failed to load quantizer: " + load_err;
+  }
+
+  // Initialize scalar distance estimator
+  if (!distance_estimator_.InitializeScalar(plan.segments)) {
     return "Failed to initialize distance estimator";
   }
+
+  // Distance metric
+  uint8_t metric_byte = 0;
+  in.read(reinterpret_cast<char*>(&metric_byte), sizeof(uint8_t));
+  metric_ = (metric_byte == 0) ? DistanceMetric::kL2
+                                : DistanceMetric::kInnerProduct;
 
   // Clusters
   clusters_.clear();
@@ -942,12 +921,19 @@ std::string IVFIndex::Load(const std::string& filename) {
     in.read(reinterpret_cast<char*>(&cluster.num_vectors), sizeof(uint32_t));
 
     cluster.global_ids.resize(cluster.num_vectors);
-    cluster.codes.resize(static_cast<size_t>(cluster.num_vectors) * num_segments_);
+    cluster.codes.resize(
+        static_cast<size_t>(cluster.num_vectors) * working_dim_);
+    cluster.v_maxs.resize(cluster.num_vectors);
+    cluster.norms_sq.resize(cluster.num_vectors);
 
     in.read(reinterpret_cast<char*>(cluster.global_ids.data()),
             cluster.global_ids.size() * sizeof(uint32_t));
     in.read(reinterpret_cast<char*>(cluster.codes.data()),
-            cluster.codes.size() * sizeof(uint32_t));
+            cluster.codes.size());
+    in.read(reinterpret_cast<char*>(cluster.v_maxs.data()),
+            cluster.v_maxs.size() * sizeof(float));
+    in.read(reinterpret_cast<char*>(cluster.norms_sq.data()),
+            cluster.norms_sq.size() * sizeof(float));
   }
 
   // ID to location map
@@ -957,45 +943,6 @@ std::string IVFIndex::Load(const std::string& filename) {
 
   if (!in.good()) {
     return "Error reading file";
-  }
-
-  // Repack codes for FastScan if applicable
-  use_fast_scan_ = false;
-  fast_scan_bits_ = 0;
-  
-  // Check if FastScan can be used
-  std::vector<uint32_t> centroids_per_segment(num_segments_);
-  uint32_t max_centroids = 0;
-  for (uint32_t s = 0; s < num_segments_; ++s) {
-    // Number of centroids from codebook
-    centroids_per_segment[s] = plan_.codebooks[s].centroids;
-    max_centroids = std::max(max_centroids, centroids_per_segment[s]);
-  }
-
-  if (CanUseFastScan(centroids_per_segment.data(), num_segments_)) {
-    fast_scan_bits_ = RecommendedFastScanBits(max_centroids);
-    if (fast_scan_bits_ != 0) {
-      use_fast_scan_ = true;
-
-      // Pack codes for each cluster
-      for (auto& cluster : clusters_) {
-        if (cluster.num_vectors == 0) continue;
-
-        bool pack_ok = false;
-        if (fast_scan_bits_ == 4) {
-          pack_ok = PackCodes4bit(cluster.codes.data(), cluster.num_vectors,
-                                   num_segments_, cluster.packed_codes);
-        } else if (fast_scan_bits_ == 8) {
-          pack_ok = PackCodes8bit(cluster.codes.data(), cluster.num_vectors,
-                                   num_segments_, cluster.packed_codes);
-        }
-
-        if (!pack_ok) {
-          use_fast_scan_ = false;
-          break;
-        }
-      }
-    }
   }
 
   built_ = true;
@@ -1011,13 +958,6 @@ ClusterAssignment IVFIndex::AssignToCluster(const float* vector) const {
   }
 
   return {candidates[0].id, candidates[0].distance};
-}
-
-void IVFIndex::ComputeResidual(const float* vector, const float* centroid,
-                                float* residual) const {
-  for (uint32_t i = 0; i < dim_; ++i) {
-    residual[i] = vector[i] - centroid[i];
-  }
 }
 
 }  // namespace saq

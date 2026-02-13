@@ -3,9 +3,9 @@
 /// @file distance_estimator.h
 /// @brief Asymmetric distance estimation for SAQ-encoded vectors.
 ///
-/// Implements fast distance computation between query vectors and
-/// SAQ-encoded database vectors using precomputed lookup tables.
-/// Supports both L2 (Euclidean) and inner product distance metrics.
+/// Supports both scalar quantization (paper formula) and legacy
+/// codebook-based ADC. For scalar codes, uses the SAQ paper's formula:
+///   <o_bar, q> = delta * <codes, q> + q_sum * (-v_max + delta/2)
 
 #include "saq/quantization_plan.h"
 
@@ -22,33 +22,40 @@ enum class DistanceMetric : uint8_t {
   kInnerProduct = 1  ///< Negative inner product (for max inner product search).
 };
 
-/// @brief Precomputed distance table for a single segment.
+/// @brief Precomputed query data for scalar distance estimation.
 ///
-/// For a query vector q and segment s with centroids C, stores:
-/// - L2: ||q[s] - C[i]||² for each centroid i
-/// - IP: -<q[s], C[i]> for each centroid i
-struct SegmentDistanceTable {
-  uint32_t segment_id = 0;    ///< Segment this table corresponds to.
-  uint32_t num_centroids = 0; ///< Number of entries in the table.
-  std::vector<float> distances; ///< Distance to each centroid.
+/// For each segment, stores the per-segment sum of query components.
+/// Used with the paper's formula:
+///   IP = sum_seg [ delta_seg * code_dot_q_seg + q_sum_seg * (-v_max + delta_seg/2) ]
+struct ScalarQueryTable {
+  /// Per-segment sum of query values: q_sum_seg = sum(q[i] for i in segment).
+  std::vector<float> segment_q_sums;
+
+  /// Per-segment scale factor: 2.0 / 2^B_seg (constant, independent of v_max).
+  std::vector<float> segment_scales;
+
+  /// Query vector in rotated space (stored for code_dot_q computation).
+  std::vector<float> rotated_query;
 };
 
-/// @brief Complete distance table for all segments.
+// --- Legacy types (for codebook-based ADC) ---
+
+/// @brief Precomputed distance table for a single segment (legacy).
+struct SegmentDistanceTable {
+  uint32_t segment_id = 0;
+  uint32_t num_centroids = 0;
+  std::vector<float> distances;
+};
+
+/// @brief Complete distance table for all segments (legacy).
 struct DistanceTable {
   DistanceMetric metric = DistanceMetric::kL2;
   std::vector<SegmentDistanceTable> segment_tables;
 
-  /// @brief Look up distance for a segment and code.
-  /// @param segment_idx Segment index.
-  /// @param code Quantization code.
-  /// @return Precomputed distance.
   float Lookup(uint32_t segment_idx, uint32_t code) const {
     return segment_tables[segment_idx].distances[code];
   }
 
-  /// @brief Compute total distance from codes.
-  /// @param codes Quantization codes, one per segment.
-  /// @return Sum of segment distances.
   float ComputeDistance(const uint32_t* codes) const {
     float total = 0.0f;
     for (size_t s = 0; s < segment_tables.size(); ++s) {
@@ -60,9 +67,8 @@ struct DistanceTable {
 
 /// @brief Asymmetric distance estimator for SAQ search.
 ///
-/// Precomputes distance tables from a query vector to all centroids,
-/// then uses table lookups to rapidly estimate distances to encoded
-/// database vectors.
+/// Provides both scalar-code estimation (paper formula) and legacy
+/// codebook-based ADC lookup.
 class DistanceEstimator {
  public:
   DistanceEstimator() = default;
@@ -74,65 +80,80 @@ class DistanceEstimator {
   DistanceEstimator(DistanceEstimator&&) = default;
   DistanceEstimator& operator=(DistanceEstimator&&) = default;
 
-  /// @brief Initialize with codebooks and segments.
-  /// @param codebooks Codebooks for each segment.
-  /// @param segments Segment definitions.
-  /// @param metric Distance metric to use.
+  // --- Scalar quantization API ---
+
+  /// @brief Initialize for scalar code distance estimation.
+  /// @param segments Segment definitions (with bits_per_dim set).
+  /// @param metric Distance metric.
   /// @return True on success.
+  bool InitializeScalar(const std::vector<Segment>& segments,
+                        DistanceMetric metric = DistanceMetric::kInnerProduct);
+
+  /// @brief Precompute query table for scalar distance estimation.
+  /// @param rotated_query Query vector in rotated space.
+  /// @return Query table for fast estimation.
+  ScalarQueryTable PrecomputeScalarQuery(const float* rotated_query) const;
+
+  /// @brief Estimate inner product using the SAQ paper formula.
+  ///
+  /// <o_bar, q> = sum_seg [ delta * <codes_seg, q_seg> +
+  ///                        q_sum_seg * (-v_max + delta/2) ]
+  ///
+  /// @param table Precomputed query table.
+  /// @param codes Per-dimension scalar codes.
+  /// @param v_max Per-vector scaling factor.
+  /// @return Estimated inner product.
+  float EstimateScalarIP(const ScalarQueryTable& table, const uint8_t* codes,
+                         float v_max) const;
+
+  /// @brief Batch estimate inner products for scalar codes.
+  /// @param table Precomputed query table.
+  /// @param codes_batch Array of per-dim code arrays.
+  /// @param v_maxs Per-vector scaling factors.
+  /// @param n_vectors Number of vectors.
+  /// @param ips Output inner products.
+  void EstimateScalarIPBatch(const ScalarQueryTable& table,
+                             const uint8_t* const* codes_batch,
+                             const float* v_maxs, uint32_t n_vectors,
+                             float* ips) const;
+
+  // --- Legacy codebook-based API ---
+
+  /// @brief Initialize with codebooks and segments (legacy).
   bool Initialize(const std::vector<Codebook>& codebooks,
                   const std::vector<Segment>& segments,
                   DistanceMetric metric = DistanceMetric::kL2);
 
-  /// @brief Precompute distance table for a query vector.
-  /// @param query Query vector.
-  /// @param dim Query dimensionality.
-  /// @return Distance table for fast lookups.
+  /// @brief Precompute distance table for a query vector (legacy).
   DistanceTable ComputeDistanceTable(const float* query, uint32_t dim) const;
 
-  /// @brief Estimate distance from query to an encoded vector.
-  /// @param table Precomputed distance table.
-  /// @param codes Quantization codes of the database vector.
-  /// @return Estimated distance.
+  /// @brief Estimate distance from query to encoded vector (legacy).
   float EstimateDistance(const DistanceTable& table,
                          const uint32_t* codes) const;
 
-  /// @brief Estimate distances to a batch of encoded vectors.
-  /// @param table Precomputed distance table.
-  /// @param codes Codes for all vectors, shape (n_vectors, num_segments).
-  /// @param n_vectors Number of vectors.
-  /// @param distances Output distances, size n_vectors.
+  /// @brief Batch distance estimation (legacy).
   void EstimateDistancesBatch(const DistanceTable& table,
                               const uint32_t* codes, uint32_t n_vectors,
                               float* distances) const;
 
-  /// @brief Compute exact distance (for verification).
-  /// @param query Query vector.
-  /// @param codes Quantization codes.
-  /// @param dim Query dimensionality.
-  /// @return Exact distance using reconstructed vector.
+  /// @brief Compute exact distance (legacy).
   float ComputeExactDistance(const float* query, const uint32_t* codes,
                              uint32_t dim) const;
 
-  /// @brief Get the distance metric.
-  DistanceMetric Metric() const { return metric_; }
-
-  /// @brief Get total dimensionality.
-  uint32_t TotalDim() const { return total_dim_; }
-
-  /// @brief Get number of segments.
-  uint32_t NumSegments() const { return static_cast<uint32_t>(segments_.size()); }
-
-  /// @brief Check if initialized.
-  bool IsInitialized() const { return !codebooks_.empty(); }
-
-  /// @brief Reconstruct vector from codes.
-  /// @param codes Quantization codes.
-  /// @param output Output buffer.
-  /// @return True on success.
+  /// @brief Reconstruct vector from codes (legacy).
   bool Reconstruct(const uint32_t* codes, float* output) const;
 
+  // --- Common accessors ---
+
+  DistanceMetric Metric() const { return metric_; }
+  uint32_t TotalDim() const { return total_dim_; }
+  uint32_t NumSegments() const {
+    return static_cast<uint32_t>(segments_.size());
+  }
+  bool IsInitialized() const { return !segments_.empty(); }
+
  private:
-  std::vector<Codebook> codebooks_;
+  std::vector<Codebook> codebooks_;  ///< Legacy codebooks.
   std::vector<Segment> segments_;
   DistanceMetric metric_ = DistanceMetric::kL2;
   uint32_t total_dim_ = 0;

@@ -8,6 +8,10 @@
 #include <limits>
 #include <numeric>
 
+#ifdef SAQ_USE_OPENMP
+#include <omp.h>
+#endif
+
 namespace saq {
 
 bool DimensionSegmenter::ComputeStats(const float* data, uint32_t n_samples,
@@ -29,13 +33,23 @@ bool DimensionSegmenter::ComputeStats(const float* data, uint32_t n_samples,
   }
 
   // First pass: compute mean, min, max
-  for (uint32_t i = 0; i < n_samples; ++i) {
-    for (uint32_t j = 0; j < dim; ++j) {
+  // Parallelize over dimensions with thread-local accumulators
+#ifdef SAQ_USE_OPENMP
+  #pragma omp parallel for schedule(static)
+#endif
+  for (uint32_t j = 0; j < dim; ++j) {
+    double sum = 0.0;
+    float local_min = std::numeric_limits<float>::max();
+    float local_max = std::numeric_limits<float>::lowest();
+    for (uint32_t i = 0; i < n_samples; ++i) {
       float val = data[i * dim + j];
-      stats_[j].mean += val;
-      stats_[j].min_val = std::min(stats_[j].min_val, val);
-      stats_[j].max_val = std::max(stats_[j].max_val, val);
+      sum += static_cast<double>(val);
+      local_min = std::min(local_min, val);
+      local_max = std::max(local_max, val);
     }
+    stats_[j].mean = static_cast<float>(sum);
+    stats_[j].min_val = local_min;
+    stats_[j].max_val = local_max;
   }
 
   const float inv_n = 1.0f / static_cast<float>(n_samples);
@@ -44,11 +58,17 @@ bool DimensionSegmenter::ComputeStats(const float* data, uint32_t n_samples,
   }
 
   // Second pass: compute variance
-  for (uint32_t i = 0; i < n_samples; ++i) {
-    for (uint32_t j = 0; j < dim; ++j) {
-      float diff = data[i * dim + j] - stats_[j].mean;
-      stats_[j].variance += diff * diff;
+#ifdef SAQ_USE_OPENMP
+  #pragma omp parallel for schedule(static)
+#endif
+  for (uint32_t j = 0; j < dim; ++j) {
+    double var_sum = 0.0;
+    float mean_j = stats_[j].mean;
+    for (uint32_t i = 0; i < n_samples; ++i) {
+      float diff = data[i * dim + j] - mean_j;
+      var_sum += static_cast<double>(diff) * static_cast<double>(diff);
     }
+    stats_[j].variance = static_cast<float>(var_sum);
   }
 
   const float inv_n_minus_1 = 1.0f / static_cast<float>(n_samples - 1);

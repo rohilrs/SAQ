@@ -33,10 +33,11 @@ struct Segment {
   uint32_t id = 0;          ///< Unique segment identifier.
   uint32_t start_dim = 0;   ///< Starting dimension index (inclusive).
   uint32_t dim_count = 0;   ///< Number of dimensions in this segment.
-  uint32_t bits = 0;        ///< Bits allocated to this segment.
+  uint32_t bits = 0;        ///< Bits per dimension (B in the SAQ paper).
+                             ///< Total bits for segment = bits * dim_count.
 };
 
-/// @brief Codebook for quantizing a segment's dimensions.
+/// @brief Codebook for quantizing a segment's dimensions (legacy, k-means based).
 struct Codebook {
   uint32_t segment_id = 0;    ///< ID of the segment this codebook serves.
   uint32_t bits = 0;          ///< Bits used for quantization (log2 of centroids).
@@ -45,22 +46,33 @@ struct Codebook {
   std::vector<float> data;    ///< Centroid vectors, size: centroids * dim_count.
 };
 
+/// @brief Per-segment rotation matrix for decorrelating dimensions.
+struct SegmentRotation {
+  uint32_t segment_id = 0;     ///< ID of the segment this rotation serves.
+  uint32_t dim_count = 0;      ///< Size of the rotation matrix (dim_count x dim_count).
+  std::vector<float> matrix;   ///< Orthonormal rotation matrix, row-major.
+};
+
 /// @brief Complete specification for SAQ vector quantization.
 ///
 /// Contains all parameters needed to encode and decode vectors:
-/// PCA projection, dimension segments, bit allocations, and codebooks.
+/// PCA projection, dimension segments, bit allocations, and per-segment
+/// rotation matrices. Uses scalar (uniform grid) quantization per dimension.
 struct QuantizationPlan {
-  uint32_t version = 1;           ///< Schema version for compatibility.
+  uint32_t version = 2;           ///< Schema version (2 = scalar quantization).
   uint32_t dimension = 0;         ///< Input vector dimensionality.
   uint32_t total_bits = 0;        ///< Total bits per encoded vector.
   uint32_t segment_count = 0;     ///< Number of dimension segments.
-  uint32_t codebook_count = 0;    ///< Number of codebooks.
   uint32_t seed = 0;              ///< RNG seed for reproducibility.
   bool use_pca = false;           ///< Whether PCA preprocessing is enabled.
 
   PCAParams pca;                  ///< PCA parameters (if use_pca is true).
   std::vector<Segment> segments;  ///< Dimension segment definitions.
-  std::vector<Codebook> codebooks;///< Codebooks for each segment.
+  std::vector<SegmentRotation> rotations; ///< Per-segment rotation matrices.
+
+  // Legacy fields (kept for backward compatibility)
+  uint32_t codebook_count = 0;    ///< Number of codebooks (legacy).
+  std::vector<Codebook> codebooks;///< Codebooks for each segment (legacy).
 
   /// @brief Validate internal consistency.
   /// @param error Optional output for error message.
