@@ -1,12 +1,16 @@
 /// @file pca_projection.cpp
 /// @brief Implementation of PCAProjection class.
+///
+/// Uses Eigen's SelfAdjointEigenSolver for numerically stable
+/// eigendecomposition at any dimension.
 
 #include "saq/pca_projection.h"
 
 #include <algorithm>
 #include <cmath>
 #include <numeric>
-#include <random>
+
+#include <Eigen/Dense>
 
 #ifdef SAQ_USE_OPENMP
 #include <omp.h>
@@ -28,119 +32,6 @@ void ComputeMean(const float* data, uint32_t n_samples, uint32_t dim,
   const float inv_n = 1.0f / static_cast<float>(n_samples);
   for (uint32_t j = 0; j < dim; ++j) {
     mean[j] *= inv_n;
-  }
-}
-
-/// @brief Compute covariance matrix (dim x dim) from centered data.
-/// @param centered Row-major centered data (n_samples x dim).
-/// @param cov Output covariance matrix (dim x dim), row-major.
-void ComputeCovariance(const float* centered, uint32_t n_samples, uint32_t dim,
-                       float* cov) {
-  const float inv_n = 1.0f / static_cast<float>(n_samples - 1);
-
-  // cov[i][j] = sum_k(centered[k][i] * centered[k][j]) / (n-1)
-#ifdef SAQ_USE_OPENMP
-  #pragma omp parallel for schedule(dynamic)
-#endif
-  for (uint32_t i = 0; i < dim; ++i) {
-    for (uint32_t j = i; j < dim; ++j) {
-      double sum = 0.0;
-      for (uint32_t k = 0; k < n_samples; ++k) {
-        sum += static_cast<double>(centered[k * dim + i]) *
-               static_cast<double>(centered[k * dim + j]);
-      }
-      float val = static_cast<float>(sum * inv_n);
-      cov[i * dim + j] = val;
-      cov[j * dim + i] = val;  // Symmetric
-    }
-  }
-}
-
-/// @brief Power iteration to find dominant eigenvector.
-/// @param matrix Symmetric matrix (dim x dim).
-/// @param dim Matrix dimension.
-/// @param eigenvector Output eigenvector (size dim), normalized.
-/// @param max_iter Maximum iterations.
-/// @param tol Convergence tolerance.
-/// @return Eigenvalue.
-float PowerIteration(const float* matrix, uint32_t dim, float* eigenvector,
-                     uint32_t max_iter = 100, float tol = 1e-6f) {
-  // Random initialization
-  std::mt19937 rng(42);
-  std::normal_distribution<float> dist(0.0f, 1.0f);
-  for (uint32_t i = 0; i < dim; ++i) {
-    eigenvector[i] = dist(rng);
-  }
-
-  // Normalize
-  float norm = 0.0f;
-  for (uint32_t i = 0; i < dim; ++i) {
-    norm += eigenvector[i] * eigenvector[i];
-  }
-  norm = std::sqrt(norm);
-  for (uint32_t i = 0; i < dim; ++i) {
-    eigenvector[i] /= norm;
-  }
-
-  std::vector<float> temp(dim);
-  float eigenvalue = 0.0f;
-
-  for (uint32_t iter = 0; iter < max_iter; ++iter) {
-    // temp = matrix * eigenvector
-    for (uint32_t i = 0; i < dim; ++i) {
-      double sum = 0.0;
-      for (uint32_t j = 0; j < dim; ++j) {
-        sum += static_cast<double>(matrix[i * dim + j]) *
-               static_cast<double>(eigenvector[j]);
-      }
-      temp[i] = static_cast<float>(sum);
-    }
-
-    // Compute new eigenvalue estimate (Rayleigh quotient)
-    float new_eigenvalue = 0.0f;
-    for (uint32_t i = 0; i < dim; ++i) {
-      new_eigenvalue += eigenvector[i] * temp[i];
-    }
-
-    // Normalize temp
-    norm = 0.0f;
-    for (uint32_t i = 0; i < dim; ++i) {
-      norm += temp[i] * temp[i];
-    }
-    norm = std::sqrt(norm);
-    if (norm < 1e-10f) {
-      break;
-    }
-    for (uint32_t i = 0; i < dim; ++i) {
-      temp[i] /= norm;
-    }
-
-    // Check convergence
-    float diff = 0.0f;
-    for (uint32_t i = 0; i < dim; ++i) {
-      float d = temp[i] - eigenvector[i];
-      diff += d * d;
-    }
-
-    std::copy(temp.begin(), temp.end(), eigenvector);
-    eigenvalue = new_eigenvalue;
-
-    if (diff < tol * tol) {
-      break;
-    }
-  }
-
-  return eigenvalue;
-}
-
-/// @brief Deflate matrix by removing contribution of eigenvector.
-/// matrix = matrix - eigenvalue * eigenvector * eigenvector^T
-void DeflateMatrix(float* matrix, uint32_t dim, float eigenvalue,
-                   const float* eigenvector) {
-  for (uint32_t i = 0; i < dim; ++i) {
-    for (uint32_t j = 0; j < dim; ++j) {
-      matrix[i * dim + j] -= eigenvalue * eigenvector[i] * eigenvector[j];
-    }
   }
 }
 
@@ -169,42 +60,74 @@ bool PCAProjection::Train(const float* data, uint32_t n_samples,
   input_dim_ = input_dim;
   output_dim_ = output_dim;
 
-  // Compute mean
+  // --- Step 1: Compute mean in double precision ---
   mean_.resize(input_dim);
   if (center) {
-    ComputeMean(data, n_samples, input_dim, mean_.data());
+    std::vector<double> mean_d(input_dim, 0.0);
+    for (uint32_t i = 0; i < n_samples; ++i) {
+      for (uint32_t j = 0; j < input_dim; ++j) {
+        mean_d[j] += static_cast<double>(data[i * input_dim + j]);
+      }
+    }
+    const double inv_n = 1.0 / static_cast<double>(n_samples);
+    for (uint32_t j = 0; j < input_dim; ++j) {
+      mean_d[j] *= inv_n;
+      mean_[j] = static_cast<float>(mean_d[j]);
+    }
   } else {
     std::fill(mean_.begin(), mean_.end(), 0.0f);
   }
 
-  // Center the data
-  std::vector<float> centered(static_cast<size_t>(n_samples) * input_dim);
-  for (uint32_t i = 0; i < n_samples; ++i) {
-    for (uint32_t j = 0; j < input_dim; ++j) {
-      centered[i * input_dim + j] = data[i * input_dim + j] - mean_[j];
+  // --- Step 2: Incremental covariance in double precision ---
+  // Instead of materializing the full N x D centered matrix (~N*D*4 bytes),
+  // we process data in blocks and accumulate the D x D covariance directly.
+  Eigen::MatrixXd cov = Eigen::MatrixXd::Zero(input_dim, input_dim);
+
+  constexpr uint32_t kBlockSize = 256;
+  for (uint32_t start = 0; start < n_samples; start += kBlockSize) {
+    const uint32_t block_n = std::min(kBlockSize, n_samples - start);
+
+    // Build a small centered block in double precision
+    Eigen::MatrixXd block_data(block_n, input_dim);
+    for (uint32_t i = 0; i < block_n; ++i) {
+      const float* row = data + static_cast<size_t>(start + i) * input_dim;
+      for (uint32_t j = 0; j < input_dim; ++j) {
+        block_data(i, j) = static_cast<double>(row[j]) -
+                            static_cast<double>(mean_[j]);
+      }
     }
+
+    // Accumulate outer product: cov += block^T * block
+    cov.noalias() += block_data.transpose() * block_data;
   }
 
-  // Compute covariance matrix
-  std::vector<float> cov(static_cast<size_t>(input_dim) * input_dim);
-  ComputeCovariance(centered.data(), n_samples, input_dim, cov.data());
+  // Normalize by (n_samples - 1) for unbiased covariance estimate
+  cov /= static_cast<double>(n_samples - 1);
 
-  // Extract top-k eigenvectors via power iteration with deflation
+  // --- Step 3: Eigendecomposition in double precision ---
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(cov);
+  if (solver.info() != Eigen::Success) {
+    error_ = "Eigen decomposition failed";
+    return false;
+  }
+
+  const auto& eigenvalues = solver.eigenvalues();   // ascending order
+  const auto& eigenvectors = solver.eigenvectors();  // columns
+
+  // --- Step 4: Store results as float (descending eigenvalue order) ---
   components_.resize(static_cast<size_t>(output_dim) * input_dim);
   eigenvalues_.resize(output_dim);
 
-  std::vector<float> eigenvector(input_dim);
-
   for (uint32_t k = 0; k < output_dim; ++k) {
-    float eigenvalue = PowerIteration(cov.data(), input_dim, eigenvector.data());
-    eigenvalues_[k] = eigenvalue;
+    // Map descending index to ascending: largest eigenvalue is at col (dim-1)
+    uint32_t src_col = input_dim - 1 - k;
+    eigenvalues_[k] = static_cast<float>(eigenvalues(src_col));
 
-    // Store eigenvector as row k of components
-    std::copy(eigenvector.begin(), eigenvector.end(),
-              components_.begin() + k * input_dim);
-
-    // Deflate for next iteration
-    DeflateMatrix(cov.data(), input_dim, eigenvalue, eigenvector.data());
+    // Copy eigenvector column into components row k
+    for (uint32_t j = 0; j < input_dim; ++j) {
+      components_[k * input_dim + j] =
+          static_cast<float>(eigenvectors(j, src_col));
+    }
   }
 
   trained_ = true;
