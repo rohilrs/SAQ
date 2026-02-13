@@ -1,12 +1,15 @@
 /// @file saq_dbpedia_sample.cpp
-/// @brief End-to-end SAQ sample on DBpedia 100K dataset.
+/// @brief End-to-end SAQ benchmark on DBpedia 100K dataset.
 ///
-/// Demonstrates:
-/// - Loading vectors from .fvecs format
-/// - K-means clustering for IVF
-/// - Building SAQ-IVF index with scalar quantization
-/// - Search with varying nprobe
-/// - Computing recall, QPS, and error metrics
+/// Evaluates SAQ-IVF with parameters matching the SAQ paper
+/// (arXiv:2509.12086): PCA projection, configurable bits-per-dimension,
+/// and nprobe=200 as the paper's primary evaluation point.
+///
+/// Usage: saq_dbpedia_sample [data_dir] [results_dir] [bpd] [pca_dim]
+///   data_dir:    Path to dataset (default: data/datasets/dbpedia_100k)
+///   results_dir: Output directory (default: results/saq)
+///   bpd:         Bits per dimension (default: 1.0, paper tests 0.2-9)
+///   pca_dim:     PCA output dimension (default: full rotation; 0 = disable PCA)
 
 #include "index/ivf_index.h"
 #include "saq/saq_quantizer.h"
@@ -286,33 +289,45 @@ void WriteResults(const std::string& filename,
                   const std::vector<BenchmarkResult>& results,
                   uint32_t n_base, uint32_t n_queries, uint32_t dim,
                   uint32_t total_bits, uint32_t num_clusters,
-                  double build_time_s) {
+                  uint32_t pca_dim, uint32_t working_dim,
+                  double build_time_s,
+                  const std::string& allocation_summary) {
   std::ofstream out(filename);
   if (!out.is_open()) {
     std::cerr << "Cannot write results to: " << filename << std::endl;
     return;
   }
-  
+
+  float bpd = static_cast<float>(total_bits) / static_cast<float>(dim);
+
   out << "================================================================================\n";
   out << "SAQ-IVF Benchmark Results\n";
   out << "================================================================================\n\n";
-  
+
   out << "Dataset Configuration:\n";
   out << "  Base vectors:    " << n_base << "\n";
   out << "  Query vectors:   " << n_queries << "\n";
   out << "  Dimension:       " << dim << "\n\n";
-  
+
   out << "Index Configuration:\n";
   out << "  Clusters (K):    " << num_clusters << "\n";
+  out << "  Bits/dim (bpd):  " << std::fixed << std::setprecision(2) << bpd << "\n";
   out << "  Total bits:      " << total_bits << "\n";
-  out << "  Compression:     " << std::fixed << std::setprecision(1) 
+  out << "  PCA dim:         " << pca_dim << (pca_dim == dim ? " (full rotation)" : " (reduced)") << "\n";
+  out << "  Working dim:     " << working_dim << "\n";
+  out << "  Compression:     " << std::fixed << std::setprecision(1)
       << ComputeRatio(dim, total_bits) << "x\n";
-  out << "  Build time:      " << std::fixed << std::setprecision(2) 
+  out << "  Build time:      " << std::fixed << std::setprecision(2)
       << build_time_s << " seconds\n\n";
-  
+
+  if (!allocation_summary.empty()) {
+    out << "Bit Allocation (DP result):\n";
+    out << allocation_summary << "\n";
+  }
+
   out << "Search Results:\n";
   out << std::string(80, '-') << "\n";
-  out << std::setw(8) << "nprobe" 
+  out << std::setw(8) << "nprobe"
       << std::setw(8) << "k"
       << std::setw(12) << "Recall@k"
       << std::setw(12) << "QPS"
@@ -320,7 +335,7 @@ void WriteResults(const std::string& filename,
       << std::setw(14) << "Search(ms)"
       << "\n";
   out << std::string(80, '-') << "\n";
-  
+
   for (const auto& r : results) {
     out << std::setw(8) << r.nprobe
         << std::setw(8) << r.k
@@ -331,7 +346,7 @@ void WriteResults(const std::string& filename,
         << "\n";
   }
   out << std::string(80, '-') << "\n\n";
-  
+
   out << "Legend:\n";
   out << "  nprobe:      Number of clusters searched\n";
   out << "  k:           Number of nearest neighbors returned\n";
@@ -339,7 +354,7 @@ void WriteResults(const std::string& filename,
   out << "  QPS:         Queries per second\n";
   out << "  Rel.Error:   Average relative error of estimated distances\n";
   out << "  Search(ms):  Total search time for all queries\n";
-  
+
   out.close();
   std::cout << "Results written to: " << filename << std::endl;
 }
@@ -348,118 +363,199 @@ void WriteResults(const std::string& filename,
 // Main
 // ============================================================================
 
+/// @brief Build DP allocation summary string for diagnostics.
+std::string BuildAllocationSummary(const QuantizationPlan& plan) {
+  std::ostringstream ss;
+
+  uint32_t total_bits_used = 0;
+  uint32_t dims_with_bits = 0;
+  uint32_t dims_without_bits = 0;
+
+  ss << "  Segments: " << plan.segments.size() << "\n";
+  for (const auto& seg : plan.segments) {
+    uint32_t seg_bits = seg.bits * seg.dim_count;
+    total_bits_used += seg_bits;
+    if (seg.bits > 0) {
+      dims_with_bits += seg.dim_count;
+    } else {
+      dims_without_bits += seg.dim_count;
+    }
+  }
+
+  ss << "  Total bits used: " << total_bits_used << " / " << plan.total_bits
+     << " (budget)\n";
+  ss << "  Dims with bits:  " << dims_with_bits << "\n";
+  ss << "  Dims w/o bits:   " << dims_without_bits << "\n";
+
+  // Show per-segment detail (first 10 and last 2)
+  ss << "  Segment details (id: dims[start..end] @ bits/dim):\n";
+  for (size_t i = 0; i < plan.segments.size(); ++i) {
+    if (i < 10 || i >= plan.segments.size() - 2) {
+      const auto& seg = plan.segments[i];
+      ss << "    seg " << std::setw(3) << seg.id << ": "
+         << std::setw(4) << seg.dim_count << " dims ["
+         << std::setw(4) << seg.start_dim << ".."
+         << std::setw(4) << (seg.start_dim + seg.dim_count - 1) << "] @ "
+         << seg.bits << " bpd"
+         << " (" << (seg.bits * seg.dim_count) << " bits)\n";
+    } else if (i == 10) {
+      ss << "    ... (" << (plan.segments.size() - 12) << " more segments) ...\n";
+    }
+  }
+
+  return ss.str();
+}
+
 int main(int argc, char* argv[]) {
   std::cout << "================================================================================\n";
-  std::cout << "SAQ-IVF Sample: DBpedia 100K Dataset\n";
+  std::cout << "SAQ-IVF Benchmark: DBpedia 100K Dataset\n";
   std::cout << "================================================================================\n\n";
-  
-  // Paths
+
+  // Parse arguments
   std::string data_dir = "data/datasets/dbpedia_100k";
   std::string results_dir = "results/saq";
-  
+  float bpd = 1.0f;          // Bits per dimension (paper tests 0.2-9)
+  uint32_t pca_dim_arg = 99999;  // default: full rotation (clamped to dim below)
+
   if (argc > 1) data_dir = argv[1];
   if (argc > 2) results_dir = argv[2];
-  
+  if (argc > 3) bpd = std::stof(argv[3]);
+  if (argc > 4) pca_dim_arg = static_cast<uint32_t>(std::stoul(argv[4]));
+
   // Load data
-  std::cout << "[1/5] Loading data...\n";
-  
+  std::cout << "[1/6] Loading data...\n";
+
   std::vector<float> base_vectors, query_vectors;
   uint32_t n_base, n_queries, dim, qdim;
-  
+
   if (!ReadFvecs(data_dir + "/vectors.fvecs", base_vectors, n_base, dim)) {
     std::cerr << "Failed to load base vectors\n";
     return 1;
   }
   std::cout << "  Base vectors: " << n_base << " x " << dim << "\n";
-  
+
   if (!ReadFvecs(data_dir + "/queries.fvecs", query_vectors, n_queries, qdim)) {
     std::cerr << "Failed to load queries\n";
     return 1;
   }
   std::cout << "  Queries: " << n_queries << " x " << qdim << "\n";
-  
+
   if (dim != qdim) {
     std::cerr << "Dimension mismatch!\n";
     return 1;
   }
-  
+
   std::vector<std::vector<uint32_t>> ground_truth;
   if (!ReadIvecs(data_dir + "/groundtruth.ivecs", ground_truth)) {
     std::cerr << "Failed to load ground truth\n";
     return 1;
   }
   std::cout << "  Ground truth: " << ground_truth.size() << " queries\n\n";
-  
-  // Configuration
+
+  // Resolve PCA dimension: 0 = no PCA, >0 = enable PCA with given dim
+  uint32_t pca_dim = (pca_dim_arg == 0) ? 0 : std::min(pca_dim_arg, dim);
+  bool use_pca = (pca_dim > 0);
+
+  // Compute total bits from bpd (relative to original dimension, matching paper)
+  uint32_t total_bits = static_cast<uint32_t>(bpd * static_cast<float>(dim));
+  if (total_bits == 0) total_bits = 1;
+
+  std::cout << "Configuration:\n";
+  std::cout << "  Bits/dim (bpd): " << std::fixed << std::setprecision(2) << bpd << "\n";
+  std::cout << "  Total bits:     " << total_bits << "\n";
+  std::cout << "  PCA dim:        " << pca_dim
+            << (pca_dim == 0 ? " (disabled)" : pca_dim == dim ? " (full rotation)" : " (reduced)") << "\n";
+  std::cout << "  Compression:    " << std::fixed << std::setprecision(1)
+            << ComputeRatio(dim, total_bits) << "x\n\n";
+
+  // Clustering
   const uint32_t num_clusters = static_cast<uint32_t>(4 * std::sqrt(n_base));
-  const uint32_t total_bits = 64;  // 64 bits per vector (48x compression for 1536d)
-  
-  std::cout << "[2/5] Clustering (" << num_clusters << " clusters)...\n";
-  
+  std::cout << "[2/6] Clustering (" << num_clusters << " clusters)...\n";
+
   std::vector<float> centroids;
   std::vector<uint32_t> assignments;
-  
+
   auto cluster_start = Clock::now();
   KMeansClustering(base_vectors.data(), n_base, dim, num_clusters,
                     centroids, assignments, 15, 42);
   auto cluster_end = Clock::now();
   double cluster_time = std::chrono::duration<double>(cluster_end - cluster_start).count();
-  std::cout << "  Clustering time: " << std::fixed << std::setprecision(2) 
+  std::cout << "  Clustering time: " << std::fixed << std::setprecision(2)
             << cluster_time << " seconds\n\n";
-  
-  // Build index
-  std::cout << "[3/5] Building SAQ-IVF index...\n";
-  
+
+  // Build index with paper-matching SAQ configuration
+  std::cout << "[3/6] Building SAQ-IVF index (bpd=" << std::fixed
+            << std::setprecision(2) << bpd << ", PCA=" << pca_dim << ")...\n";
+
   IVFIndex index;
   IVFTrainConfig config;
   config.ivf.num_clusters = num_clusters;
   config.ivf.nprobe = 32;
-  config.saq.total_bits = total_bits;
   config.seed = 42;
-  
+
+  // SAQ configuration
+  config.saq.total_bits = total_bits;
+  config.saq.use_pca = use_pca;
+  config.saq.pca_dim = pca_dim;
+  config.saq.use_segment_rotation = true;
+
+  // Bound segment size for DP feasibility at high bit budgets.
+  // Without this, DP over 1536 dims with Q=12288 is O(D^2 * Q) which is too slow.
+  config.saq.max_dims_per_segment = 48;
+  config.saq.min_dims_per_segment = 1;
+  config.saq.min_bits_per_dim = 0;
+  config.saq.max_bits_per_dim = 8;
+
   auto build_start = Clock::now();
   std::string err = index.Build(base_vectors.data(), n_base, dim,
                                  centroids.data(), assignments.data(), config);
   auto build_end = Clock::now();
-  
+
   if (!err.empty()) {
     std::cerr << "Build failed: " << err << std::endl;
     return 1;
   }
-  
+
   double build_time = std::chrono::duration<double>(build_end - build_start).count();
-  std::cout << "  Build time: " << std::fixed << std::setprecision(2) 
+  std::cout << "  Build time: " << std::fixed << std::setprecision(2)
             << build_time << " seconds\n";
-  std::cout << std::endl;
-  
-  // Benchmark with varying nprobe
-  std::cout << "[4/5] Running search benchmarks...\n";
-  
-  std::vector<uint32_t> nprobe_values = {1, 2, 4, 8, 16, 32, 64, 128};
+
+  // Print DP allocation diagnostics
+  std::cout << "\n[4/6] Bit allocation diagnostics:\n";
+  const auto& plan = index.GetPlan();
+  std::string alloc_summary = BuildAllocationSummary(plan);
+  std::cout << alloc_summary << std::endl;
+
+  // Benchmark with varying nprobe (include 200 to match paper's evaluation)
+  std::cout << "[5/6] Running search benchmarks...\n";
+
+  std::vector<uint32_t> nprobe_values = {1, 2, 4, 8, 16, 32, 64, 128, 200};
   std::vector<uint32_t> k_values = {1, 10, 100};
   std::vector<BenchmarkResult> results;
-  
+
   for (uint32_t nprobe : nprobe_values) {
+    if (nprobe > num_clusters) continue;
+
     // Warmup
     std::vector<std::vector<IVFSearchResult>> warmup_results;
     index.SearchBatch(query_vectors.data(), 10, 10, warmup_results, nprobe);
-    
+
     // Actual search
     std::vector<std::vector<IVFSearchResult>> search_results;
-    
+
     auto search_start = Clock::now();
     index.SearchBatch(query_vectors.data(), n_queries, 100, search_results, nprobe);
     auto search_end = Clock::now();
-    
+
     double search_time_ms = std::chrono::duration<double, std::milli>(search_end - search_start).count();
     double qps = n_queries / (search_time_ms / 1000.0);
-    
+
     // Compute metrics for each k
     for (uint32_t k : k_values) {
       float recall = ComputeRecall(search_results, ground_truth, k);
       float rel_error = ComputeRelativeError(search_results, base_vectors.data(),
                                               query_vectors.data(), dim, k);
-      
+
       BenchmarkResult r;
       r.nprobe = nprobe;
       r.k = k;
@@ -469,18 +565,18 @@ int main(int argc, char* argv[]) {
       r.ratio = ComputeRatio(dim, total_bits);
       r.search_time_ms = search_time_ms;
       results.push_back(r);
-      
-      std::cout << "  nprobe=" << std::setw(3) << nprobe 
+
+      std::cout << "  nprobe=" << std::setw(3) << nprobe
                 << " k=" << std::setw(3) << k
                 << " recall=" << std::fixed << std::setprecision(2) << std::setw(6) << (recall * 100) << "%"
                 << " QPS=" << std::fixed << std::setprecision(0) << std::setw(6) << qps
                 << "\n";
     }
   }
-  
+
   // Write results
-  std::cout << "\n[5/5] Writing results...\n";
-  
+  std::cout << "\n[6/6] Writing results...\n";
+
   // Create results directory if needed
   #ifdef _WIN32
     std::string mkdir_cmd = "mkdir \"" + results_dir + "\" 2>nul";
@@ -488,14 +584,27 @@ int main(int argc, char* argv[]) {
     std::string mkdir_cmd = "mkdir -p \"" + results_dir + "\"";
   #endif
   system(mkdir_cmd.c_str());
-  
-  std::string results_file = results_dir + "/dbpedia_100k_results.txt";
+
+  // Include bpd in filename for easy comparison across runs
+  std::ostringstream bpd_str;
+  bpd_str << std::fixed << std::setprecision(1) << bpd;
+  std::string results_file = results_dir + "/dbpedia_100k_bpd" + bpd_str.str() + "_results.txt";
+
+  uint32_t working_dim = (index.GetPlan().use_pca && index.GetPlan().pca.output_dim > 0)
+      ? index.GetPlan().pca.output_dim
+      : dim;
+
   WriteResults(results_file, results, n_base, n_queries, dim,
-               total_bits, num_clusters, build_time + cluster_time);
-  
+               total_bits, num_clusters, pca_dim, working_dim,
+               build_time + cluster_time, alloc_summary);
+
   std::cout << "\n================================================================================\n";
-  std::cout << "Sample completed successfully!\n";
+  std::cout << "Benchmark completed successfully!\n";
+  std::cout << "  bpd=" << std::fixed << std::setprecision(2) << bpd
+            << "  total_bits=" << total_bits
+            << "  compression=" << std::fixed << std::setprecision(1)
+            << ComputeRatio(dim, total_bits) << "x\n";
   std::cout << "================================================================================\n";
-  
+
   return 0;
 }
