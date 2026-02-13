@@ -1,0 +1,61 @@
+=== SAQ Python Bindings Benchmark ===
+NumPy version: 2.4.2
+
+=== IVF Scalar Search Benchmark (Python) ===
+Vectors: 10000, Dim: 128, Clusters: 100
+Queries: 100, k: 10, nprobe: 10
+Total bits: 64
+
+Generating data... done
+Clustering... done
+Computing ground truth... done
+Building IVF index... done (7.98 ms)
+Searching... done
+
+=== Results ===
+Build Time: 7.98 ms
+Search Time (100 queries): 1.19 ms
+Queries Per Second: 83970.11 QPS
+Recall@10: 6.40%
+
+=== IVF Scalar Search Benchmark (Python) ===
+Vectors: 50000, Dim: 128, Clusters: 256
+Queries: 100, k: 10, nprobe: 20
+Total bits: 64
+
+Generating data... done
+Clustering... done
+Computing ground truth... done
+Building IVF index... done (15.29 ms)
+Searching... done
+
+=== Results ===
+Build Time: 15.29 ms
+Search Time (100 queries): 3.90 ms
+Queries Per Second: 25617.38 QPS
+Recall@10: 4.00%
+
+=== IVF Scalar Search Benchmark (Python) ===
+Vectors: 100000, Dim: 128, Clusters: 512
+Queries: 100, k: 10, nprobe: 32
+Total bits: 64
+
+Generating data... done
+Clustering... done
+Computing ground truth... done
+Building IVF index... done (30.70 ms)
+Searching... done
+
+=== Results ===
+Build Time: 30.70 ms
+Search Time (100 queries): 5.95 ms
+Queries Per Second: 16806.44 QPS
+Recall@10: 3.50%
+
+
+=== Summary ===
+   Vectors    Build(ms)   Search(ms)          QPS     Recall
+----------------------------------------------------------
+     10000         7.98         1.19     83970.11      6.40%
+     50000        15.29         3.90     25617.38      4.00%
+    100000        30.70         5.95     16806.44      3.50%

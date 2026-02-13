@@ -11,6 +11,7 @@ option(SAQ_BUILD_SAMPLES "Build SAQ sample programs" ON)
 option(SAQ_REQUIRE_AVX512 "Require AVX-512 support" ON)
 option(SAQ_BUILD_TESTS "Build SAQ test programs" OFF)
 option(SAQ_USE_OPENMP "Enable OpenMP parallelization" ON)
+option(SAQ_BUILD_PYTHON "Build Python bindings via pybind11" OFF)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -21,6 +22,15 @@ FetchContent_Declare(
   GIT_TAG        1.0.0-beta.14
 )
 FetchContent_MakeAvailable(taocpp-json)
+
+if(SAQ_BUILD_PYTHON)
+  FetchContent_Declare(
+    pybind11
+    GIT_REPOSITORY https://github.com/pybind/pybind11.git
+    GIT_TAG        v2.12.0
+  )
+  FetchContent_MakeAvailable(pybind11)
+endif()
 
 add_library(saq STATIC)
 target_include_directories(saq
@@ -64,3 +74,7 @@ if(SAQ_BUILD_SAMPLES)
 endif()
 
 add_subdirectory(src)
+
+if(SAQ_BUILD_PYTHON)
+  add_subdirectory(python/bindings)
+endif()
