@@ -1,14 +1,17 @@
-# SAQ: Segmented Additive Quantization
+# SAQ: Scalar Additive Quantization
 
-A high-performance C++17 implementation of **Segmented Additive Quantization** for approximate nearest neighbor search, based on the paper [arXiv:2509.12086](https://arxiv.org/abs/2509.12086).
+A high-performance C++17 implementation of **Scalar Additive Quantization** for approximate nearest neighbor search, based on the paper [arXiv:2509.12086](https://arxiv.org/abs/2509.12086).
 
 ## Features
 
 - **Extreme Compression**: 768x compression ratio (1536d float32 → 64 bits)
+- **Scalar Quantization**: Uniform grid per dimension with per-vector v_max scaling
+- **Joint DP Optimization**: Single dynamic programming pass for simultaneous segmentation and bit allocation
 - **IVF Indexing**: Scalable to 1M-10M+ vectors with sublinear search
-- **FastScan SIMD**: AVX-512/AVX2 accelerated distance estimation (1.6-2.1x speedup)
-- **Asymmetric Distance**: Precomputed lookup tables for fast query processing
-- **Flexible Bit Allocation**: Dynamic programming for optimal bits-per-segment
+- **OpenMP Parallelization**: Multi-threaded build and search (5.6x speedup at 8 threads)
+- **Python Bindings**: pybind11 interface with NumPy interop (~3% overhead vs C++)
+- **SIMD Acceleration**: AVX-512/AVX2 kernels for distance computation
+- **Code Adjustment (CAQ)**: Per-dimension refinement optimizing cosine similarity
 
 ## Quick Start
 
@@ -17,15 +20,22 @@ A high-performance C++17 implementation of **Segmented Additive Quantization** f
 ```powershell
 # Windows (MSVC with AVX-512)
 mkdir build && cd build
-cmake .. -G Ninja -DSAQ_BUILD_SAMPLES=ON
+cmake .. -G Ninja -DSAQ_BUILD_SAMPLES=ON -DSAQ_USE_OPENMP=ON
 cmake --build .
 ```
 
 ```bash
 # Linux/macOS
 mkdir -p build && cd build
-cmake .. -DSAQ_BUILD_SAMPLES=ON
+cmake .. -DSAQ_BUILD_SAMPLES=ON -DSAQ_USE_OPENMP=ON
 make -j$(nproc)
+```
+
+### Build with Python Bindings
+
+```bash
+cmake .. -DSAQ_BUILD_PYTHON=ON
+cmake --build . --target _saq_core
 ```
 
 ### Run Sample
@@ -48,52 +58,47 @@ SAQ/
 │   │   ├── quantization_plan.h  # Serializable plan structure
 │   │   ├── pca_projection.h     # Dimensionality reduction
 │   │   ├── dimension_segmentation.h
-│   │   ├── bit_allocation_dp.h  # Optimal bit distribution
-│   │   ├── caq_code_adjustment.h
-│   │   ├── distance_estimator.h # Asymmetric distance
+│   │   ├── bit_allocation_dp.h  # Joint segmentation + bit allocation
+│   │   ├── caq_code_adjustment.h # Per-dimension code adjustment
+│   │   ├── distance_estimator.h # Scalar IP estimation
 │   │   └── simd_kernels.h       # AVX-512/AVX2 kernels
 │   └── index/         # Indexing structures
 │       ├── ivf_index.h          # IVF partitioning
 │       └── fast_scan/           # SIMD-accelerated scanning
 ├── src/               # Implementation files
 ├── samples/           # End-to-end examples
-├── python/            # Python utilities (clustering, data prep)
+├── python/
+│   ├── saq/           # Python package (pybind11 bindings)
+│   ├── bindings/      # C++/Python binding source
+│   ├── ivf_clustering.py  # FAISS-based clustering utility
+│   └── benchmark_saq.py   # Python benchmark script
 ├── data/              # Datasets (downloaded, not in git)
 ├── results/           # Benchmark results
 ├── tests/             # Unit tests
 └── docs/              # Documentation and diagrams
 ```
 
-## Performance (DBpedia 100K, 1536d)
-
-| nprobe | Recall@100 | QPS    | Compression |
-|--------|------------|--------|-------------|
-| 1      | 27.7%      | 1,284  | 768x        |
-| 8      | 26.9%      | 1,166  | 768x        |
-| 32     | 23.8%      | 1,017  | 768x        |
-| 128    | 22.6%      | 748    | 768x        |
-
-*64 bits per vector, FastScan enabled, single-threaded*
-
 ## Algorithm Overview
 
 ```
 Training:
-  1. PCA Projection (optional) → reduce dimensionality
-  2. Dimension Segmentation   → partition dims by variance
-  3. Bit Allocation (DP)      → optimal bits per segment
-  4. Codebook Training        → k-means per segment
+  1. PCA Projection (optional)        → reduce dimensionality
+  2. Joint DP (segmentation + bits)   → optimal segments and bit allocation
+  3. Per-segment random rotation      → decorrelate dimensions within segments
+  4. Compute per-dimension statistics → variance for distortion model
 
 Encoding:
-  1. Project vector (if PCA)
-  2. Quantize each segment → nearest centroid
-  3. CAQ Refinement (optional) → cross-segment optimization
+  1. Project vector (PCA if enabled)
+  2. Apply per-segment rotation
+  3. Scalar quantize: c[i] = floor((v[i] + v_max) / delta)
+  4. CAQ refinement (optional) → per-dimension ±1 adjustments for cosine similarity
 
 Search:
   1. Find nprobe nearest clusters (IVF)
-  2. Precompute distance tables (query → centroids)
-  3. Scan clusters with table lookups (FastScan SIMD)
-  4. Return top-K results
+  2. Precompute scalar query table
+  3. Estimate IP: <o,q> = delta * <codes, q> + q_sum * (-v_max + delta/2)
+  4. Convert to L2: ||q-o||^2 = ||q||^2 - 2*IP + ||o||^2
+  5. Return top-K results
 ```
 
 See [docs/saq_codeflow.md](docs/saq_codeflow.md) for detailed Mermaid diagrams.
@@ -103,13 +108,24 @@ See [docs/saq_codeflow.md](docs/saq_codeflow.md) for detailed Mermaid diagrams.
 - **Compiler**: C++17 (MSVC 2019+, GCC 9+, Clang 10+)
 - **SIMD**: AVX-512 recommended, AVX2 fallback supported
 - **CMake**: 3.16+
-- **Python** (optional): 3.8+ with numpy, datasets, faiss
+- **OpenMP** (optional): For multi-threaded build and search
+- **Python** (optional): 3.8+ with numpy for bindings; faiss for clustering
+
+## CMake Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `SAQ_BUILD_SAMPLES` | ON | Build sample programs |
+| `SAQ_BUILD_TESTS` | OFF | Build unit tests |
+| `SAQ_REQUIRE_AVX512` | ON | Require AVX-512 support |
+| `SAQ_USE_OPENMP` | ON | Enable OpenMP parallelization |
+| `SAQ_BUILD_PYTHON` | OFF | Build Python bindings (pybind11) |
 
 ## Citation
 
 ```bibtex
 @article{saq2025,
-  title     = {SAQ: Segmented Additive Quantization},
+  title     = {SAQ: Scalar Additive Quantization},
   eprint    = {2509.12086},
   archivePrefix = {arXiv},
   primaryClass  = {cs.LG},

@@ -1,20 +1,78 @@
-# SAQ Python Utilities
+# SAQ Python
 
-Python scripts for data preparation, clustering, and benchmarking support.
+Python bindings, utilities, and benchmarks for the SAQ library.
 
 ## Setup
 
 ```bash
-# Create conda environment (recommended)
-conda create -n saq python=3.10
-conda activate saq
+# Install numpy (required for bindings)
+pip install numpy
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Or install individually
-pip install numpy faiss-cpu datasets
+# For clustering support
+pip install faiss-cpu
 ```
+
+## Python Bindings (pybind11)
+
+The `saq` package provides Python access to the C++ SAQ library with NumPy interop.
+
+### Building
+
+```bash
+# From project root
+mkdir build && cd build
+cmake .. -DSAQ_BUILD_PYTHON=ON
+cmake --build . --target _saq_core
+```
+
+The compiled module is placed in `python/saq/` automatically.
+
+### Usage
+
+```python
+import sys
+sys.path.insert(0, "python")  # Or install with pip install -e python/
+
+import numpy as np
+import saq
+
+# Create and build IVF index
+index = saq.IVFIndex()
+config = saq.IVFTrainConfig()
+config.ivf.num_clusters = 100
+config.saq.total_bits = 64
+
+data = np.random.randn(10000, 128).astype(np.float32)
+centroids = ...  # From k-means
+assignments = ...  # Cluster IDs
+
+index.build(data, centroids, assignments, config)
+
+# Search
+queries = np.random.randn(10, 128).astype(np.float32)
+indices, distances = index.search_batch(queries, k=10, nprobe=10)
+
+# Save/Load
+index.save("my_index.bin")
+index2 = saq.IVFIndex()
+index2.load("my_index.bin")
+```
+
+### Available Classes
+
+| Class | Description |
+|-------|-------------|
+| `saq.SAQQuantizer` | Train, encode_batch, decode, search |
+| `saq.IVFIndex` | build, search, search_batch, save, load, reconstruct |
+| `saq.SAQTrainConfig` | Training parameters (total_bits, use_pca, metric, etc.) |
+| `saq.SAQEncodeConfig` | Encoding parameters (use_caq) |
+| `saq.IVFConfig` | IVF parameters (num_clusters, nprobe, hnsw) |
+| `saq.IVFTrainConfig` | Combined IVF + SAQ config |
+| `saq.DistanceMetric` | L2 or InnerProduct |
+
+### Performance
+
+The GIL is released during compute-heavy C++ calls (`build`, `search_batch`, `encode_batch`), so Python binding overhead is minimal (~3% on search QPS).
 
 ## Scripts
 
@@ -35,48 +93,28 @@ python ivf_clustering.py \
     l2
 ```
 
-**Arguments:**
-| Argument | Description |
-|----------|-------------|
-| `data_file` | Input vectors (.fvecs or .npy) |
-| `num_clusters` | Number of clusters K (recommend: 4 × √n) |
-| `centroids_out` | Output centroid vectors |
-| `cluster_ids_out` | Output cluster assignments |
-| `metric` | `l2` (default) or `ip` (inner product) |
+### benchmark_saq.py — Python Benchmark
 
-**Why use this instead of C++ clustering?**
-- FAISS provides GPU-accelerated k-means
-- Faster for large datasets (1M+ vectors)
-- Pre-clustering separates concerns from index building
+Benchmarks IVF search performance through the Python bindings.
+
+```bash
+# Set PYTHONPATH to include python/ directory
+export PYTHONPATH=python:$PYTHONPATH
+
+# Run all configurations
+python python/benchmark_saq.py
+
+# Small-scale only
+python python/benchmark_saq.py --small-only
+```
 
 ### samples/download_dbpedia.py — Dataset Download
 
-Downloads the DBpedia 100K dataset from HuggingFace and prepares it for benchmarking.
+Downloads the DBpedia 100K dataset from HuggingFace.
 
 ```bash
+pip install datasets
 python samples/download_dbpedia.py
-```
-
-**Output:**
-- `data/datasets/dbpedia_100k/vectors.fvecs` — 99K base vectors (1536d)
-- `data/datasets/dbpedia_100k/queries.fvecs` — 1K query vectors
-- `data/datasets/dbpedia_100k/groundtruth.ivecs` — Exact k-NN (k=100)
-
-## File Format Utilities
-
-Both scripts include utility functions for reading/writing standard formats:
-
-```python
-from ivf_clustering import read_fvecs, write_fvecs, read_ivecs, write_ivecs
-
-# Read vectors
-vectors = read_fvecs("data/sift_base.fvecs")  # Returns np.ndarray (n, d)
-
-# Write vectors
-write_fvecs("output.fvecs", vectors)
-
-# Read ground truth
-gt = read_ivecs("groundtruth.ivecs")  # Returns np.ndarray (n, k)
 ```
 
 ## Requirements
@@ -86,27 +124,25 @@ See [requirements.txt](requirements.txt):
 ```
 numpy>=1.20
 faiss-cpu>=1.7.0    # Or faiss-gpu for CUDA support
-datasets>=2.0       # For HuggingFace dataset loading
 ```
 
 ## Integration with C++
 
-The Python scripts produce files that the C++ sample directly consumes:
-
 ```
 ┌─────────────────────┐     ┌─────────────────────┐
-│  download_dbpedia.py│────▶│  vectors.fvecs      │
+│  download_dbpedia.py│────>│  vectors.fvecs      │
 │                     │     │  queries.fvecs      │
 │                     │     │  groundtruth.ivecs  │
 └─────────────────────┘     └──────────┬──────────┘
                                        │
-┌─────────────────────┐                ▼
-│  ivf_clustering.py  │────▶  centroids.fvecs
+┌─────────────────────┐                v
+│  ivf_clustering.py  │────>  centroids.fvecs
 │  (optional)         │       cluster_ids.ivecs
 └─────────────────────┘                │
-                                       ▼
-                            ┌─────────────────────┐
-                            │  saq_dbpedia_sample │
-                            │  (C++ executable)   │
-                            └─────────────────────┘
+                                       v
+                  ┌──────────────────────────────────┐
+                  │  saq_dbpedia_sample (C++)         │
+                  │  — or —                          │
+                  │  saq.IVFIndex (Python bindings)   │
+                  └──────────────────────────────────┘
 ```

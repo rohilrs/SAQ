@@ -11,8 +11,8 @@ Complete benchmark on the DBpedia 100K dataset (1536d OpenAI embeddings).
 **Features:**
 - Loads vectors from .fvecs format
 - K-means++ clustering for IVF partitioning
-- Builds SAQ-IVF index with FastScan
-- Benchmarks search with varying nprobe
+- Builds SAQ-IVF index with scalar quantization
+- Benchmarks search with varying nprobe (1-128)
 - Computes recall@k, QPS, and relative error
 - Writes detailed results to file
 
@@ -45,16 +45,14 @@ SAQ-IVF Sample: DBpedia 100K Dataset
   Ground truth: 1000 queries
 
 [2/5] Clustering (1258 clusters)...
-  Clustering time: 6593.03 seconds
+  Clustering time: ...
 
 [3/5] Building SAQ-IVF index...
-  Build time: 273.18 seconds
-  FastScan enabled: yes
+  Build time: ...
 
 [4/5] Running search benchmarks...
-  nprobe=  1 k=  1 recall=  8.00% QPS=  1284
-  nprobe= 32 k=100 recall= 23.77% QPS=  1017
-  ...
+  nprobe=  1 k=  1 recall=  ...% QPS= ...
+  nprobe= 32 k=100 recall=  ...% QPS= ...
 
 [5/5] Writing results...
 Results written to: results/saq/dbpedia_100k_results.txt
@@ -66,7 +64,7 @@ Samples are built when `SAQ_BUILD_SAMPLES=ON` (default):
 
 ```bash
 mkdir build && cd build
-cmake .. -DSAQ_BUILD_SAMPLES=ON
+cmake .. -DSAQ_BUILD_SAMPLES=ON -DSAQ_USE_OPENMP=ON
 cmake --build .
 ```
 
@@ -76,13 +74,20 @@ The sample uses these default parameters:
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `num_clusters` | 4 × √n | IVF partitions |
+| `num_clusters` | 4 x sqrt(n) | IVF partitions |
 | `total_bits` | 64 | Bits per vector (768x compression for 1536d) |
-| `num_segments` | 16 | Segments (4 bits each) |
-| `use_fast_scan` | true | SIMD-accelerated scanning |
-| `nprobe` | 1-128 | Clusters searched per query |
+| `nprobe` | 1-128 | Clusters searched per query (swept) |
+| `k` | 1, 10, 100 | Nearest neighbors returned (swept) |
 
 Modify these in `saq_dbpedia_sample.cpp` to experiment with different trade-offs.
+
+## OpenMP
+
+With `SAQ_USE_OPENMP=ON`, the index build and search use multiple threads. Control thread count with `OMP_NUM_THREADS`:
+
+```bash
+OMP_NUM_THREADS=8 ./build/samples/saq_dbpedia_sample
+```
 
 ## Adding New Samples
 
@@ -104,7 +109,7 @@ target_link_libraries(your_sample PRIVATE saq)
 |--------|---------|
 | `download_dbpedia.py` | Download DBpedia 100K from HuggingFace |
 
-See [python/README.md](../python/README.md) for more utilities.
+See [python/README.md](../python/README.md) for more utilities and the Python benchmark.
 
 ## Results
 
@@ -113,30 +118,4 @@ Sample results are written to `results/saq/`:
 ```
 results/saq/
 └── dbpedia_100k_results.txt
-```
-
-Example output format:
-```
-================================================================================
-SAQ-IVF Benchmark Results
-================================================================================
-
-Dataset Configuration:
-  Base vectors:    99000
-  Query vectors:   1000
-  Dimension:       1536
-
-Index Configuration:
-  Clusters (K):    1258
-  Total bits:      64
-  FastScan:        enabled
-  Compression:     768.0x
-
-Search Results:
---------------------------------------------------------------------------------
-  nprobe       k    Recall@k         QPS       Rel.Error    Search(ms)
---------------------------------------------------------------------------------
-       1       1       8.00%      1284.0         0.3479        778.80
-      ...
---------------------------------------------------------------------------------
 ```
