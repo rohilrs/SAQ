@@ -142,16 +142,18 @@ JointAllocationResult BitAllocatorDP::AllocateJointDP(
     }
   }
 
-  // Find best solution: dp[D][q] for any q <= Q
-  // We want to use as much of the budget as possible for best quality,
-  // but the DP already optimizes distortion, so take the minimum.
+  // Find best solution: prefer using the full budget Q for best search quality.
+  // More bits always improve quantization accuracy. Search downward from Q
+  // for the highest usable budget with a valid solution.
   float best_dist = kInfinity;
   uint32_t best_q = 0;
-  for (uint32_t q = 0; q <= Q; ++q) {
-    if (dp[D][q] < best_dist) {
+  for (uint32_t q = Q; ; --q) {
+    if (dp[D][q] < kInfinity) {
       best_dist = dp[D][q];
       best_q = q;
+      break;
     }
+    if (q == 0) break;
   }
 
   if (best_dist >= kInfinity) {
