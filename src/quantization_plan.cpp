@@ -1,475 +1,208 @@
 /// @file quantization_plan.cpp
-/// @brief Implementation of QuantizationPlan serialization.
+/// @brief Implementation of SaqData serialization and SaqDataMaker DP/segmentation.
+///
+/// Ported faithfully from reference:
+///   - saqlib/quantization/saq_data.hpp (SaqData::save/load, SaqDataMaker methods)
 
 #include "saq/quantization_plan.h"
 
-#include <cstring>
-#include <tao/json.hpp>
+#include <algorithm>
+#include <limits>
+#include <utility>
+#include <vector>
 
 namespace saq {
 
-namespace {
+// ============================================================================
+// SaqData::save / SaqData::load
+// ============================================================================
 
-/// Binary format magic number: "PQSA" in little-endian.
-constexpr uint32_t kBinaryMagic = 0x53515150;
+void SaqData::save(std::ofstream &output) const {
+    output.write(reinterpret_cast<const char *>(&cfg), sizeof(QuantizeConfig));
+    output.write(reinterpret_cast<const char *>(&num_dim), sizeof(size_t));
+    save_floatvec(output, data_variance);
 
-void WriteU32(std::vector<uint8_t>* out, uint32_t v) {
-  out->push_back(static_cast<uint8_t>(v & 0xFFu));
-  out->push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
-  out->push_back(static_cast<uint8_t>((v >> 16) & 0xFFu));
-  out->push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
-}
-
-/// Write a single byte.
-void WriteU8(std::vector<uint8_t>* out, uint8_t v) {
-  out->push_back(v);
-}
-
-/// Read a 32-bit unsigned integer in little-endian format.
-bool ReadU32(const std::vector<uint8_t>& in, size_t* offset, uint32_t* v) {
-  if (*offset + 4 > in.size()) { return false; }
-  *v = static_cast<uint32_t>(in[*offset]) |
-       (static_cast<uint32_t>(in[*offset + 1]) << 8) |
-       (static_cast<uint32_t>(in[*offset + 2]) << 16) |
-       (static_cast<uint32_t>(in[*offset + 3]) << 24);
-  *offset += 4;
-  return true;
-}
-
-/// Read a single byte.
-bool ReadU8(const std::vector<uint8_t>& in, size_t* offset, uint8_t* v) {
-  if (*offset + 1 > in.size()) { return false; }
-  *v = in[*offset];
-  *offset += 1;
-  return true;
-}
-
-/// Write a 32-bit float as a little-endian uint32.
-void WriteF32(std::vector<uint8_t>* out, float v) {
-  static_assert(sizeof(float) == 4, "float must be 4 bytes");
-  uint32_t u;
-  std::memcpy(&u, &v, sizeof(float));
-  WriteU32(out, u);
-}
-
-/// Read a 32-bit float from little-endian uint32.
-bool ReadF32(const std::vector<uint8_t>& in, size_t* offset, float* v) {
-  uint32_t u = 0;
-  if (!ReadU32(in, offset, &u)) { return false; }
-  std::memcpy(v, &u, sizeof(float));
-  return true;
-}
-
-/// Write a length-prefixed array of floats.
-void WriteF32Array(std::vector<uint8_t>* out, const std::vector<float>& data) {
-  WriteU32(out, static_cast<uint32_t>(data.size()));
-  for (float f : data) {
-    WriteF32(out, f);
-  }
-}
-
-/// Read a length-prefixed array of floats.
-bool ReadF32Array(const std::vector<uint8_t>& in, size_t* offset,
-                  std::vector<float>* data) {
-  uint32_t count = 0;
-  if (!ReadU32(in, offset, &count)) { return false; }
-  data->clear();
-  data->reserve(count);
-  for (uint32_t i = 0; i < count; ++i) {
-    float f = 0.0f;
-    if (!ReadF32(in, offset, &f)) { return false; }
-    data->push_back(f);
-  }
-  return true;
-}
-
-// --- JSON serialization helpers ---
-
-/// Convert float vector to JSON array of doubles.
-tao::json::value FloatVecToJson(const std::vector<float>& vec) {
-  tao::json::value arr = tao::json::empty_array;
-  for (float f : vec) {
-    arr.emplace_back(static_cast<double>(f));
-  }
-  return arr;
-}
-
-/// Convert JSON array of numbers to float vector.
-std::vector<float> JsonToFloatVec(const tao::json::value& v) {
-  std::vector<float> result;
-  if (v.is_array()) {
-    result.reserve(v.get_array().size());
-    for (const auto& elem : v.get_array()) {
-      result.push_back(static_cast<float>(elem.as<double>()));
+    auto size = base_datas.size();
+    output.write(reinterpret_cast<const char *>(&size), sizeof(size_t));
+    for (const auto &bi : base_datas) {
+        bi.save(output);
     }
-  }
-  return result;
 }
 
-/// Serialize PCAParams to JSON object.
-tao::json::value ToJson(const PCAParams& p) {
-  tao::json::value v = tao::json::empty_object;
-  v["input_dim"] = static_cast<std::uint64_t>(p.input_dim);
-  v["output_dim"] = static_cast<std::uint64_t>(p.output_dim);
-  v["enabled"] = p.enabled;
-  v["mean"] = FloatVecToJson(p.mean);
-  v["components"] = FloatVecToJson(p.components);
-  return v;
-}
+void SaqData::load(std::ifstream &input) {
+    input.read(reinterpret_cast<char *>(&cfg), sizeof(QuantizeConfig));
+    input.read(reinterpret_cast<char *>(&num_dim), sizeof(size_t));
+    load_floatvec(input, data_variance);
+    CHECK_EQ(data_variance.cols(), static_cast<Eigen::Index>(num_dim))
+        << "data_variance size mismatch with num_dim";
 
-/// Serialize Segment to JSON object.
-tao::json::value ToJson(const Segment& s) {
-  tao::json::value v = tao::json::empty_object;
-  v["id"] = static_cast<std::uint64_t>(s.id);
-  v["start_dim"] = static_cast<std::uint64_t>(s.start_dim);
-  v["dim_count"] = static_cast<std::uint64_t>(s.dim_count);
-  v["bits"] = static_cast<std::uint64_t>(s.bits);
-  return v;
-}
-
-/// Serialize Codebook to JSON object.
-tao::json::value ToJson(const Codebook& c) {
-  tao::json::value v = tao::json::empty_object;
-  v["segment_id"] = static_cast<std::uint64_t>(c.segment_id);
-  v["bits"] = static_cast<std::uint64_t>(c.bits);
-  v["centroids"] = static_cast<std::uint64_t>(c.centroids);
-  v["dim_count"] = static_cast<std::uint64_t>(c.dim_count);
-  v["data"] = FloatVecToJson(c.data);
-  return v;
-}
-
-/// Deserialize PCAParams from JSON object.
-bool FromJson(const tao::json::value& v, PCAParams* p) {
-  if (!v.is_object()) { return false; }
-  p->input_dim = static_cast<uint32_t>(v.at("input_dim").as<std::uint64_t>());
-  p->output_dim = static_cast<uint32_t>(v.at("output_dim").as<std::uint64_t>());
-  p->enabled = v.at("enabled").as<bool>();
-  p->mean = JsonToFloatVec(v.at("mean"));
-  p->components = JsonToFloatVec(v.at("components"));
-  return true;
-}
-
-/// Deserialize Segment from JSON object.
-bool FromJson(const tao::json::value& v, Segment* s) {
-  if (!v.is_object()) { return false; }
-  s->id = static_cast<uint32_t>(v.at("id").as<std::uint64_t>());
-  s->start_dim = static_cast<uint32_t>(v.at("start_dim").as<std::uint64_t>());
-  s->dim_count = static_cast<uint32_t>(v.at("dim_count").as<std::uint64_t>());
-  s->bits = static_cast<uint32_t>(v.at("bits").as<std::uint64_t>());
-  return true;
-}
-
-/// Deserialize Codebook from JSON object.
-bool FromJson(const tao::json::value& v, Codebook* c) {
-  if (!v.is_object()) { return false; }
-  c->segment_id = static_cast<uint32_t>(v.at("segment_id").as<std::uint64_t>());
-  c->bits = static_cast<uint32_t>(v.at("bits").as<std::uint64_t>());
-  c->centroids = static_cast<uint32_t>(v.at("centroids").as<std::uint64_t>());
-  c->dim_count = static_cast<uint32_t>(v.at("dim_count").as<std::uint64_t>());
-  c->data = JsonToFloatVec(v.at("data"));
-  return true;
-}
-
-/// Serialize SegmentRotation to JSON object.
-tao::json::value ToJson(const SegmentRotation& r) {
-  tao::json::value v = tao::json::empty_object;
-  v["segment_id"] = static_cast<std::uint64_t>(r.segment_id);
-  v["dim_count"] = static_cast<std::uint64_t>(r.dim_count);
-  v["matrix"] = FloatVecToJson(r.matrix);
-  return v;
-}
-
-/// Deserialize SegmentRotation from JSON object.
-bool FromJson(const tao::json::value& v, SegmentRotation* r) {
-  if (!v.is_object()) { return false; }
-  r->segment_id = static_cast<uint32_t>(v.at("segment_id").as<std::uint64_t>());
-  r->dim_count = static_cast<uint32_t>(v.at("dim_count").as<std::uint64_t>());
-  r->matrix = JsonToFloatVec(v.at("matrix"));
-  return true;
-}
-
-}  // anonymous namespace
-
-bool QuantizationPlan::Validate(std::string* error) const {
-  if (dimension == 0) {
-    if (error) { *error = "dimension must be > 0"; }
-    return false;
-  }
-  if (segment_count != segments.size()) {
-    if (error) { *error = "segment_count does not match segments size"; }
-    return false;
-  }
-  // For version 2 (scalar quantization), codebooks may be empty.
-  // For version 1 (legacy), codebook_count must match.
-  if (version < 2 && codebook_count != codebooks.size()) {
-    if (error) { *error = "codebook_count does not match codebooks size"; }
-    return false;
-  }
-  return true;
-}
-
-std::vector<uint8_t> QuantizationPlan::SerializeBinary() const {
-  std::vector<uint8_t> out;
-  out.reserve(256);
-
-  WriteU32(&out, kBinaryMagic);
-  WriteU32(&out, version);
-  WriteU32(&out, dimension);
-  WriteU32(&out, total_bits);
-  WriteU32(&out, segment_count);
-  WriteU32(&out, codebook_count);
-  WriteU32(&out, seed);
-  WriteU8(&out, use_pca ? 1 : 0);
-
-  WriteU32(&out, pca.input_dim);
-  WriteU32(&out, pca.output_dim);
-  WriteU8(&out, pca.enabled ? 1 : 0);
-  WriteF32Array(&out, pca.mean);
-  WriteF32Array(&out, pca.components);
-
-  WriteU32(&out, static_cast<uint32_t>(segments.size()));
-  for (const auto& s : segments) {
-    WriteU32(&out, s.id);
-    WriteU32(&out, s.start_dim);
-    WriteU32(&out, s.dim_count);
-    WriteU32(&out, s.bits);
-  }
-
-  WriteU32(&out, static_cast<uint32_t>(codebooks.size()));
-  for (const auto& c : codebooks) {
-    WriteU32(&out, c.segment_id);
-    WriteU32(&out, c.bits);
-    WriteU32(&out, c.centroids);
-    WriteU32(&out, c.dim_count);
-    WriteF32Array(&out, c.data);
-  }
-
-  // Version 2+: write per-segment rotation matrices.
-  if (version >= 2) {
-    WriteU32(&out, static_cast<uint32_t>(rotations.size()));
-    for (const auto& r : rotations) {
-      WriteU32(&out, r.segment_id);
-      WriteU32(&out, r.dim_count);
-      WriteF32Array(&out, r.matrix);
+    size_t size;
+    input.read(reinterpret_cast<char *>(&size), sizeof(size_t));
+    base_datas.clear();
+    quant_plan.clear();
+    base_datas.resize(size);
+    for (auto &bi : base_datas) {
+        bi.load(input);
+        quant_plan.emplace_back(bi.num_dim_pad, bi.num_bits);
     }
-  }
-
-  return out;
 }
 
-bool QuantizationPlan::DeserializeBinary(const std::vector<uint8_t>& data, std::string* error) {
-  size_t offset = 0;
-  uint32_t magic = 0;
-  if (!ReadU32(data, &offset, &magic) || magic != kBinaryMagic) {
-    if (error) { *error = "invalid binary magic"; }
-    return false;
-  }
+// ============================================================================
+// SaqDataMaker::compute_variance
+// ============================================================================
 
-  if (!ReadU32(data, &offset, &version) ||
-      !ReadU32(data, &offset, &dimension) ||
-      !ReadU32(data, &offset, &total_bits) ||
-      !ReadU32(data, &offset, &segment_count) ||
-      !ReadU32(data, &offset, &codebook_count) ||
-      !ReadU32(data, &offset, &seed)) {
-    if (error) { *error = "truncated header"; }
-    return false;
-  }
-
-  uint8_t use_pca_u8 = 0;
-  if (!ReadU8(data, &offset, &use_pca_u8)) {
-    if (error) { *error = "truncated use_pca"; }
-    return false;
-  }
-  use_pca = (use_pca_u8 != 0);
-
-  uint8_t pca_enabled_u8 = 0;
-  if (!ReadU32(data, &offset, &pca.input_dim) ||
-      !ReadU32(data, &offset, &pca.output_dim) ||
-      !ReadU8(data, &offset, &pca_enabled_u8)) {
-    if (error) { *error = "truncated pca header"; }
-    return false;
-  }
-  pca.enabled = (pca_enabled_u8 != 0);
-  if (!ReadF32Array(data, &offset, &pca.mean) ||
-      !ReadF32Array(data, &offset, &pca.components)) {
-    if (error) { *error = "truncated pca data"; }
-    return false;
-  }
-
-  uint32_t seg_count = 0;
-  if (!ReadU32(data, &offset, &seg_count)) {
-    if (error) { *error = "truncated segments count"; }
-    return false;
-  }
-  segments.clear();
-  segments.reserve(seg_count);
-  for (uint32_t i = 0; i < seg_count; ++i) {
-    Segment s;
-    if (!ReadU32(data, &offset, &s.id) ||
-        !ReadU32(data, &offset, &s.start_dim) ||
-        !ReadU32(data, &offset, &s.dim_count) ||
-        !ReadU32(data, &offset, &s.bits)) {
-      if (error) { *error = "truncated segment entry"; }
-      return false;
-    }
-    segments.push_back(std::move(s));
-  }
-
-  uint32_t cb_count = 0;
-  if (!ReadU32(data, &offset, &cb_count)) {
-    if (error) { *error = "truncated codebooks count"; }
-    return false;
-  }
-  codebooks.clear();
-  codebooks.reserve(cb_count);
-  for (uint32_t i = 0; i < cb_count; ++i) {
-    Codebook c;
-    if (!ReadU32(data, &offset, &c.segment_id) ||
-        !ReadU32(data, &offset, &c.bits) ||
-        !ReadU32(data, &offset, &c.centroids) ||
-        !ReadU32(data, &offset, &c.dim_count)) {
-      if (error) { *error = "truncated codebook entry header"; }
-      return false;
-    }
-    if (!ReadF32Array(data, &offset, &c.data)) {
-      if (error) { *error = "truncated codebook data"; }
-      return false;
-    }
-    codebooks.push_back(std::move(c));
-  }
-
-  // Version 2+: read per-segment rotation matrices.
-  if (version >= 2 && offset < data.size()) {
-    uint32_t rot_count = 0;
-    if (!ReadU32(data, &offset, &rot_count)) {
-      if (error) { *error = "truncated rotations count"; }
-      return false;
-    }
-    rotations.clear();
-    rotations.reserve(rot_count);
-    for (uint32_t i = 0; i < rot_count; ++i) {
-      SegmentRotation r;
-      if (!ReadU32(data, &offset, &r.segment_id) ||
-          !ReadU32(data, &offset, &r.dim_count)) {
-        if (error) { *error = "truncated rotation entry"; }
-        return false;
-      }
-      if (!ReadF32Array(data, &offset, &r.matrix)) {
-        if (error) { *error = "truncated rotation matrix data"; }
-        return false;
-      }
-      rotations.push_back(std::move(r));
-    }
-  }
-
-  if (segment_count != segments.size()) {
-    segment_count = static_cast<uint32_t>(segments.size());
-  }
-  if (codebook_count != codebooks.size()) {
-    codebook_count = static_cast<uint32_t>(codebooks.size());
-  }
-
-  return Validate(error);
+void SaqDataMaker::compute_variance(const FloatRowMat &data) {
+    CHECK_EQ(data.cols(), static_cast<Eigen::Index>(num_dim_padded_))
+        << "Data dimension mismatch with padded dimension";
+    FloatVec mean = data.colwise().mean();
+    FloatVec data_variance = ((data.rowwise() - mean).array().square()).colwise().mean();
+    set_variance(std::move(data_variance));
 }
 
-std::string QuantizationPlan::SerializeJson(bool pretty) const {
-  tao::json::value v = tao::json::empty_object;
-  v["version"] = static_cast<std::uint64_t>(version);
-  v["dimension"] = static_cast<std::uint64_t>(dimension);
-  v["total_bits"] = static_cast<std::uint64_t>(total_bits);
-  v["segment_count"] = static_cast<std::uint64_t>(segment_count);
-  v["codebook_count"] = static_cast<std::uint64_t>(codebook_count);
-  v["seed"] = static_cast<std::uint64_t>(seed);
-  v["use_pca"] = use_pca;
-  v["pca"] = ToJson(pca);
+// ============================================================================
+// SaqDataMaker::prepare_quantizers
+// ============================================================================
 
-  tao::json::value segs = tao::json::empty_array;
-  for (const auto& s : segments) {
-    segs.emplace_back(ToJson(s));
-  }
-  v["segments"] = std::move(segs);
+void SaqDataMaker::prepare_quantizers() {
+    CHECK_EQ(data_->data_variance.cols(), static_cast<Eigen::Index>(num_dim_padded_))
+        << "please set_variance or compute_variance before prepare()";
+    analyze_plan();
 
-  tao::json::value cbs = tao::json::empty_array;
-  for (const auto& c : codebooks) {
-    cbs.emplace_back(ToJson(c));
-  }
-  v["codebooks"] = std::move(cbs);
+    data_->base_datas.clear();
+    for (auto [dim, bit] : data_->quant_plan) {
+        BaseQuantizerData bi;
+        bi.num_dim_pad = dim;
+        bi.num_bits = bit;
+        bi.cfg = data_->cfg.single;
+        bi.init();
 
-  tao::json::value rots = tao::json::empty_array;
-  for (const auto& r : rotations) {
-    rots.emplace_back(ToJson(r));
-  }
-  v["rotations"] = std::move(rots);
-
-  return pretty ? tao::json::to_string(v, 2) : tao::json::to_string(v);
+        data_->base_datas.emplace_back(std::move(bi));
+    }
 }
 
-bool QuantizationPlan::DeserializeJson(const std::string& json, std::string* error) {
-  try {
-    const auto v = tao::json::from_string(json);
-    if (!v.is_object()) {
-      if (error) { *error = "root must be a JSON object"; }
-      return false;
+// ============================================================================
+// SaqDataMaker::equal_segmentation
+// ============================================================================
+
+SaqDataMaker::QuantPlanT SaqDataMaker::equal_segmentation(int num_segs) {
+    size_t b = static_cast<size_t>(data_->cfg.avg_bits);
+    LOG_IF(WARNING, b != data_->cfg.avg_bits)
+        << fmt::format("Can not use float-point {} as equal-segment bits. Will use {} bit instead.",
+                        data_->cfg.avg_bits, b);
+    QuantPlanT quant_plan;
+    size_t d = 0;
+    for (int i = 0; i < num_segs && d < num_dim_padded_; i++) {
+        auto t = rd_up_to_multiple_of((num_dim_padded_ - d) / (num_segs - i), kDimPaddingSize);
+        quant_plan.push_back({t, b});
+        d += t;
     }
+    return quant_plan;
+}
 
-    version = static_cast<uint32_t>(v.at("version").as<std::uint64_t>());
-    dimension = static_cast<uint32_t>(v.at("dimension").as<std::uint64_t>());
-    total_bits = static_cast<uint32_t>(v.at("total_bits").as<std::uint64_t>());
-    segment_count = static_cast<uint32_t>(v.at("segment_count").as<std::uint64_t>());
-    codebook_count = static_cast<uint32_t>(v.at("codebook_count").as<std::uint64_t>());
-    seed = static_cast<uint32_t>(v.at("seed").as<std::uint64_t>());
-    use_pca = v.at("use_pca").as<bool>();
+// ============================================================================
+// SaqDataMaker::dynamic_programming
+// ============================================================================
 
-    if (!FromJson(v.at("pca"), &pca)) {
-      if (error) { *error = "invalid pca object"; }
-      return false;
-    }
+SaqDataMaker::QuantPlanT SaqDataMaker::dynamic_programming(
+    const FloatVec &data_variance, float avg_bits) {
 
-    segments.clear();
-    for (const auto& s : v.at("segments").get_array()) {
-      Segment seg;
-      if (!FromJson(s, &seg)) {
-        if (error) { *error = "invalid segment entry"; }
-        return false;
-      }
-      segments.push_back(std::move(seg));
-    }
+    CHECK_EQ(data_variance.cols(), static_cast<Eigen::Index>(num_dim_padded_));
 
-    codebooks.clear();
-    for (const auto& c : v.at("codebooks").get_array()) {
-      Codebook cb;
-      if (!FromJson(c, &cb)) {
-        if (error) { *error = "invalid codebook entry"; }
-        return false;
-      }
-      codebooks.push_back(std::move(cb));
-    }
+    const auto num_bit_factors = kNumShortFactors * sizeof(float) * 8;
+    const size_t tot_bits = static_cast<size_t>(avg_bits * num_dim_padded_ + num_bit_factors);
+    const size_t max_num_segs = avg_bits < 2
+        ? num_dim_padded_ / kDimPaddingSize
+        : num_dim_padded_ / kDimPaddingSize / 2;
+    constexpr auto valid_lmt = std::numeric_limits<double>::max();
 
-    // Read rotations (optional, present in version 2+).
-    rotations.clear();
-    if (v.find("rotations") != nullptr) {
-      for (const auto& r : v.at("rotations").get_array()) {
-        SegmentRotation rot;
-        if (!FromJson(r, &rot)) {
-          if (error) { *error = "invalid rotation entry"; }
-          return false;
+    // DP table: f[ns][i][used_bits] = (min_error, backtrack_info)
+    //   ns: number of segments used so far
+    //   i: number of kDimPaddingSize-blocks covered so far
+    //   used_bits: total bits consumed so far
+    auto f = std::vector<std::vector<std::vector<std::pair<double, size_t>>>>(
+        max_num_segs + 1,
+        std::vector<std::vector<std::pair<double, size_t>>>(
+            num_dim_padded_ / kDimPaddingSize + 1,
+            std::vector<std::pair<double, size_t>>(
+                tot_bits + 1, {valid_lmt, 0})));
+
+    const size_t i_end = num_dim_padded_ / kDimPaddingSize;
+    size_t ans_ns = 0;
+    size_t ans_i = i_end;
+    size_t ans_b = tot_bits;
+
+    f[0][0][0] = {0, 0};
+
+    for (size_t ns = 0; ns <= max_num_segs; ns++) {
+        for (size_t i = 0; i <= i_end; i++) {
+            for (size_t used_bits = 0; used_bits <= tot_bits; ++used_bits) {
+                if (f[ns][i][used_bits].first < valid_lmt) {
+                    if (i == i_end) {
+                        // At the end of all dimensions: check if this is a better solution
+                        if (f[ns][i][used_bits].first * (1.01) < f[ans_ns][ans_i][ans_b].first) {
+                            ans_ns = ns;
+                            ans_i = i;
+                            ans_b = used_bits;
+                        }
+                        continue;
+                    }
+                    if (ns == max_num_segs) {
+                        continue;
+                    }
+
+                    // Try extending with a new segment of j blocks with b bits each
+                    double var_sum = 0;
+                    for (size_t j = 1; (i + j) * kDimPaddingSize <= num_dim_padded_; j++) {
+                        var_sum += data_variance
+                                       .segment((i + j - 1) * kDimPaddingSize, kDimPaddingSize)
+                                       .sum();
+
+                        for (size_t b = 1; b <= kMaxQuantBit; ++b) {
+                            auto B_new = used_bits + b * j * kDimPaddingSize + num_bit_factors;
+                            if (B_new > tot_bits)
+                                break;
+                            auto v = var_sum / (1 << b);
+                            auto &f_to = f[ns + 1][i + j][B_new];
+                            if (f_to.first > f[ns][i][used_bits].first + v) {
+                                f_to.first = f[ns][i][used_bits].first + v;
+                                f_to.second = (i << 4) + b;
+                            }
+                        }
+                    }
+                    // Also try assigning 0 bits to remaining dimensions (unquantized tail)
+                    auto err0 = var_sum;
+                    if (f[ns][i][used_bits].first + err0 < f[1 + ns][i_end][used_bits].first) {
+                        f[1 + ns][i_end][used_bits].first = f[ns][i][used_bits].first + err0;
+                        f[1 + ns][i_end][used_bits].second = (i << 4) + 0;
+                    }
+                }
+            }
         }
-        rotations.push_back(std::move(rot));
-      }
     }
 
-    if (segment_count != segments.size()) {
-      segment_count = static_cast<uint32_t>(segments.size());
-    }
-    if (codebook_count != codebooks.size()) {
-      codebook_count = static_cast<uint32_t>(codebooks.size());
-    }
+    // Backtrack to reconstruct the optimal quantization plan
+    QuantPlanT quant_plan;
+    {
+        size_t ns = ans_ns;
+        size_t i = ans_i;
+        size_t B = ans_b;
+        while (i > 0) {
+            auto &f_cur = f[ns][i][B];
+            auto prev_i = (f_cur.second >> 4);
+            auto curr_bits = f_cur.second & 0xf;
+            auto curr_dim_len = (i - prev_i) * kDimPaddingSize;
+            quant_plan.emplace_back(curr_dim_len, curr_bits);
 
-    return Validate(error);
-  } catch (const std::exception& e) {
-    if (error) { *error = e.what(); }
-    return false;
-  }
+            ns--;
+            i = prev_i;
+            if (curr_bits)
+                B -= curr_bits * curr_dim_len + num_bit_factors;
+        }
+
+        // Reverse since we constructed the plan by working backwards
+        std::reverse(quant_plan.begin(), quant_plan.end());
+    }
+    return quant_plan;
 }
 
-}  // namespace saq
+} // namespace saq

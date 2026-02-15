@@ -1,105 +1,202 @@
 #pragma once
 
 /// @file quantization_plan.h
-/// @brief Data structures for SAQ quantization plan serialization.
+/// @brief SaqData (quantization plan container) and SaqDataMaker (plan builder).
 ///
-/// Defines the QuantizationPlan struct and related types that describe
-/// how vectors are segmented, how bits are allocated, and what codebooks
-/// are used for quantization.
+/// Ported from reference:
+///   - saqlib/quantization/saq_data.hpp     -> SaqData, SaqDataMaker
+///   - saqlib/quantization/quantizer_data.hpp -> BaseQuantizerData
+///
+/// SaqData holds the complete quantization plan: per-dimension variance,
+/// segment dimensions/bits, and per-segment rotators. SaqDataMaker computes
+/// the optimal plan via joint dynamic programming over segmentation + bit
+/// allocation.
 
-#include <cstdint>
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include <glog/logging.h>
+#include <fmt/core.h>
+
+#include "saq/defines.h"
+#include "saq/config.h"
+#include "saq/io_utils.h"
+#include "saq/rotator.h"
+#include "saq/tools.h"
 
 namespace saq {
 
-/// @brief Serialization format for QuantizationPlan.
-enum class SerializationFormat : uint8_t {
-  kBinary = 0,  ///< Compact binary format.
-  kJson = 1     ///< Human-readable JSON format.
-};
+// ============================================================================
+// BaseQuantizerData — per-segment quantization metadata + rotator
+// ============================================================================
 
-/// @brief Parameters for optional PCA dimensionality reduction.
-struct PCAParams {
-  uint32_t input_dim = 0;         ///< Original vector dimensionality.
-  uint32_t output_dim = 0;        ///< Reduced dimensionality after PCA.
-  bool enabled = false;           ///< Whether PCA is applied.
-  std::vector<float> mean;        ///< Mean vector, size: input_dim.
-  std::vector<float> components;  ///< Principal components, size: output_dim * input_dim (row-major).
-};
-
-/// @brief A contiguous range of dimensions treated as one quantization unit.
-struct Segment {
-  uint32_t id = 0;          ///< Unique segment identifier.
-  uint32_t start_dim = 0;   ///< Starting dimension index (inclusive).
-  uint32_t dim_count = 0;   ///< Number of dimensions in this segment.
-  uint32_t bits = 0;        ///< Bits per dimension (B in the SAQ paper).
-                             ///< Total bits for segment = bits * dim_count.
-};
-
-/// @brief Codebook for quantizing a segment's dimensions (legacy, k-means based).
-struct Codebook {
-  uint32_t segment_id = 0;    ///< ID of the segment this codebook serves.
-  uint32_t bits = 0;          ///< Bits used for quantization (log2 of centroids).
-  uint32_t centroids = 0;     ///< Number of centroids, typically 2^bits.
-  uint32_t dim_count = 0;     ///< Dimensionality of each centroid.
-  std::vector<float> data;    ///< Centroid vectors, size: centroids * dim_count.
-};
-
-/// @brief Per-segment rotation matrix for decorrelating dimensions.
-struct SegmentRotation {
-  uint32_t segment_id = 0;     ///< ID of the segment this rotation serves.
-  uint32_t dim_count = 0;      ///< Size of the rotation matrix (dim_count x dim_count).
-  std::vector<float> matrix;   ///< Orthonormal rotation matrix, row-major.
-};
-
-/// @brief Complete specification for SAQ vector quantization.
+/// @brief Per-segment quantization data: padded dimension count, bit width,
+///        quantization config, and optional random rotation matrix.
 ///
-/// Contains all parameters needed to encode and decode vectors:
-/// PCA projection, dimension segments, bit allocations, and per-segment
-/// rotation matrices. Uses scalar (uniform grid) quantization per dimension.
-struct QuantizationPlan {
-  uint32_t version = 2;           ///< Schema version (2 = scalar quantization).
-  uint32_t dimension = 0;         ///< Input vector dimensionality.
-  uint32_t total_bits = 0;        ///< Total bits per encoded vector.
-  uint32_t segment_count = 0;     ///< Number of dimension segments.
-  uint32_t seed = 0;              ///< RNG seed for reproducibility.
-  bool use_pca = false;           ///< Whether PCA preprocessing is enabled.
+/// Ported from reference saqlib::BaseQuantizerData (quantizer_data.hpp).
+struct BaseQuantizerData {
+    size_t num_dim_pad;        ///< Padded dimension count for this segment
+    size_t num_bits;           ///< Bits per dimension for this segment
+    QuantSingleConfig cfg;     ///< Quantization configuration
+    RotatorPtr rotator;        ///< Per-segment random rotation (optional)
 
-  PCAParams pca;                  ///< PCA parameters (if use_pca is true).
-  std::vector<Segment> segments;  ///< Dimension segment definitions.
-  std::vector<SegmentRotation> rotations; ///< Per-segment rotation matrices.
+    /// @brief Initialize the rotator if random_rotation is enabled.
+    void init() {
+        if (cfg.random_rotation) {
+            rotator = std::make_unique<Rotator>(static_cast<uint32_t>(num_dim_pad));
+            rotator->orthogonalize();
+        }
+    }
 
-  // Legacy fields (kept for backward compatibility)
-  uint32_t codebook_count = 0;    ///< Number of codebooks (legacy).
-  std::vector<Codebook> codebooks;///< Codebooks for each segment (legacy).
+    /// @brief Serialize to binary stream.
+    void save(std::ofstream &output) const {
+        output.write(reinterpret_cast<const char *>(&num_dim_pad), sizeof(size_t));
+        output.write(reinterpret_cast<const char *>(&num_bits), sizeof(size_t));
+        output.write(reinterpret_cast<const char *>(&cfg), sizeof(QuantSingleConfig));
+        char flags = rotator ? 1 : 0;
+        output.write(&flags, sizeof(char));
+        if (rotator) {
+            rotator->save(output);
+        }
+    }
 
-  /// @brief Validate internal consistency.
-  /// @param error Optional output for error message.
-  /// @return True if valid.
-  bool Validate(std::string* error) const;
-
-  /// @brief Serialize to compact binary format.
-  /// @return Binary data.
-  std::vector<uint8_t> SerializeBinary() const;
-
-  /// @brief Deserialize from binary format.
-  /// @param data Binary data.
-  /// @param error Optional output for error message.
-  /// @return True on success.
-  bool DeserializeBinary(const std::vector<uint8_t>& data, std::string* error);
-
-  /// @brief Serialize to JSON string.
-  /// @param pretty If true, format with indentation.
-  /// @return JSON string.
-  std::string SerializeJson(bool pretty = false) const;
-
-  /// @brief Deserialize from JSON string.
-  /// @param json JSON string.
-  /// @param error Optional output for error message.
-  /// @return True on success.
-  bool DeserializeJson(const std::string& json, std::string* error);
+    /// @brief Deserialize from binary stream.
+    void load(std::ifstream &input) {
+        input.read(reinterpret_cast<char *>(&num_dim_pad), sizeof(size_t));
+        input.read(reinterpret_cast<char *>(&num_bits), sizeof(size_t));
+        input.read(reinterpret_cast<char *>(&cfg), sizeof(QuantSingleConfig));
+        char flags;
+        input.read(&flags, sizeof(char));
+        if (flags) {
+            rotator = std::make_unique<Rotator>(static_cast<uint32_t>(num_dim_pad));
+            rotator->load(input);
+        }
+    }
 };
 
-}  // namespace saq
+// ============================================================================
+// SaqData — complete quantization plan container
+// ============================================================================
 
+/// @brief Complete SAQ quantization plan: config, variance, segment plan,
+///        and per-segment BaseQuantizerData entries.
+///
+/// Ported from reference saqlib::SaqData (saq_data.hpp).
+struct SaqData {
+    using QuantPlanT = std::vector<std::pair<size_t, size_t>>; ///< (dim_length, bits) per segment
+
+    QuantizeConfig cfg;                        ///< Quantization configuration
+    size_t num_dim;                            ///< Original (unpadded) dimension
+    FloatVec data_variance;                    ///< Per-dimension variance (1 x num_dim_padded)
+    std::vector<BaseQuantizerData> base_datas; ///< Per-segment quantizer data
+    QuantPlanT quant_plan;                     ///< Quantization plan: (dim_length, bits) per segment
+
+    /// @brief Serialize the entire SaqData to a binary stream.
+    void save(std::ofstream &output) const;
+
+    /// @brief Deserialize from a binary stream.
+    void load(std::ifstream &input);
+
+    /// @brief Convenience: save to a named file.
+    void save(const std::string &filename) const {
+        std::ofstream output(filename, std::ios::binary);
+        CHECK(output.is_open()) << "Failed to open file for writing: " << filename;
+        save(output);
+        output.close();
+    }
+
+    /// @brief Convenience: load from a named file.
+    void load(const std::string &filename) {
+        std::ifstream input(filename, std::ios::binary);
+        CHECK(input.is_open()) << "Failed to open file for reading: " << filename;
+        load(input);
+        input.close();
+    }
+};
+
+// ============================================================================
+// SaqDataMaker — builds SaqData via DP-based segmentation + bit allocation
+// ============================================================================
+
+/// @brief Constructs a SaqData by computing per-dimension variance and then
+///        running joint dynamic programming over segmentation and bit allocation.
+///
+/// Ported from reference saqlib::SaqDataMaker (saq_data.hpp).
+class SaqDataMaker {
+  protected:
+    using QuantPlanT = SaqData::QuantPlanT;
+    static constexpr size_t kNumShortFactors = 2;
+    static constexpr size_t kMaxQuantBit = KMaxQuantizeBits;
+
+    const size_t num_dim_;        ///< Original dimension
+    const size_t num_dim_padded_; ///< Padded dimension (multiple of kDimPaddingSize)
+    std::unique_ptr<SaqData> data_;
+
+  public:
+    /// @brief Construct a SaqDataMaker with the given config and dimension.
+    explicit SaqDataMaker(QuantizeConfig cfg, size_t num_dim)
+        : num_dim_(num_dim),
+          num_dim_padded_(rd_up_to_multiple_of(num_dim, kDimPaddingSize)),
+          data_(std::make_unique<SaqData>()) {
+        data_->cfg = std::move(cfg);
+        data_->num_dim = num_dim_;
+    }
+
+    size_t getPaddedDim() const { return num_dim_padded_; }
+    const SaqData *get_data() const { return data_.get(); }
+    auto return_data() { return std::move(data_); }
+
+    bool is_variance_set() const {
+        return data_->data_variance.cols() != 0;
+    }
+
+    /// @brief Set per-dimension variance directly; pads with zeros if needed.
+    void set_variance(FloatVec vars) {
+        if (data_->data_variance.cols() < static_cast<int>(num_dim_padded_)) {
+            data_->data_variance = FloatVec::Zero(num_dim_padded_);
+            data_->data_variance.head(vars.cols()) = vars;
+        } else {
+            data_->data_variance = std::move(vars);
+        }
+        prepare_quantizers();
+    }
+
+    /// @brief Compute per-dimension variance from data matrix.
+    void compute_variance(const FloatRowMat &data);
+
+  protected:
+    /// @brief Create BaseQuantizerData entries from the quantization plan.
+    void prepare_quantizers();
+
+    /// @brief Analyze config and run DP or equal segmentation.
+    void analyze_plan() {
+        DCHECK_EQ(num_dim_padded_ % kDimPaddingSize, 0);
+
+        if (data_->cfg.enable_segmentation) {
+            if (data_->cfg.seg_eqseg > 0) {
+                data_->quant_plan = equal_segmentation(data_->cfg.seg_eqseg);
+            } else {
+                data_->quant_plan = dynamic_programming(data_->data_variance, data_->cfg.avg_bits);
+            }
+        } else {
+            data_->quant_plan = equal_segmentation(1);
+        }
+    }
+
+    /// @brief Uniformly partition dimensions into num_segs segments with equal bits.
+    QuantPlanT equal_segmentation(int num_segs);
+
+    /// @brief Joint DP over segmentation and bit allocation to minimize
+    ///        quantization distortion (sum of variance / 2^bits per segment).
+    QuantPlanT dynamic_programming(const FloatVec &data_variance, float avg_bits);
+};
+
+} // namespace saq
