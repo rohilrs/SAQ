@@ -4,7 +4,7 @@ project(saq LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(SAQ_BUILD_SAMPLES "Build SAQ sample programs" ON)
@@ -17,11 +17,16 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(FetchContent)
 FetchContent_Declare(
-  taocpp-json
-  GIT_REPOSITORY https://github.com/taocpp/json.git
-  GIT_TAG        1.0.0-beta.14
+  eigen
+  GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+  GIT_TAG        3.4.0
+  GIT_SHALLOW    TRUE
 )
-FetchContent_MakeAvailable(taocpp-json)
+FetchContent_MakeAvailable(eigen)
+
+find_package(glog REQUIRED)
+find_package(gflags REQUIRED)
+find_package(fmt REQUIRED)
 
 if(SAQ_BUILD_PYTHON)
   FetchContent_Declare(
@@ -39,7 +44,10 @@ target_include_directories(saq
 )
 target_link_libraries(saq
   PUBLIC
-    taocpp::json
+    Eigen3::Eigen
+    glog::glog
+    gflags
+    fmt::fmt
 )
 
 if(SAQ_REQUIRE_AVX512)
