@@ -1,4 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
+# Allow older FetchContent deps (gflags) that use cmake_minimum_required < 3.5
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 
 project(saq LANGUAGES C CXX)
 
@@ -22,11 +24,42 @@ FetchContent_Declare(
   GIT_TAG        3.4.0
   GIT_SHALLOW    TRUE
 )
-FetchContent_MakeAvailable(eigen)
 
-find_package(glog REQUIRED)
-find_package(gflags REQUIRED)
-find_package(fmt REQUIRED)
+# gflags (needed by glog)
+set(GFLAGS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(GFLAGS_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(GFLAGS_BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+set(GFLAGS_BUILD_gflags_LIB ON CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  gflags
+  GIT_REPOSITORY https://github.com/gflags/gflags.git
+  GIT_TAG        v2.2.2
+  GIT_SHALLOW    TRUE
+)
+
+# glog
+set(WITH_GFLAGS ON CACHE BOOL "" FORCE)
+set(WITH_GTEST OFF CACHE BOOL "" FORCE)
+set(WITH_UNWIND OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  glog
+  GIT_REPOSITORY https://github.com/google/glog.git
+  GIT_TAG        v0.7.1
+  GIT_SHALLOW    TRUE
+)
+
+# fmt
+set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
+set(FMT_TEST OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  fmt
+  GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+  GIT_TAG        10.2.1
+  GIT_SHALLOW    TRUE
+)
+
+FetchContent_MakeAvailable(eigen gflags glog fmt)
 
 if(SAQ_BUILD_PYTHON)
   FetchContent_Declare(
@@ -46,7 +79,7 @@ target_link_libraries(saq
   PUBLIC
     Eigen3::Eigen
     glog::glog
-    gflags
+    gflags_static
     fmt::fmt
 )
 

@@ -70,11 +70,11 @@ class CAQClusterData {
 
     ~CAQClusterData() {
         if (should_free_) {
-            std::free(short_factors_);
-            std::free(short_code_);
-            std::free(long_code_);
-            std::free(long_factors_);
-            std::free(ids_);
+            portable_aligned_free(short_factors_);
+            portable_aligned_free(short_code_);
+            portable_aligned_free(long_code_);
+            portable_aligned_free(long_factors_);
+            portable_aligned_free(ids_);
         }
     }
 
@@ -252,11 +252,11 @@ class SaqCluData {
 
     ~SaqCluData() {
         if (short_factors_) {
-            std::free(short_factors_);
+            portable_aligned_free(short_factors_);
         }
-        std::free(short_code_);
-        std::free(long_code_);
-        std::free(long_factors_);
+        portable_aligned_free(short_code_);
+        portable_aligned_free(long_code_);
+        portable_aligned_free(long_factors_);
     }
 
     auto &get_segment(size_t idx) { return segments_[idx]; }

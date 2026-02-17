@@ -233,12 +233,13 @@ class CAQEncoder {
         base_code.o_l2norm = caq.o_l2norm;
         base_code.fac_rescale = caq.fac_rescale;
         base_code.fac_error = caq.fac_error;
-        if (num_bits_ > 1) {
-            if (centroid) {
-                base_code.ip_cent_oa = centroid->dot(caq.get_oa());
+        if (num_bits_ >= 1) {
+            if (num_bits_ > 1) {
+                if (centroid) {
+                    base_code.ip_cent_oa = centroid->dot(caq.get_oa());
+                }
+                base_code.norm_ip_o_oa = caq.ip_o_oa / caq.o_l2norm / std::sqrt(caq.oa_l2sqr);
             }
-            base_code.norm_ip_o_oa = caq.ip_o_oa / caq.o_l2norm / std::sqrt(caq.oa_l2sqr);
-
             base_code.code = std::move(caq.code);
         }
     }

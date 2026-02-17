@@ -1,6 +1,11 @@
 #pragma once
 #define EIGEN_DONT_PARALLELIZE
 
+// MSVC uses __restrict instead of GCC's __restrict__
+#ifdef _MSC_VER
+#define __restrict__ __restrict
+#endif
+
 #include <stdint.h>
 
 #include <Eigen/Dense>

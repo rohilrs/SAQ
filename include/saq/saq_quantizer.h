@@ -1,215 +1,112 @@
 #pragma once
 
 /// @file saq_quantizer.h
-/// @brief Main SAQ quantizer implementing scalar additive quantization.
+/// @brief Top-level SAQ quantizers: SAQuantizer (cluster batch) and SAQuantizerSingle.
 ///
-/// Implements the SAQ paper (arXiv:2509.12086): PCA projection,
-/// joint dimension segmentation + bit allocation via DP,
-/// per-segment rotation, scalar (uniform grid) quantization,
-/// and code adjustment for cosine similarity optimization.
+/// Ported from reference saqlib/quantization/saq_quantizer.hpp.
+/// SAQuantizer orchestrates per-segment QuantizerCluster instances to encode
+/// all vectors in a cluster across all segments.
+/// SAQuantizerSingle orchestrates per-segment QuantizerSingle instances to
+/// encode a single vector across all segments.
 
-#include "saq/bit_allocation_dp.h"
-#include "saq/caq_code_adjustment.h"
-#include "saq/dimension_segmentation.h"
-#include "saq/distance_estimator.h"
-#include "saq/pca_projection.h"
-#include "saq/quantization_plan.h"
-
-#include <cstdint>
+#include <algorithm>
+#include <cstddef>
 #include <memory>
-#include <string>
 #include <vector>
+
+#include <glog/logging.h>
+
+#include "saq/defines.h"
+#include "saq/quantization_plan.h"
+#include "saq/quantizer.h"
+#include "saq/single_data.h"
+#include "saq/tools.h"
 
 namespace saq {
 
-/// @brief Training configuration for SAQ.
-struct SAQTrainConfig {
-  /// Target bits per vector (total budget across all segments).
-  uint32_t total_bits = 64;
+class SAQuantizer {
+  protected:
+    const size_t num_dim_;
+    const size_t num_dim_padded_;
+    std::vector<std::unique_ptr<QuantizerCluster>> data_quans_;
+    const SaqData *data_;
 
-  /// Whether to apply PCA before quantization.
-  bool use_pca = false;
+  public:
+    explicit SAQuantizer(const SaqData *data)
+        : num_dim_(data->num_dim),
+          num_dim_padded_(rd_up_to_multiple_of(num_dim_, kDimPaddingSize)),
+          data_(data) {
+        for (auto &bi : data_->base_datas) {
+            data_quans_.emplace_back(std::make_unique<QuantizerCluster>(&bi));
+        }
+    }
 
-  /// Target dimension after PCA (0 = no reduction).
-  uint32_t pca_dim = 0;
+    void quantize_cluster(const FloatRowMat &data, const FloatVec &centroid, const std::vector<PID> &IDs,
+                          SaqCluData &saq_clus) {
+        CHECK_EQ(saq_clus.num_segments_, data_quans_.size());
+        std::copy(IDs.begin(), IDs.end(), saq_clus.ids());
 
-  /// Random seed for reproducibility.
-  uint32_t seed = 42;
+        const size_t num_points = saq_clus.num_vec_;
+        for (size_t ci = 0, offset = 0; ci < saq_clus.num_segments_; ++ci) {
+            auto &clus = saq_clus.get_segment(ci);
+            const size_t copy_size = std::min(clus.num_dim_padded_, num_dim_ - offset);
 
-  /// Maximum bits per dimension in any segment.
-  uint32_t max_bits_per_dim = 8;
+            FloatRowMat vecs(static_cast<Eigen::Index>(num_points), static_cast<Eigen::Index>(clus.num_dim_padded_));
+            vecs.setZero();
+            for (size_t r = 0; r < num_points; ++r) {
+                auto id = clus.ids()[r];
+                vecs.row(static_cast<Eigen::Index>(r)).head(static_cast<Eigen::Index>(copy_size)) =
+                    data.row(static_cast<Eigen::Index>(id)).segment(static_cast<Eigen::Index>(offset), static_cast<Eigen::Index>(copy_size));
+            }
 
-  /// Minimum bits per dimension in any segment (0 = segment can be skipped).
-  uint32_t min_bits_per_dim = 0;
+            FloatVec cen(static_cast<Eigen::Index>(clus.num_dim_padded_));
+            cen.setZero();
+            cen.head(static_cast<Eigen::Index>(copy_size)) =
+                centroid.segment(static_cast<Eigen::Index>(offset), static_cast<Eigen::Index>(copy_size));
 
-  /// Minimum number of dimensions per segment.
-  uint32_t min_dims_per_segment = 1;
-
-  /// Maximum number of dimensions per segment (0 = no limit).
-  uint32_t max_dims_per_segment = 0;
-
-  /// Distance metric.
-  DistanceMetric metric = DistanceMetric::kL2;
-
-  /// Whether to generate per-segment rotation matrices.
-  bool use_segment_rotation = true;
+            data_quans_[ci]->quantize(vecs, cen, clus);
+            offset += clus.num_dim_padded_;
+        }
+    }
 };
 
-/// @brief Encoding configuration.
-struct SAQEncodeConfig {
-  /// Whether to use CAQ refinement (code adjustment).
-  bool use_caq = true;
+class SAQuantizerSingle {
+  protected:
+    const size_t num_dim_;
+    const size_t num_dim_padded_;
+    std::vector<std::unique_ptr<QuantizerSingle>> data_quans_;
+    const SaqData *data_;
 
-  /// CAQ configuration.
-  CAQConfig caq_config;
+  public:
+    SAQuantizerSingle(const SaqData *data)
+        : num_dim_(data->num_dim),
+          num_dim_padded_(rd_up_to_multiple_of(num_dim_, kDimPaddingSize)),
+          data_(data) {
+        for (auto &bi : data_->base_datas) {
+            data_quans_.emplace_back(std::make_unique<QuantizerSingle>(&bi));
+        }
+    }
+
+    void quantize(const FloatVec &or_vec, SaqSingleDataWrapper *caq_data) const {
+        CHECK_EQ(caq_data->num_segments_, data_quans_.size());
+
+        for (size_t ci = 0, offset = 0; ci < caq_data->num_segments_; ++ci) {
+            auto &clus = caq_data->get_segment(ci);
+
+            if (auto rem_sz = num_dim_ - offset; clus.num_dim_padded_ <= rem_sz) {
+                data_quans_[ci]->quantize(
+                    or_vec.segment(static_cast<Eigen::Index>(offset), static_cast<Eigen::Index>(clus.num_dim_padded_)),
+                    &clus);
+            } else {
+                FloatVec t = FloatVec::Zero(static_cast<Eigen::Index>(clus.num_dim_padded_));
+                t.head(static_cast<Eigen::Index>(rem_sz)) =
+                    or_vec.segment(static_cast<Eigen::Index>(offset), static_cast<Eigen::Index>(rem_sz));
+                data_quans_[ci]->quantize(t, &clus);
+            }
+
+            offset += clus.num_dim_padded_;
+        }
+    }
 };
 
-/// @brief Search result for a single query.
-struct SearchResult {
-  uint32_t index = 0;     ///< Index of the result vector.
-  float distance = 0.0f;  ///< Distance to query.
-};
-
-/// @brief Encoded vector in scalar quantization format.
-///
-/// Each dimension is quantized to B bits (per the segment's allocation).
-/// The codes are packed as uint8_t per dimension (supports up to 8 bits).
-/// A per-vector v_max stores the scaling factor for reconstruction.
-struct ScalarEncodedVector {
-  std::vector<uint8_t> codes;  ///< Per-dimension codes, size = working_dim.
-  float v_max = 0.0f;          ///< Max absolute value for this vector.
-};
-
-/// @brief The main SAQ quantizer using scalar quantization.
-///
-/// Implements the full SAQ pipeline:
-/// 1. PCA projection (optional dimensionality reduction)
-/// 2. Joint dimension segmentation + bit allocation (DP)
-/// 3. Per-segment random orthonormal rotation
-/// 4. Scalar (uniform grid) quantization per dimension
-/// 5. Code adjustment (CAQ) for cosine similarity
-class SAQQuantizer {
- public:
-  SAQQuantizer() = default;
-  ~SAQQuantizer() = default;
-
-  // Non-copyable, movable
-  SAQQuantizer(const SAQQuantizer&) = delete;
-  SAQQuantizer& operator=(const SAQQuantizer&) = delete;
-  SAQQuantizer(SAQQuantizer&&) = default;
-  SAQQuantizer& operator=(SAQQuantizer&&) = default;
-
-  /// @brief Train the quantizer on a dataset.
-  /// @param data Training vectors, row-major (n_vectors x dim).
-  /// @param n_vectors Number of training vectors.
-  /// @param dim Vector dimensionality.
-  /// @param config Training configuration.
-  /// @return Error message, empty on success.
-  std::string Train(const float* data, uint32_t n_vectors, uint32_t dim,
-                    const SAQTrainConfig& config);
-
-  /// @brief Encode a single vector to scalar codes.
-  /// @param vector Input vector.
-  /// @param encoded Output encoded vector.
-  /// @param config Encoding configuration.
-  /// @return True on success.
-  bool Encode(const float* vector, ScalarEncodedVector& encoded,
-              const SAQEncodeConfig& config = {}) const;
-
-  /// @brief Encode a batch of vectors.
-  /// @param vectors Input vectors, row-major (n_vectors x dim).
-  /// @param n_vectors Number of vectors.
-  /// @param encoded Output encoded vectors.
-  /// @param config Encoding configuration.
-  /// @return True on success.
-  bool EncodeBatch(const float* vectors, uint32_t n_vectors,
-                   std::vector<ScalarEncodedVector>& encoded,
-                   const SAQEncodeConfig& config = {}) const;
-
-  /// @brief Decode an encoded vector back to float.
-  /// @param encoded Encoded vector.
-  /// @param vector Output vector (must have size = dim).
-  /// @return True on success.
-  bool Decode(const ScalarEncodedVector& encoded, float* vector) const;
-
-  /// @brief Estimate inner product between query and encoded vector.
-  ///
-  /// Uses the SAQ paper formula:
-  /// <o_bar, q> = delta * <codes, q> + q_sum * (-v_max + delta/2)
-  ///
-  /// @param query Query vector (working dim).
-  /// @param encoded Encoded database vector.
-  /// @return Estimated inner product.
-  float EstimateInnerProduct(const float* query,
-                             const ScalarEncodedVector& encoded) const;
-
-  /// @brief Search for k nearest neighbors.
-  /// @param query Query vector.
-  /// @param encoded_db Database of encoded vectors.
-  /// @param k Number of neighbors to return.
-  /// @param results Output results (sorted by distance).
-  void Search(const float* query,
-              const std::vector<ScalarEncodedVector>& encoded_db,
-              uint32_t k, std::vector<SearchResult>& results) const;
-
-  /// @brief Get the quantization plan.
-  const QuantizationPlan& Plan() const { return plan_; }
-
-  /// @brief Get a mutable reference to the plan (for serialization).
-  QuantizationPlan& MutablePlan() { return plan_; }
-
-  /// @brief Load from a quantization plan.
-  /// @param plan The plan to load.
-  /// @return Error message, empty on success.
-  std::string LoadPlan(const QuantizationPlan& plan);
-
-  /// @brief Get input dimensionality.
-  uint32_t Dim() const { return plan_.dimension; }
-
-  /// @brief Get working dimensionality (after PCA if enabled).
-  uint32_t WorkingDim() const {
-    return plan_.use_pca ? plan_.pca.output_dim : plan_.dimension;
-  }
-
-  /// @brief Get number of segments.
-  uint32_t NumSegments() const { return plan_.segment_count; }
-
-  /// @brief Get total bits per vector.
-  uint32_t TotalBits() const { return plan_.total_bits; }
-
-  /// @brief Check if trained.
-  bool IsTrained() const { return trained_; }
-
-  /// @brief Transform a query vector to rotated space for distance estimation.
-  /// Applies PCA projection (if enabled) and per-segment rotation.
-  /// @param query Input query vector (dim).
-  /// @param rotated_query Output vector in rotated space (working_dim).
-  /// @return True on success.
-  bool TransformQuery(const float* query, float* rotated_query) const;
-
- private:
-  /// @brief Generate per-segment rotation matrices.
-  std::string GenerateRotations(uint32_t seed);
-
-  /// @brief Apply per-segment rotation to a working-dim vector.
-  void ApplyRotation(const float* input, float* output) const;
-
-  /// @brief Apply inverse per-segment rotation.
-  void ApplyInverseRotation(const float* input, float* output) const;
-
-  /// @brief Scalar-quantize a rotated vector.
-  void ScalarQuantize(const float* rotated, uint32_t working_dim,
-                      ScalarEncodedVector& encoded) const;
-
-  /// @brief Reconstruct from scalar codes in rotated space.
-  void ScalarDequantize(const ScalarEncodedVector& encoded,
-                        float* rotated) const;
-
-  QuantizationPlan plan_;
-  PCAProjection pca_;
-  CAQAdjuster caq_adjuster_;
-  DistanceEstimator distance_estimator_;
-  bool trained_ = false;
-};
-
-}  // namespace saq
+} // namespace saq

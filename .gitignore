@@ -27,23 +27,49 @@
 *.out
 *.app
 
-# build
+# Build
 build/
 bin/
 
-# vscode
+# MSVC debug artifacts
+*.pdb
+
+# Python compiled modules
+*.pyd
+
+# Binary index files
+*.index
+
+# VS Code
 .vscode/
 .clang-format
+
+# Tests (old, need updating)
 tests/
 
-# github
+# GitHub
 .github/
 
-# datasets
+# Datasets
 data/datasets/
 
-# python
+# Python
 __pycache__/
 *.pyc
 *.pyo
 .conda/
+
+# Benchmark logs
+bench_*.txt
+
+# Windows NUL device artifact
+nul
+
+# Git worktrees
+.worktrees/
+
+# Reference repository (development reference only)
+reference/
+
+# Generated results
+results/

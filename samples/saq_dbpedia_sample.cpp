@@ -1,610 +1,400 @@
 /// @file saq_dbpedia_sample.cpp
-/// @brief End-to-end SAQ benchmark on DBpedia 100K dataset.
+/// @brief End-to-end SAQ-IVF benchmark on DBpedia 100K dataset.
 ///
-/// Evaluates SAQ-IVF with parameters matching the SAQ paper
-/// (arXiv:2509.12086): PCA projection, configurable bits-per-dimension,
-/// and nprobe=200 as the paper's primary evaluation point.
+/// Loads pre-computed PCA-transformed data, centroids, cluster assignments,
+/// and ground truth produced by the Python preprocessing scripts. Builds
+/// an IVF index and evaluates recall at multiple nprobe settings.
 ///
-/// Usage: saq_dbpedia_sample [data_dir] [results_dir] [bpd] [pca_dim]
-///   data_dir:    Path to dataset (default: data/datasets/dbpedia_100k)
-///   results_dir: Output directory (default: results/saq)
-///   bpd:         Bits per dimension (default: 1.0, paper tests 0.2-9)
-///   pca_dim:     PCA output dimension (default: full rotation; 0 = disable PCA)
+/// Usage: saq_dbpedia_sample [data_dir] [results_dir] [bpd] [num_clusters] [nprobe] [num_threads]
+///   data_dir:      Path to dataset (default: data/datasets/dbpedia_100k)
+///   results_dir:   Output directory (default: results/saq)
+///   bpd:           Bits per dimension (default: 2.0)
+///   num_clusters:  K for clustering (default: 4096)
+///   nprobe:        Primary nprobe for search (default: 200)
+///   num_threads:   Thread count for index construction (default: 8)
 
 #include "index/ivf_index.h"
-#include "saq/saq_quantizer.h"
-#include "saq/simd_kernels.h"
+#include "saq/config.h"
+#include "saq/defines.h"
+#include "saq/io_utils.h"
+#include "saq/stopw.h"
 
 #include <algorithm>
-#include <chrono>
-#include <cmath>
-#include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <numeric>
-#include <random>
 #include <sstream>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
+#ifdef SAQ_USE_OPENMP
+#include <omp.h>
+#endif
+
 using namespace saq;
-using Clock = std::chrono::high_resolution_clock;
 
 // ============================================================================
-// File I/O Utilities
+// Recall computation
 // ============================================================================
 
-/// @brief Read vectors from .fvecs format.
-bool ReadFvecs(const std::string& filename, std::vector<float>& data,
-               uint32_t& n_vectors, uint32_t& dim) {
-  std::ifstream file(filename, std::ios::binary);
-  if (!file.is_open()) {
-    std::cerr << "Cannot open: " << filename << std::endl;
-    return false;
-  }
-  
-  // Read first dimension
-  int32_t d;
-  file.read(reinterpret_cast<char*>(&d), sizeof(int32_t));
-  if (d <= 0) return false;
-  dim = static_cast<uint32_t>(d);
-  
-  // Get file size to compute number of vectors
-  file.seekg(0, std::ios::end);
-  size_t file_size = file.tellg();
-  size_t bytes_per_vector = sizeof(int32_t) + dim * sizeof(float);
-  n_vectors = static_cast<uint32_t>(file_size / bytes_per_vector);
-  
-  // Read all vectors
-  data.resize(static_cast<size_t>(n_vectors) * dim);
-  file.seekg(0, std::ios::beg);
-  
-  for (uint32_t i = 0; i < n_vectors; ++i) {
-    int32_t vec_dim;
-    file.read(reinterpret_cast<char*>(&vec_dim), sizeof(int32_t));
-    if (static_cast<uint32_t>(vec_dim) != dim) {
-      std::cerr << "Dimension mismatch at vector " << i << std::endl;
-      return false;
-    }
-    file.read(reinterpret_cast<char*>(data.data() + i * dim), dim * sizeof(float));
-  }
-  
-  return true;
-}
+/// @brief Compute recall@k for a single query.
+///
+/// Counts how many of the top-k returned results appear in the ground truth
+/// top-k. The ground truth matrix has one row per query, each containing
+/// the IDs of the 100 nearest neighbors.
+static float ComputeRecallAtK(const std::vector<std::vector<PID>>& results,
+                               const UintRowMat& gt, size_t k) {
+    size_t nq = results.size();
+    size_t total_correct = 0;
+    size_t total_count = 0;
 
-/// @brief Read ground truth from .ivecs format.
-bool ReadIvecs(const std::string& filename, std::vector<std::vector<uint32_t>>& gt) {
-  std::ifstream file(filename, std::ios::binary);
-  if (!file.is_open()) {
-    std::cerr << "Cannot open: " << filename << std::endl;
-    return false;
-  }
-  
-  gt.clear();
-  while (file.peek() != EOF) {
-    int32_t k;
-    file.read(reinterpret_cast<char*>(&k), sizeof(int32_t));
-    if (file.eof()) break;
-    
-    std::vector<uint32_t> neighbors(k);
-    file.read(reinterpret_cast<char*>(neighbors.data()), k * sizeof(int32_t));
-    gt.push_back(std::move(neighbors));
-  }
-  
-  return !gt.empty();
-}
+    for (size_t q = 0; q < nq; ++q) {
+        size_t gt_k = std::min(k, static_cast<size_t>(gt.cols()));
+        size_t res_k = std::min(k, results[q].size());
 
-// ============================================================================
-// K-means Clustering
-// ============================================================================
-
-/// @brief Simple k-means clustering.
-void KMeansClustering(const float* data, uint32_t n, uint32_t dim,
-                       uint32_t k, std::vector<float>& centroids,
-                       std::vector<uint32_t>& assignments,
-                       uint32_t max_iter = 20, uint32_t seed = 42) {
-  std::mt19937 rng(seed);
-  
-  // Initialize centroids with k-means++
-  centroids.resize(static_cast<size_t>(k) * dim);
-  assignments.resize(n);
-  
-  // First centroid: random
-  std::uniform_int_distribution<uint32_t> uniform(0, n - 1);
-  uint32_t first = uniform(rng);
-  std::memcpy(centroids.data(), data + first * dim, dim * sizeof(float));
-  
-  // Remaining centroids: k-means++ initialization
-  std::vector<float> min_dists(n, std::numeric_limits<float>::max());
-  
-  for (uint32_t c = 1; c < k; ++c) {
-    // Update min distances
-    const float* prev = centroids.data() + (c - 1) * dim;
-    std::vector<float> dists(n);
-    simd::L2DistancesBatch(prev, data, n, dim, dists.data());
-    
-    float total = 0.0f;
-    for (uint32_t i = 0; i < n; ++i) {
-      min_dists[i] = std::min(min_dists[i], dists[i]);
-      total += min_dists[i];
-    }
-    
-    // Sample proportionally
-    std::uniform_real_distribution<float> dist(0.0f, total);
-    float r = dist(rng);
-    float cumsum = 0.0f;
-    uint32_t selected = n - 1;
-    for (uint32_t i = 0; i < n; ++i) {
-      cumsum += min_dists[i];
-      if (cumsum >= r) {
-        selected = i;
-        break;
-      }
-    }
-    
-    std::memcpy(centroids.data() + c * dim, data + selected * dim, dim * sizeof(float));
-    
-    if ((c + 1) % 100 == 0) {
-      std::cout << "  Initialized " << (c + 1) << "/" << k << " centroids\r" << std::flush;
-    }
-  }
-  std::cout << "  Initialized " << k << "/" << k << " centroids" << std::endl;
-  
-  // Lloyd's algorithm
-  std::vector<uint32_t> counts(k);
-  std::vector<float> new_centroids(k * dim);
-  
-  for (uint32_t iter = 0; iter < max_iter; ++iter) {
-    // Assign points to nearest centroid
-    std::fill(counts.begin(), counts.end(), 0);
-    std::fill(new_centroids.begin(), new_centroids.end(), 0.0f);
-    
-    for (uint32_t i = 0; i < n; ++i) {
-      const float* vec = data + i * dim;
-      
-      // Find nearest centroid
-      float best_dist = std::numeric_limits<float>::max();
-      uint32_t best_c = 0;
-      
-      for (uint32_t c = 0; c < k; ++c) {
-        float dist = 0.0f;
-        const float* cent = centroids.data() + c * dim;
-        for (uint32_t d = 0; d < dim; ++d) {
-          float diff = vec[d] - cent[d];
-          dist += diff * diff;
+        // Build ground truth set for this query
+        std::unordered_set<PID> gt_set;
+        for (size_t i = 0; i < gt_k; ++i) {
+            gt_set.insert(gt(q, i));
         }
-        if (dist < best_dist) {
-          best_dist = dist;
-          best_c = c;
+
+        // Count hits
+        for (size_t i = 0; i < res_k; ++i) {
+            if (gt_set.count(results[q][i])) {
+                total_correct++;
+            }
         }
-      }
-      
-      assignments[i] = best_c;
-      counts[best_c]++;
-      
-      // Accumulate for new centroid
-      for (uint32_t d = 0; d < dim; ++d) {
-        new_centroids[best_c * dim + d] += vec[d];
-      }
+        total_count += gt_k;
     }
-    
-    // Update centroids
-    for (uint32_t c = 0; c < k; ++c) {
-      if (counts[c] > 0) {
-        float inv = 1.0f / counts[c];
-        for (uint32_t d = 0; d < dim; ++d) {
-          centroids[c * dim + d] = new_centroids[c * dim + d] * inv;
-        }
-      }
-    }
-    
-    std::cout << "  K-means iteration " << (iter + 1) << "/" << max_iter << "\r" << std::flush;
-  }
-  std::cout << std::endl;
-}
 
-// ============================================================================
-// Evaluation Metrics
-// ============================================================================
-
-/// @brief Compute recall@k.
-float ComputeRecall(const std::vector<std::vector<IVFSearchResult>>& results,
-                    const std::vector<std::vector<uint32_t>>& gt,
-                    uint32_t k) {
-  uint32_t hits = 0;
-  uint32_t total = 0;
-  
-  for (size_t q = 0; q < results.size(); ++q) {
-    std::unordered_set<uint32_t> gt_set;
-    for (uint32_t i = 0; i < std::min(k, static_cast<uint32_t>(gt[q].size())); ++i) {
-      gt_set.insert(gt[q][i]);
-    }
-    
-    for (size_t i = 0; i < std::min(static_cast<size_t>(k), results[q].size()); ++i) {
-      if (gt_set.count(results[q][i].index)) {
-        hits++;
-      }
-    }
-    total += k;
-  }
-  
-  return static_cast<float>(hits) / static_cast<float>(total);
-}
-
-/// @brief Compute average relative error of distances.
-float ComputeRelativeError(const std::vector<std::vector<IVFSearchResult>>& results,
-                            const float* base_vectors, const float* queries,
-                            uint32_t dim, uint32_t k) {
-  float total_error = 0.0f;
-  uint32_t count = 0;
-  
-  for (size_t q = 0; q < results.size(); ++q) {
-    const float* query = queries + q * dim;
-    
-    for (size_t i = 0; i < std::min(static_cast<size_t>(k), results[q].size()); ++i) {
-      uint32_t idx = results[q][i].index;
-      float estimated_dist = results[q][i].distance;
-      
-      // Compute true distance
-      const float* vec = base_vectors + idx * dim;
-      float true_dist = 0.0f;
-      for (uint32_t d = 0; d < dim; ++d) {
-        float diff = query[d] - vec[d];
-        true_dist += diff * diff;
-      }
-      
-      // Relative error
-      if (true_dist > 1e-10f) {
-        total_error += std::abs(estimated_dist - true_dist) / true_dist;
-        count++;
-      }
-    }
-  }
-  
-  return count > 0 ? total_error / count : 0.0f;
-}
-
-/// @brief Compute compression ratio.
-float ComputeRatio(uint32_t dim, uint32_t total_bits) {
-  uint32_t original_bits = dim * 32;  // float32
-  return static_cast<float>(original_bits) / static_cast<float>(total_bits);
-}
-
-// ============================================================================
-// Result Output
-// ============================================================================
-
-struct BenchmarkResult {
-  uint32_t nprobe;
-  uint32_t k;
-  float recall;
-  float qps;
-  float avg_relative_error;
-  float ratio;
-  double search_time_ms;
-};
-
-void WriteResults(const std::string& filename,
-                  const std::vector<BenchmarkResult>& results,
-                  uint32_t n_base, uint32_t n_queries, uint32_t dim,
-                  uint32_t total_bits, uint32_t num_clusters,
-                  uint32_t pca_dim, uint32_t working_dim,
-                  double build_time_s,
-                  const std::string& allocation_summary) {
-  std::ofstream out(filename);
-  if (!out.is_open()) {
-    std::cerr << "Cannot write results to: " << filename << std::endl;
-    return;
-  }
-
-  float bpd = static_cast<float>(total_bits) / static_cast<float>(dim);
-
-  out << "================================================================================\n";
-  out << "SAQ-IVF Benchmark Results\n";
-  out << "================================================================================\n\n";
-
-  out << "Dataset Configuration:\n";
-  out << "  Base vectors:    " << n_base << "\n";
-  out << "  Query vectors:   " << n_queries << "\n";
-  out << "  Dimension:       " << dim << "\n\n";
-
-  out << "Index Configuration:\n";
-  out << "  Clusters (K):    " << num_clusters << "\n";
-  out << "  Bits/dim (bpd):  " << std::fixed << std::setprecision(2) << bpd << "\n";
-  out << "  Total bits:      " << total_bits << "\n";
-  out << "  PCA dim:         " << pca_dim << (pca_dim == dim ? " (full rotation)" : " (reduced)") << "\n";
-  out << "  Working dim:     " << working_dim << "\n";
-  out << "  Compression:     " << std::fixed << std::setprecision(1)
-      << ComputeRatio(dim, total_bits) << "x\n";
-  out << "  Build time:      " << std::fixed << std::setprecision(2)
-      << build_time_s << " seconds\n\n";
-
-  if (!allocation_summary.empty()) {
-    out << "Bit Allocation (DP result):\n";
-    out << allocation_summary << "\n";
-  }
-
-  out << "Search Results:\n";
-  out << std::string(80, '-') << "\n";
-  out << std::setw(8) << "nprobe"
-      << std::setw(8) << "k"
-      << std::setw(12) << "Recall@k"
-      << std::setw(12) << "QPS"
-      << std::setw(16) << "Rel.Error"
-      << std::setw(14) << "Search(ms)"
-      << "\n";
-  out << std::string(80, '-') << "\n";
-
-  for (const auto& r : results) {
-    out << std::setw(8) << r.nprobe
-        << std::setw(8) << r.k
-        << std::setw(11) << std::fixed << std::setprecision(2) << (r.recall * 100) << "%"
-        << std::setw(12) << std::fixed << std::setprecision(1) << r.qps
-        << std::setw(15) << std::fixed << std::setprecision(4) << r.avg_relative_error
-        << std::setw(14) << std::fixed << std::setprecision(2) << r.search_time_ms
-        << "\n";
-  }
-  out << std::string(80, '-') << "\n\n";
-
-  out << "Legend:\n";
-  out << "  nprobe:      Number of clusters searched\n";
-  out << "  k:           Number of nearest neighbors returned\n";
-  out << "  Recall@k:    Percentage of true k-NN found\n";
-  out << "  QPS:         Queries per second\n";
-  out << "  Rel.Error:   Average relative error of estimated distances\n";
-  out << "  Search(ms):  Total search time for all queries\n";
-
-  out.close();
-  std::cout << "Results written to: " << filename << std::endl;
+    return total_count > 0
+        ? static_cast<float>(total_correct) / static_cast<float>(total_count)
+        : 0.0f;
 }
 
 // ============================================================================
 // Main
 // ============================================================================
 
-/// @brief Build DP allocation summary string for diagnostics.
-std::string BuildAllocationSummary(const QuantizationPlan& plan) {
-  std::ostringstream ss;
-
-  uint32_t total_bits_used = 0;
-  uint32_t dims_with_bits = 0;
-  uint32_t dims_without_bits = 0;
-
-  ss << "  Segments: " << plan.segments.size() << "\n";
-  for (const auto& seg : plan.segments) {
-    uint32_t seg_bits = seg.bits * seg.dim_count;
-    total_bits_used += seg_bits;
-    if (seg.bits > 0) {
-      dims_with_bits += seg.dim_count;
-    } else {
-      dims_without_bits += seg.dim_count;
-    }
-  }
-
-  ss << "  Total bits used: " << total_bits_used << " / " << plan.total_bits
-     << " (budget)\n";
-  ss << "  Dims with bits:  " << dims_with_bits << "\n";
-  ss << "  Dims w/o bits:   " << dims_without_bits << "\n";
-
-  // Show per-segment detail (first 10 and last 2)
-  ss << "  Segment details (id: dims[start..end] @ bits/dim):\n";
-  for (size_t i = 0; i < plan.segments.size(); ++i) {
-    if (i < 10 || i >= plan.segments.size() - 2) {
-      const auto& seg = plan.segments[i];
-      ss << "    seg " << std::setw(3) << seg.id << ": "
-         << std::setw(4) << seg.dim_count << " dims ["
-         << std::setw(4) << seg.start_dim << ".."
-         << std::setw(4) << (seg.start_dim + seg.dim_count - 1) << "] @ "
-         << seg.bits << " bpd"
-         << " (" << (seg.bits * seg.dim_count) << " bits)\n";
-    } else if (i == 10) {
-      ss << "    ... (" << (plan.segments.size() - 12) << " more segments) ...\n";
-    }
-  }
-
-  return ss.str();
-}
-
 int main(int argc, char* argv[]) {
-  std::cout << "================================================================================\n";
-  std::cout << "SAQ-IVF Benchmark: DBpedia 100K Dataset\n";
-  std::cout << "================================================================================\n\n";
+    google::InitGoogleLogging(argv[0]);
+    FLAGS_logtostderr = 1;
 
-  // Parse arguments
-  std::string data_dir = "data/datasets/dbpedia_100k";
-  std::string results_dir = "results/saq";
-  float bpd = 1.0f;          // Bits per dimension (paper tests 0.2-9)
-  uint32_t pca_dim_arg = 99999;  // default: full rotation (clamped to dim below)
+    std::cout << "========================================================================\n";
+    std::cout << "SAQ-IVF Benchmark: DBpedia 100K Dataset\n";
+    std::cout << "========================================================================\n\n";
 
-  if (argc > 1) data_dir = argv[1];
-  if (argc > 2) results_dir = argv[2];
-  if (argc > 3) bpd = std::stof(argv[3]);
-  if (argc > 4) pca_dim_arg = static_cast<uint32_t>(std::stoul(argv[4]));
+    // -----------------------------------------------------------------------
+    // 1. Parse command-line arguments
+    // -----------------------------------------------------------------------
+    std::string data_dir     = "data/datasets/dbpedia_100k";
+    std::string results_dir  = "results/saq";
+    float       bpd          = 2.0f;
+    size_t      num_clusters = 4096;
+    size_t      primary_nprobe = 200;
+    int         num_threads  = 8;
 
-  // Load data
-  std::cout << "[1/6] Loading data...\n";
+    if (argc > 1) data_dir        = argv[1];
+    if (argc > 2) results_dir     = argv[2];
+    if (argc > 3) bpd             = std::stof(argv[3]);
+    if (argc > 4) num_clusters    = std::stoul(argv[4]);
+    if (argc > 5) primary_nprobe  = std::stoul(argv[5]);
+    if (argc > 6) num_threads     = std::stoi(argv[6]);
 
-  std::vector<float> base_vectors, query_vectors;
-  uint32_t n_base, n_queries, dim, qdim;
+    std::cout << "Configuration:\n";
+    std::cout << "  data_dir:      " << data_dir << "\n";
+    std::cout << "  results_dir:   " << results_dir << "\n";
+    std::cout << "  bpd:           " << std::fixed << std::setprecision(2) << bpd << "\n";
+    std::cout << "  num_clusters:  " << num_clusters << "\n";
+    std::cout << "  nprobe:        " << primary_nprobe << "\n";
+    std::cout << "  num_threads:   " << num_threads << "\n\n";
 
-  if (!ReadFvecs(data_dir + "/vectors.fvecs", base_vectors, n_base, dim)) {
-    std::cerr << "Failed to load base vectors\n";
-    return 1;
-  }
-  std::cout << "  Base vectors: " << n_base << " x " << dim << "\n";
+    // -----------------------------------------------------------------------
+    // 2. Build file paths
+    // -----------------------------------------------------------------------
+    std::string k_str = std::to_string(num_clusters);
 
-  if (!ReadFvecs(data_dir + "/queries.fvecs", query_vectors, n_queries, qdim)) {
-    std::cerr << "Failed to load queries\n";
-    return 1;
-  }
-  std::cout << "  Queries: " << n_queries << " x " << qdim << "\n";
+    std::string data_file      = data_dir + "/vectors_pca.fvecs";
+    std::string query_file     = data_dir + "/queries_pca.fvecs";
+    std::string centroid_file  = data_dir + "/centroids_" + k_str + "_pca.fvecs";
+    std::string cids_file      = data_dir + "/cluster_ids_" + k_str + ".ivecs";
+    std::string gt_file        = data_dir + "/groundtruth.ivecs";
+    std::string variance_file  = data_dir + "/variances_pca.fvecs";
 
-  if (dim != qdim) {
-    std::cerr << "Dimension mismatch!\n";
-    return 1;
-  }
+    // -----------------------------------------------------------------------
+    // 3. Load data files
+    // -----------------------------------------------------------------------
+    std::cout << "[1/4] Loading data files...\n";
 
-  std::vector<std::vector<uint32_t>> ground_truth;
-  if (!ReadIvecs(data_dir + "/groundtruth.ivecs", ground_truth)) {
-    std::cerr << "Failed to load ground truth\n";
-    return 1;
-  }
-  std::cout << "  Ground truth: " << ground_truth.size() << " queries\n\n";
+    // Check required files exist
+    auto check_file = [](const std::string& path) {
+        if (!file_exists(path.c_str())) {
+            std::cerr << "ERROR: Required file not found: " << path << "\n";
+            std::cerr << "Run the Python preprocessing scripts first:\n";
+            std::cerr << "  python samples/preprocess_dbpedia.py\n";
+            std::exit(1);
+        }
+    };
 
-  // Resolve PCA dimension: 0 = no PCA, >0 = enable PCA with given dim
-  uint32_t pca_dim = (pca_dim_arg == 0) ? 0 : std::min(pca_dim_arg, dim);
-  bool use_pca = (pca_dim > 0);
+    check_file(data_file);
+    check_file(query_file);
+    check_file(centroid_file);
+    check_file(cids_file);
+    check_file(gt_file);
 
-  // Compute total bits from bpd (relative to original dimension, matching paper)
-  uint32_t total_bits = static_cast<uint32_t>(bpd * static_cast<float>(dim));
-  if (total_bits == 0) total_bits = 1;
+    FloatRowMat data, queries, centroids;
+    UintRowMat  cluster_ids, gt;
 
-  std::cout << "Configuration:\n";
-  std::cout << "  Bits/dim (bpd): " << std::fixed << std::setprecision(2) << bpd << "\n";
-  std::cout << "  Total bits:     " << total_bits << "\n";
-  std::cout << "  PCA dim:        " << pca_dim
-            << (pca_dim == 0 ? " (disabled)" : pca_dim == dim ? " (full rotation)" : " (reduced)") << "\n";
-  std::cout << "  Compression:    " << std::fixed << std::setprecision(1)
-            << ComputeRatio(dim, total_bits) << "x\n\n";
+    load_something<float, FloatRowMat>(data_file.c_str(), data);
+    load_something<float, FloatRowMat>(query_file.c_str(), queries);
+    load_something<float, FloatRowMat>(centroid_file.c_str(), centroids);
+    load_something<uint32_t, UintRowMat>(cids_file.c_str(), cluster_ids);
+    load_something<uint32_t, UintRowMat>(gt_file.c_str(), gt);
 
-  // Clustering
-  const uint32_t num_clusters = static_cast<uint32_t>(4 * std::sqrt(n_base));
-  std::cout << "[2/6] Clustering (" << num_clusters << " clusters)...\n";
-
-  std::vector<float> centroids;
-  std::vector<uint32_t> assignments;
-
-  auto cluster_start = Clock::now();
-  KMeansClustering(base_vectors.data(), n_base, dim, num_clusters,
-                    centroids, assignments, 15, 42);
-  auto cluster_end = Clock::now();
-  double cluster_time = std::chrono::duration<double>(cluster_end - cluster_start).count();
-  std::cout << "  Clustering time: " << std::fixed << std::setprecision(2)
-            << cluster_time << " seconds\n\n";
-
-  // Build index with paper-matching SAQ configuration
-  std::cout << "[3/6] Building SAQ-IVF index (bpd=" << std::fixed
-            << std::setprecision(2) << bpd << ", PCA=" << pca_dim << ")...\n";
-
-  IVFIndex index;
-  IVFTrainConfig config;
-  config.ivf.num_clusters = num_clusters;
-  config.ivf.nprobe = 32;
-  config.seed = 42;
-
-  // SAQ configuration
-  config.saq.total_bits = total_bits;
-  config.saq.use_pca = use_pca;
-  config.saq.pca_dim = pca_dim;
-  config.saq.use_segment_rotation = true;
-
-  // Bound segment size for DP feasibility at high bit budgets.
-  // Without this, DP over 1536 dims with Q=12288 is O(D^2 * Q) which is too slow.
-  config.saq.max_dims_per_segment = 48;
-  config.saq.min_dims_per_segment = 1;
-  config.saq.min_bits_per_dim = 0;
-  config.saq.max_bits_per_dim = 8;
-
-  auto build_start = Clock::now();
-  std::string err = index.Build(base_vectors.data(), n_base, dim,
-                                 centroids.data(), assignments.data(), config);
-  auto build_end = Clock::now();
-
-  if (!err.empty()) {
-    std::cerr << "Build failed: " << err << std::endl;
-    return 1;
-  }
-
-  double build_time = std::chrono::duration<double>(build_end - build_start).count();
-  std::cout << "  Build time: " << std::fixed << std::setprecision(2)
-            << build_time << " seconds\n";
-
-  // Print DP allocation diagnostics
-  std::cout << "\n[4/6] Bit allocation diagnostics:\n";
-  const auto& plan = index.GetPlan();
-  std::string alloc_summary = BuildAllocationSummary(plan);
-  std::cout << alloc_summary << std::endl;
-
-  // Benchmark with varying nprobe (include 200 to match paper's evaluation)
-  std::cout << "[5/6] Running search benchmarks...\n";
-
-  std::vector<uint32_t> nprobe_values = {1, 2, 4, 8, 16, 32, 64, 128, 200};
-  std::vector<uint32_t> k_values = {1, 10, 100};
-  std::vector<BenchmarkResult> results;
-
-  for (uint32_t nprobe : nprobe_values) {
-    if (nprobe > num_clusters) continue;
-
-    // Warmup
-    std::vector<std::vector<IVFSearchResult>> warmup_results;
-    index.SearchBatch(query_vectors.data(), 10, 10, warmup_results, nprobe);
-
-    // Actual search
-    std::vector<std::vector<IVFSearchResult>> search_results;
-
-    auto search_start = Clock::now();
-    index.SearchBatch(query_vectors.data(), n_queries, 100, search_results, nprobe);
-    auto search_end = Clock::now();
-
-    double search_time_ms = std::chrono::duration<double, std::milli>(search_end - search_start).count();
-    double qps = n_queries / (search_time_ms / 1000.0);
-
-    // Compute metrics for each k
-    for (uint32_t k : k_values) {
-      float recall = ComputeRecall(search_results, ground_truth, k);
-      float rel_error = ComputeRelativeError(search_results, base_vectors.data(),
-                                              query_vectors.data(), dim, k);
-
-      BenchmarkResult r;
-      r.nprobe = nprobe;
-      r.k = k;
-      r.recall = recall;
-      r.qps = static_cast<float>(qps);
-      r.avg_relative_error = rel_error;
-      r.ratio = ComputeRatio(dim, total_bits);
-      r.search_time_ms = search_time_ms;
-      results.push_back(r);
-
-      std::cout << "  nprobe=" << std::setw(3) << nprobe
-                << " k=" << std::setw(3) << k
-                << " recall=" << std::fixed << std::setprecision(2) << std::setw(6) << (recall * 100) << "%"
-                << " QPS=" << std::fixed << std::setprecision(0) << std::setw(6) << qps
-                << "\n";
+    // Optionally load variances
+    FloatRowMat variances;
+    bool have_variances = file_exists(variance_file.c_str());
+    if (have_variances) {
+        load_something<float, FloatRowMat>(variance_file.c_str(), variances);
+    } else {
+        std::cout << "  (variances file not found, will be computed from data)\n";
     }
-  }
 
-  // Write results
-  std::cout << "\n[6/6] Writing results...\n";
+    size_t num_vecs = static_cast<size_t>(data.rows());
+    size_t num_dim  = static_cast<size_t>(data.cols());
+    size_t num_q    = static_cast<size_t>(queries.rows());
 
-  // Create results directory if needed
-  #ifdef _WIN32
+    std::cout << "\n  Base vectors:  " << num_vecs << " x " << num_dim << "\n";
+    std::cout << "  Queries:       " << num_q << " x " << queries.cols() << "\n";
+    std::cout << "  Centroids:     " << centroids.rows() << " x " << centroids.cols() << "\n";
+    std::cout << "  Ground truth:  " << gt.rows() << " x " << gt.cols() << "\n";
+    std::cout << "  Compression:   " << std::fixed << std::setprecision(1)
+              << (32.0f / bpd) << "x\n\n";
+
+    // -----------------------------------------------------------------------
+    // 4. Build the IVF index
+    // -----------------------------------------------------------------------
+    std::cout << "[2/4] Building IVF index (bpd=" << std::fixed << std::setprecision(2)
+              << bpd << ", K=" << num_clusters << ")...\n";
+
+    QuantizeConfig cfg;
+    cfg.avg_bits              = bpd;
+    cfg.single.quant_type     = BaseQuantType::CAQ;
+    cfg.single.random_rotation = true;
+    cfg.single.use_fastscan   = true;
+    cfg.single.caq_adj_rd_lmt = 6;
+    cfg.enable_segmentation   = true;
+
+    IVF ivf(num_vecs, num_dim, num_clusters, cfg);
+
+    if (have_variances && variances.rows() > 0) {
+        // Convert the first row of the variance matrix to a FloatVec
+        FloatVec var_vec = variances.row(0);
+        ivf.set_variance(std::move(var_vec));
+        std::cout << "  Variance data loaded and set.\n";
+    }
+
+    StopW build_timer;
+    ivf.construct(data, centroids, cluster_ids.data(), num_threads);
+    float build_time_s = build_timer.getElapsedTimeMili() / 1000.0f;
+
+    std::cout << "  Build time: " << std::fixed << std::setprecision(2)
+              << build_time_s << " seconds\n";
+
+    // Print quantization plan
+    const SaqData* saq_data = ivf.get_saq_data();
+    if (saq_data) {
+        std::cout << "  Quantization plan: ";
+        size_t dims_sum = 0;
+        for (auto& [dim_len, bits] : saq_data->quant_plan) {
+            std::cout << "[" << dims_sum << ".." << (dims_sum + dim_len) << ")@" << bits << "b ";
+            dims_sum += dim_len;
+        }
+        std::cout << "\n";
+    }
+
+    // Save index
+    std::ostringstream bpd_ss;
+    bpd_ss << std::fixed << std::setprecision(1) << bpd;
+
+    // Create results directory
+#ifdef _WIN32
     std::string mkdir_cmd = "mkdir \"" + results_dir + "\" 2>nul";
-  #else
+#else
     std::string mkdir_cmd = "mkdir -p \"" + results_dir + "\"";
-  #endif
-  system(mkdir_cmd.c_str());
+#endif
+    system(mkdir_cmd.c_str());
 
-  // Include bpd in filename for easy comparison across runs
-  std::ostringstream bpd_str;
-  bpd_str << std::fixed << std::setprecision(1) << bpd;
-  std::string results_file = results_dir + "/dbpedia_100k_bpd" + bpd_str.str() + "_results.txt";
+    std::string index_path = results_dir + "/ivf_k" + k_str + "_bpd" + bpd_ss.str() + ".index";
+    ivf.save(index_path.c_str());
+    std::cout << "  Index saved to: " << index_path << "\n";
 
-  uint32_t working_dim = (index.GetPlan().use_pca && index.GetPlan().pca.output_dim > 0)
-      ? index.GetPlan().pca.output_dim
-      : dim;
+    // Print build quality metrics
+    auto& ip_metrics = ivf.quant_metrics_.norm_ip_o_oa;
+    if (ip_metrics.cnt_ > 0) {
+        std::cout << "  IP error: avg=" << std::fixed << std::setprecision(6)
+                  << ip_metrics.avg() << "  max=" << ip_metrics.max() << "\n";
+    }
+    std::cout << "\n";
 
-  WriteResults(results_file, results, n_base, n_queries, dim,
-               total_bits, num_clusters, pca_dim, working_dim,
-               build_time + cluster_time, alloc_summary);
+    // -----------------------------------------------------------------------
+    // 5. Search with varying nprobe values
+    // -----------------------------------------------------------------------
+    std::cout << "[3/4] Running search benchmarks...\n";
 
-  std::cout << "\n================================================================================\n";
-  std::cout << "Benchmark completed successfully!\n";
-  std::cout << "  bpd=" << std::fixed << std::setprecision(2) << bpd
-            << "  total_bits=" << total_bits
-            << "  compression=" << std::fixed << std::setprecision(1)
-            << ComputeRatio(dim, total_bits) << "x\n";
-  std::cout << "================================================================================\n";
+    SearcherConfig searcher_cfg;
+    searcher_cfg.dist_type = DistType::L2Sqr;
 
-  return 0;
+    constexpr size_t TOPK = 100;
+    std::vector<size_t> nprobe_values = {1, 5, 10, 20, 50, 100, 200, 500};
+
+    // Filter out nprobe values that exceed the number of clusters
+    std::vector<size_t> valid_nprobes;
+    for (size_t np : nprobe_values) {
+        if (np <= num_clusters) {
+            valid_nprobes.push_back(np);
+        }
+    }
+    // Make sure the user-specified primary nprobe is included
+    if (primary_nprobe <= num_clusters) {
+        bool found = false;
+        for (size_t np : valid_nprobes) {
+            if (np == primary_nprobe) { found = true; break; }
+        }
+        if (!found) {
+            valid_nprobes.push_back(primary_nprobe);
+            std::sort(valid_nprobes.begin(), valid_nprobes.end());
+        }
+    }
+
+    // Header
+    std::cout << std::string(72, '-') << "\n";
+    std::cout << std::setw(8) << "nprobe"
+              << std::setw(12) << "Recall@1"
+              << std::setw(12) << "Recall@10"
+              << std::setw(12) << "Recall@100"
+              << std::setw(14) << "Time(ms)"
+              << std::setw(12) << "QPS"
+              << "\n";
+    std::cout << std::string(72, '-') << "\n";
+
+    // Store results for file output
+    struct SearchResult {
+        size_t nprobe;
+        float recall_at_1;
+        float recall_at_10;
+        float recall_at_100;
+        float time_ms;
+        float qps;
+    };
+    std::vector<SearchResult> all_results;
+
+    for (size_t nprobe : valid_nprobes) {
+        // Allocate result storage
+        std::vector<std::vector<PID>> results(num_q, std::vector<PID>(TOPK));
+
+        StopW search_timer;
+
+        // Search all queries
+        for (size_t q = 0; q < num_q; ++q) {
+            ivf.search<DistType::L2Sqr>(
+                queries.row(q), TOPK, nprobe, searcher_cfg,
+                results[q].data());
+        }
+
+        float search_time_ms = search_timer.getElapsedTimeMili();
+        float qps = static_cast<float>(num_q) / (search_time_ms / 1000.0f);
+
+        // Compute recall at different k values
+        float r1   = ComputeRecallAtK(results, gt, 1);
+        float r10  = ComputeRecallAtK(results, gt, 10);
+        float r100 = ComputeRecallAtK(results, gt, 100);
+
+        std::cout << std::setw(8) << nprobe
+                  << std::setw(11) << std::fixed << std::setprecision(2) << (r1 * 100) << "%"
+                  << std::setw(11) << std::fixed << std::setprecision(2) << (r10 * 100) << "%"
+                  << std::setw(11) << std::fixed << std::setprecision(2) << (r100 * 100) << "%"
+                  << std::setw(14) << std::fixed << std::setprecision(1) << search_time_ms
+                  << std::setw(12) << std::fixed << std::setprecision(0) << qps
+                  << "\n";
+
+        all_results.push_back({nprobe, r1, r10, r100, search_time_ms, qps});
+    }
+    std::cout << std::string(72, '-') << "\n\n";
+
+    // -----------------------------------------------------------------------
+    // 6. Write results to file
+    // -----------------------------------------------------------------------
+    std::cout << "[4/4] Writing results...\n";
+
+    std::string results_file = results_dir + "/dbpedia_100k_k" + k_str
+                             + "_bpd" + bpd_ss.str() + "_results.txt";
+
+    std::ofstream out(results_file);
+    if (out.is_open()) {
+        out << "========================================================================\n";
+        out << "SAQ-IVF Benchmark Results\n";
+        out << "========================================================================\n\n";
+
+        out << "Dataset:\n";
+        out << "  Base vectors:  " << num_vecs << " x " << num_dim << "\n";
+        out << "  Queries:       " << num_q << "\n";
+        out << "  Centroids (K): " << num_clusters << "\n\n";
+
+        out << "Index Configuration:\n";
+        out << "  Bits/dim:      " << std::fixed << std::setprecision(2) << bpd << "\n";
+        out << "  Quant type:    CAQ\n";
+        out << "  Segmentation:  enabled\n";
+        out << "  Fast scan:     enabled\n";
+        out << "  Rotation:      random\n";
+        out << "  Compression:   " << std::fixed << std::setprecision(1)
+            << (32.0f / bpd) << "x\n";
+        out << "  Build time:    " << std::fixed << std::setprecision(2)
+            << build_time_s << " seconds\n";
+        if (ip_metrics.cnt_ > 0) {
+            out << "  IP error avg:  " << std::fixed << std::setprecision(6)
+                << ip_metrics.avg() << "\n";
+            out << "  IP error max:  " << std::fixed << std::setprecision(6)
+                << ip_metrics.max() << "\n";
+        }
+        out << "\n";
+
+        out << "Search Results (dist_type=L2Sqr):\n";
+        out << std::string(72, '-') << "\n";
+        out << std::setw(8) << "nprobe"
+            << std::setw(12) << "Recall@1"
+            << std::setw(12) << "Recall@10"
+            << std::setw(12) << "Recall@100"
+            << std::setw(14) << "Time(ms)"
+            << std::setw(12) << "QPS"
+            << "\n";
+        out << std::string(72, '-') << "\n";
+
+        for (const auto& r : all_results) {
+            out << std::setw(8) << r.nprobe
+                << std::setw(11) << std::fixed << std::setprecision(2) << (r.recall_at_1 * 100) << "%"
+                << std::setw(11) << std::fixed << std::setprecision(2) << (r.recall_at_10 * 100) << "%"
+                << std::setw(11) << std::fixed << std::setprecision(2) << (r.recall_at_100 * 100) << "%"
+                << std::setw(14) << std::fixed << std::setprecision(1) << r.time_ms
+                << std::setw(12) << std::fixed << std::setprecision(0) << r.qps
+                << "\n";
+        }
+        out << std::string(72, '-') << "\n";
+
+        out.close();
+        std::cout << "  Results written to: " << results_file << "\n";
+    } else {
+        std::cerr << "  WARNING: Could not write results to: " << results_file << "\n";
+    }
+
+    std::cout << "\n========================================================================\n";
+    std::cout << "Benchmark completed successfully!\n";
+    std::cout << "  bpd=" << std::fixed << std::setprecision(2) << bpd
+              << "  K=" << num_clusters
+              << "  compression=" << std::fixed << std::setprecision(1) << (32.0f / bpd) << "x\n";
+    std::cout << "========================================================================\n";
+
+    return 0;
 }

@@ -23,6 +23,18 @@
 #endif
 
 namespace saq {
+
+/// @brief Portable free for memory allocated by align_mm or _aligned_malloc.
+/// On MSVC, _aligned_malloc must be paired with _aligned_free (not std::free).
+inline void portable_aligned_free(void *p) {
+    if (!p) return;
+#ifdef _MSC_VER
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
+}
+
 template <size_t alignment, class T, bool HUGE_PAGE = false>
 inline T *align_mm(size_t size) {
     size_t nbytes = rd_up_to_multiple_of(size * sizeof(T), alignment);
@@ -36,7 +48,7 @@ inline T *align_mm(size_t size) {
         madvise(p, nbytes, MADV_HUGEPAGE);
     }
 #endif
-    std::memset(p, 0, size);
+    std::memset(p, 0, size * sizeof(T));
     return static_cast<T *>(p);
 }
 
@@ -65,8 +77,13 @@ struct AlignedAllocator {
     struct rebind {
         typedef AlignedAllocator<U, alignment> other;
     };
-    bool operator!=(const AlignedAllocator &rhs) { return alignment_ != rhs.alignment_; }
-    bool operator==(const AlignedAllocator &rhs) { return alignment_ == rhs.alignment_; }
+    // Converting constructor required by MSVC's std::vector internals
+    template <typename U>
+    AlignedAllocator(const AlignedAllocator<U, alignment> &) noexcept : alignment_(alignment) {}
+    AlignedAllocator() noexcept : alignment_(alignment) {}
+
+    bool operator!=(const AlignedAllocator &rhs) const { return alignment_ != rhs.alignment_; }
+    bool operator==(const AlignedAllocator &rhs) const { return alignment_ == rhs.alignment_; }
 };
 
 template <typename T>
@@ -86,15 +103,18 @@ UniqueArray<T> make_unique_array(std::size_t size, std::size_t alignment = 0) {
         return UniqueArray<T>(nullptr, [](void *) {});
     }
     void *raw_ptr;
-    if (alignment) {
 #ifdef _MSC_VER
-        raw_ptr = _aligned_malloc(rd_up_to_multiple_of(size * sizeof(T), alignment), alignment);
+    // MSVC: always use _aligned_malloc/_aligned_free pair to avoid heap mismatch.
+    // When alignment is 0, use a default alignment of sizeof(void*).
+    size_t actual_align = alignment ? alignment : sizeof(void *);
+    raw_ptr = _aligned_malloc(rd_up_to_multiple_of(size * sizeof(T), actual_align), actual_align);
 #else
+    if (alignment) {
         raw_ptr = std::aligned_alloc(alignment, rd_up_to_multiple_of(size * sizeof(T), alignment));
-#endif
     } else {
         raw_ptr = std::malloc(size * sizeof(T));
     }
+#endif
 
     if (!raw_ptr) {
         throw std::bad_alloc();

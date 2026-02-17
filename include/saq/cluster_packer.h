@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "saq/defines.h"
+#include "saq/caq_encoder.h"
 #include "saq/cluster_data.h"
 #include "saq/fast_scan.h"
 #include "saq/code_helper.h"

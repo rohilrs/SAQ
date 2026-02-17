@@ -172,7 +172,9 @@ Example:
         print(f"Transformed query data saved to {transformed_query_path}")
 
     if X_centroid is not None:
-        transformed_centroid_path = os.path.join(output_dir, "centroids_pca.fvecs")
+        # Preserve centroid filename stem (e.g. centroids_4096 → centroids_4096_pca)
+        centroid_stem = os.path.splitext(args.centroids)[0]
+        transformed_centroid_path = os.path.join(output_dir, f"{centroid_stem}_pca.fvecs")
         write_fvecs(transformed_centroid_path, X_centroid_transformed)
         print(f"Transformed centroid data saved to {transformed_centroid_path}")
 
