@@ -1,148 +1,109 @@
 # SAQ Python
 
-Python bindings, utilities, and benchmarks for the SAQ library.
+Python preprocessing scripts and bindings for the SAQ library.
 
 ## Setup
 
 ```bash
-# Install numpy (required for bindings)
-pip install numpy
-
-# For clustering support
-pip install faiss-cpu
+pip install numpy faiss-cpu
 ```
+
+## Preprocessing Scripts
+
+The preprocessing pipeline prepares data for the C++ SAQ index. All scripts are in `preprocessing/`.
+
+### 1. PCA Rotation
+
+```bash
+python -m preprocessing.pca --data-dir data/datasets/dbpedia_100k
+```
+
+Applies full PCA rotation via `faiss.PCAMatrix`. Outputs:
+- `vectors_pca.fvecs` — PCA-transformed base vectors
+- `queries_pca.fvecs` — PCA-transformed query vectors
+- `centroids_{K}_pca.fvecs` — PCA-transformed centroids (if centroids exist)
+- `variances_pca.fvecs` — Per-dimension variance of transformed data
+
+Options: `--pca-dim` (default: full rotation), `--base-file`, `--query-file`, `--centroids`
+
+### 2. K-means Clustering
+
+```bash
+python -m preprocessing.ivf --data-dir data/datasets/dbpedia_100k -K 4096
+```
+
+Performs K-means via `faiss.IndexIVFFlat`. Outputs:
+- `centroids_{K}.fvecs` — Cluster centroids
+- `cluster_ids_{K}.ivecs` — Per-vector cluster assignments
+
+Options: `-K` (num clusters, default 4096), `--metric` (l2 or ip)
+
+### 3. Ground Truth
+
+```bash
+python -m preprocessing.compute_gt --data-dir data/datasets/dbpedia_100k
+```
+
+Brute-force exact kNN computation. Outputs:
+- `groundtruth.ivecs` — Top-1000 nearest neighbor IDs per query
+
+Options: `--top-k` (default 1000), `--threads` (default 8)
+
+### Complete Pipeline
+
+```bash
+cd python
+python -m preprocessing.pca --data-dir ../data/datasets/dbpedia_100k
+python -m preprocessing.ivf --data-dir ../data/datasets/dbpedia_100k -K 4096
+python -m preprocessing.pca --data-dir ../data/datasets/dbpedia_100k --centroids centroids_4096
+python -m preprocessing.compute_gt --data-dir ../data/datasets/dbpedia_100k
+```
+
+The C++ sample expects: `vectors_pca.fvecs`, `queries_pca.fvecs`, `centroids_{K}_pca.fvecs`, `cluster_ids_{K}.ivecs`, `variances_pca.fvecs`, `groundtruth.ivecs`
 
 ## Python Bindings (pybind11)
 
-The `saq` package provides Python access to the C++ SAQ library with NumPy interop.
+**Status: Needs updating.** The bindings in `bindings/saq_bindings.cpp` reference the old C++ API (`SAQQuantizer`, `IVFIndex`, etc.) which was replaced during the reference alignment refactor. The current C++ API uses `SAQuantizer`, `IVF`, `QuantizeConfig`, `SearcherConfig`, etc.
 
-### Building
+To use SAQ from Python, use the preprocessing scripts above and run the C++ benchmark directly.
 
-```bash
-# From project root
-mkdir build && cd build
-cmake .. -DSAQ_BUILD_PYTHON=ON
-cmake --build . --target _saq_core
-```
-
-The compiled module is placed in `python/saq/` automatically.
-
-### Usage
-
-```python
-import sys
-sys.path.insert(0, "python")  # Or install with pip install -e python/
-
-import numpy as np
-import saq
-
-# Create and build IVF index
-index = saq.IVFIndex()
-config = saq.IVFTrainConfig()
-config.ivf.num_clusters = 100
-config.saq.total_bits = 64
-
-data = np.random.randn(10000, 128).astype(np.float32)
-centroids = ...  # From k-means
-assignments = ...  # Cluster IDs
-
-index.build(data, centroids, assignments, config)
-
-# Search
-queries = np.random.randn(10, 128).astype(np.float32)
-indices, distances = index.search_batch(queries, k=10, nprobe=10)
-
-# Save/Load
-index.save("my_index.bin")
-index2 = saq.IVFIndex()
-index2.load("my_index.bin")
-```
-
-### Available Classes
-
-| Class | Description |
-|-------|-------------|
-| `saq.SAQQuantizer` | Train, encode_batch, decode, search |
-| `saq.IVFIndex` | build, search, search_batch, save, load, reconstruct |
-| `saq.SAQTrainConfig` | Training parameters (total_bits, use_pca, metric, etc.) |
-| `saq.SAQEncodeConfig` | Encoding parameters (use_caq) |
-| `saq.IVFConfig` | IVF parameters (num_clusters, nprobe, hnsw) |
-| `saq.IVFTrainConfig` | Combined IVF + SAQ config |
-| `saq.DistanceMetric` | L2 or InnerProduct |
-
-### Performance
-
-The GIL is released during compute-heavy C++ calls (`build`, `search_batch`, `encode_batch`), so Python binding overhead is minimal (~3% on search QPS).
-
-## Scripts
-
-### ivf_clustering.py — K-means Clustering for IVF
-
-Performs K-means clustering using FAISS to produce centroids and assignments
-needed for IVF index construction.
+### Building (when bindings are updated)
 
 ```bash
-python ivf_clustering.py <data_file> <num_clusters> <centroids_out> <cluster_ids_out> [metric]
-
-# Example: Cluster SIFT1M into 4096 partitions
-python ivf_clustering.py \
-    data/datasets/sift/sift_base.fvecs \
-    4096 \
-    data/datasets/sift/centroids.fvecs \
-    data/datasets/sift/cluster_ids.ivecs \
-    l2
+cmake -B build -DSAQ_BUILD_PYTHON=ON
+cmake --build build --target _saq_core
 ```
 
-### benchmark_saq.py — Python Benchmark
+## Utility Scripts
 
-Benchmarks IVF search performance through the Python bindings.
-
-```bash
-# Set PYTHONPATH to include python/ directory
-export PYTHONPATH=python:$PYTHONPATH
-
-# Run all configurations
-python python/benchmark_saq.py
-
-# Small-scale only
-python python/benchmark_saq.py --small-only
-```
-
-### samples/download_dbpedia.py — Dataset Download
-
-Downloads the DBpedia 100K dataset from HuggingFace.
-
-```bash
-pip install datasets
-python samples/download_dbpedia.py
-```
+| Script | Location | Description |
+|--------|----------|-------------|
+| `preprocessing/pca.py` | `preprocessing/` | PCA via Faiss PCAMatrix |
+| `preprocessing/ivf.py` | `preprocessing/` | K-means via Faiss |
+| `preprocessing/compute_gt.py` | `preprocessing/` | Brute-force ground truth |
+| `preprocessing/utils/io.py` | `preprocessing/utils/` | Read/write fvecs/ivecs/fbin/ibin |
+| `ivf_clustering.py` | root | Standalone K-means clustering utility |
+| `benchmark_saq.py` | root | Python benchmark (requires updated bindings) |
 
 ## Requirements
 
 See [requirements.txt](requirements.txt):
 
 ```
-numpy>=1.20
-faiss-cpu>=1.7.0    # Or faiss-gpu for CUDA support
+numpy>=1.20.0
+faiss-cpu>=1.7.0
 ```
 
 ## Integration with C++
 
 ```
-┌─────────────────────┐     ┌─────────────────────┐
-│  download_dbpedia.py│────>│  vectors.fvecs      │
-│                     │     │  queries.fvecs      │
-│                     │     │  groundtruth.ivecs  │
-└─────────────────────┘     └──────────┬──────────┘
-                                       │
-┌─────────────────────┐                v
-│  ivf_clustering.py  │────>  centroids.fvecs
-│  (optional)         │       cluster_ids.ivecs
-└─────────────────────┘                │
-                                       v
-                  ┌──────────────────────────────────┐
-                  │  saq_dbpedia_sample (C++)         │
-                  │  — or —                          │
-                  │  saq.IVFIndex (Python bindings)   │
-                  └──────────────────────────────────┘
+Preprocessing (Python/Faiss)          C++ Index Construction + Search
+┌──────────────────────┐              ┌──────────────────────────────┐
+│  pca.py              │──────────>   │  saq_dbpedia_sample          │
+│  ivf.py              │  .fvecs      │  (or custom C++ program)     │
+│  compute_gt.py       │  .ivecs      │                              │
+└──────────────────────┘              │  Loads preprocessed data     │
+                                      │  Builds IVF index            │
+                                      │  Runs search benchmarks      │
+                                      └──────────────────────────────┘
 ```

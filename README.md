@@ -1,115 +1,121 @@
 # SAQ: Scalar Additive Quantization
 
-A high-performance C++17 implementation of **Scalar Additive Quantization** for approximate nearest neighbor search, based on the paper [arXiv:2509.12086](https://arxiv.org/abs/2509.12086).
+A C++20 implementation of **Scalar Additive Quantization** for approximate nearest neighbor search, based on arXiv:2509.12086 and aligned with the [reference repository](https://github.com/howarlii/SAQ).
 
 ## Features
 
-- **Extreme Compression**: 768x compression ratio (1536d float32 → 64 bits)
-- **Scalar Quantization**: Uniform grid per dimension with per-vector v_max scaling
-- **Joint DP Optimization**: Single dynamic programming pass for simultaneous segmentation and bit allocation
-- **IVF Indexing**: Scalable to 1M-10M+ vectors with sublinear search
-- **OpenMP Parallelization**: Multi-threaded build and search (5.6x speedup at 8 threads)
-- **Python Bindings**: pybind11 interface with NumPy interop (~3% overhead vs C++)
-- **SIMD Acceleration**: AVX-512/AVX2 kernels for distance computation
-- **Code Adjustment (CAQ)**: Per-dimension refinement optimizing cosine similarity
+- **Extreme Compression**: 8x-32x compression (e.g., 1536d float32 at 1-4 bits/dim)
+- **CAQ Encoding**: Per-vector, per-segment v_max scaling with code adjustment (cosine optimization)
+- **Joint DP Optimization**: Dynamic programming over 64-dim blocks for segment boundaries + bit allocation
+- **3-Stage Search**: Variance pruning -> 1-bit fastscan (SIMD) -> accurate distance with early termination
+- **IVF Indexing**: Inverted file index for sublinear search
+- **SIMD Acceleration**: AVX-512/AVX2 LUT-based fastscan (32 vectors at once)
+- **OpenMP Parallelization**: Multi-threaded index construction
 
 ## Quick Start
 
+### Prerequisites (Python)
+
+Preprocessing requires Python with Faiss:
+
+```bash
+pip install numpy faiss-cpu
+```
+
+### Preprocess Dataset
+
+```bash
+cd python
+python -m preprocessing.pca --data-dir ../data/datasets/dbpedia_100k
+python -m preprocessing.ivf --data-dir ../data/datasets/dbpedia_100k -K 4096
+python -m preprocessing.compute_gt --data-dir ../data/datasets/dbpedia_100k
+```
+
 ### Build
 
-```powershell
-# Windows (MSVC with AVX-512)
-mkdir build && cd build
-cmake .. -G Ninja -DSAQ_BUILD_SAMPLES=ON -DSAQ_USE_OPENMP=ON
-cmake --build .
+```bash
+cmake -B build -DSAQ_BUILD_SAMPLES=ON -DSAQ_USE_OPENMP=ON
+cmake --build build
 ```
+
+### Run Benchmark
 
 ```bash
-# Linux/macOS
-mkdir -p build && cd build
-cmake .. -DSAQ_BUILD_SAMPLES=ON -DSAQ_USE_OPENMP=ON
-make -j$(nproc)
+./build/samples/saq_dbpedia_sample data/datasets/dbpedia_100k results/saq 2.0 4096 200 8
+# Args: data_dir results_dir bpd num_clusters nprobe num_threads
 ```
 
-### Build with Python Bindings
+## Benchmark Results
 
-```bash
-cmake .. -DSAQ_BUILD_PYTHON=ON
-cmake --build . --target _saq_core
-```
+**Dataset:** DBpedia 100K (1536D OpenAI embeddings, K=4096, nprobe=200)
 
-### Run Sample
-
-```bash
-# Download dataset (requires Python with datasets, numpy)
-python samples/download_dbpedia.py
-
-# Run benchmark
-./build/samples/saq_dbpedia_sample
-```
+| bpd | Compression | R@1 | R@10 | R@100 |
+|-----|-------------|-----|------|-------|
+| 1.0 | 32x | 85.0% | 87.3% | 86.6% |
+| 2.0 | 16x | 92.8% | 92.6% | 90.0% |
+| 4.0 | 8x | 97.0% | 94.8% | 90.9% |
 
 ## Directory Structure
 
 ```
 SAQ/
 ├── include/
-│   ├── saq/           # Core SAQ algorithm headers
-│   │   ├── saq_quantizer.h      # Main quantizer interface
-│   │   ├── quantization_plan.h  # Serializable plan structure
-│   │   ├── pca_projection.h     # Dimensionality reduction
-│   │   ├── dimension_segmentation.h
-│   │   ├── bit_allocation_dp.h  # Joint segmentation + bit allocation
-│   │   ├── caq_code_adjustment.h # Per-dimension code adjustment
-│   │   ├── distance_estimator.h # Scalar IP estimation
-│   │   └── simd_kernels.h       # AVX-512/AVX2 kernels
-│   └── index/         # Indexing structures
-│       ├── ivf_index.h          # IVF partitioning
-│       └── fast_scan/           # SIMD-accelerated scanning
-├── src/               # Implementation files
-├── samples/           # End-to-end examples
+│   ├── saq/                    # Core SAQ algorithm headers
+│   │   ├── quantization_plan.h     # SaqData, SaqDataMaker (DP optimizer)
+│   │   ├── caq_encoder.h           # CAQEncoder (quantize + code adjustment)
+│   │   ├── quantizer.h             # QuantizerCluster, QuantizerSingle
+│   │   ├── saq_quantizer.h         # SAQuantizer (multi-segment orchestrator)
+│   │   ├── caq_estimator.h         # CaqCluEstimator (3-stage distance)
+│   │   ├── saq_estimator.h         # SaqCluEstimator (multi-segment aggregator)
+│   │   ├── saq_searcher.h          # SAQSearcher (block-level 3-stage search)
+│   │   ├── cluster_data.h          # CAQClusterData, SaqCluData
+│   │   ├── cluster_packer.h        # ClusterPacker (code + factor packing)
+│   │   ├── single_data.h           # Single-vector data wrappers
+│   │   ├── fast_scan.h             # AVX-512/AVX2 fastscan primitives
+│   │   ├── lut.h                   # SIMD lookup table for fast IP
+│   │   ├── rotator.h               # Per-segment random orthogonal rotation
+│   │   └── ...                     # config, defines, tools, memory, etc.
+│   └── index/
+│       └── ivf_index.h             # IVF (construct, search, save/load)
+├── src/                        # Implementation files (.cpp)
+├── samples/                    # Benchmark program
 ├── python/
-│   ├── saq/           # Python package (pybind11 bindings)
-│   ├── bindings/      # C++/Python binding source
-│   ├── ivf_clustering.py  # FAISS-based clustering utility
-│   └── benchmark_saq.py   # Python benchmark script
-├── data/              # Datasets (downloaded, not in git)
-├── results/           # Benchmark results
-├── tests/             # Unit tests
-└── docs/              # Documentation and diagrams
+│   ├── preprocessing/          # PCA, K-means, ground truth (Faiss)
+│   └── bindings/               # pybind11 bindings (needs updating)
+├── data/                       # Datasets (not in git)
+└── docs/                       # Architecture diagrams
 ```
 
 ## Algorithm Overview
 
-```
-Training:
-  1. PCA Projection (optional)        → reduce dimensionality
-  2. Joint DP (segmentation + bits)   → optimal segments and bit allocation
-  3. Per-segment random rotation      → decorrelate dimensions within segments
-  4. Compute per-dimension statistics → variance for distortion model
+### Preprocessing (Python, Faiss)
 
-Encoding:
-  1. Project vector (PCA if enabled)
-  2. Apply per-segment rotation
-  3. Scalar quantize: c[i] = floor((v[i] + v_max) / delta)
-  4. CAQ refinement (optional) → per-dimension ±1 adjustments for cosine similarity
+1. PCA full rotation -> reorder dimensions by variance
+2. K-means clustering -> IVF partitions
+3. Brute-force ground truth computation
 
-Search:
-  1. Find nprobe nearest clusters (IVF)
-  2. Precompute scalar query table
-  3. Estimate IP: <o,q> = delta * <codes, q> + q_sum * (-v_max + delta/2)
-  4. Convert to L2: ||q-o||^2 = ||q||^2 - 2*IP + ||o||^2
-  5. Return top-K results
-```
+### Index Construction (C++)
 
-See [docs/saq_codeflow.md](docs/saq_codeflow.md) for detailed Mermaid diagrams.
+1. Load PCA-transformed data, centroids, cluster assignments
+2. `SaqDataMaker`: compute variance -> joint DP over 64-dim blocks -> segment plan + per-segment rotators
+3. `SAQuantizer` per cluster: rotate -> `CAQEncoder` (quantize + code adjustment) -> `ClusterPacker` (pack short/long codes)
+4. Build `IVF` index
+
+### Search (C++)
+
+1. `FlatInitializer`: find nprobe nearest centroids
+2. `SAQSearcher` per cluster (3-stage, block-level):
+   - **Variance pruning**: cheap lower bounds, skip blocks exceeding distk
+   - **1-bit fastscan**: SIMD LUT lookup on MSB codes (32 vectors at once)
+   - **Accurate distance**: full-bit codes for promising candidates
 
 ## Requirements
 
-- **Compiler**: C++17 (MSVC 2019+, GCC 9+, Clang 10+)
-- **SIMD**: AVX-512 recommended, AVX2 fallback supported
+- **Compiler**: C++20 (MSVC 2019+, GCC 10+, Clang 12+)
+- **SIMD**: AVX-512 required (AVX2 fallback for some operations)
 - **CMake**: 3.16+
-- **OpenMP** (optional): For multi-threaded build and search
-- **Python** (optional): 3.8+ with numpy for bindings; faiss for clustering
+- **OpenMP** (optional): For multi-threaded index construction
+- **Python** (preprocessing): 3.8+ with numpy, faiss-cpu
 
 ## CMake Options
 
@@ -117,9 +123,19 @@ See [docs/saq_codeflow.md](docs/saq_codeflow.md) for detailed Mermaid diagrams.
 |--------|---------|-------------|
 | `SAQ_BUILD_SAMPLES` | ON | Build sample programs |
 | `SAQ_BUILD_TESTS` | OFF | Build unit tests |
-| `SAQ_REQUIRE_AVX512` | ON | Require AVX-512 support |
+| `SAQ_REQUIRE_AVX512` | ON | Enable AVX-512 SIMD |
 | `SAQ_USE_OPENMP` | ON | Enable OpenMP parallelization |
 | `SAQ_BUILD_PYTHON` | OFF | Build Python bindings (pybind11) |
+
+## Dependencies
+
+All C++ dependencies are fetched automatically via CMake FetchContent:
+
+- **Eigen3** 3.4.0
+- **glog** 0.7.1
+- **gflags** 2.2.2
+- **fmt** 10.2.1
+- **pybind11** 2.12.0 (only when `SAQ_BUILD_PYTHON=ON`)
 
 ## Citation
 

@@ -1,28 +1,26 @@
 # SAQ Source Files
 
-Implementation files for the SAQ library.
+Implementation files for the SAQ library. Most classes are header-only (inline in `.h`); the `.cpp` files serve as minimal translation units.
 
 ## Files
 
-| File | Description |
-|------|-------------|
-| `saq_quantizer.cpp` | Main quantizer: Train, Encode, Decode, Search with scalar quantization |
-| `bit_allocation_dp.cpp` | Joint DP for simultaneous segmentation and bit allocation |
-| `dimension_segmentation.cpp` | Per-dimension variance statistics (Welford's algorithm) |
-| `pca_projection.cpp` | SVD-based dimensionality reduction (OpenMP-parallelized) |
-| `caq_code_adjustment.cpp` | Per-dimension code adjustment optimizing cosine similarity |
-| `distance_estimator.cpp` | Scalar IP estimation using paper formula + legacy ADC |
-| `quantization_plan.cpp` | Binary/JSON serialization (v1 codebook, v2 scalar+rotations) |
-| `ivf_index.cpp` | IVF index: Build, Search, Save/Load with L2 from IP |
-| `simd_kernels.cpp` | AVX-512/AVX2 distance computation kernels |
-| `fast_scan.cpp` | SIMD-accelerated cluster scanning with packed codes |
+| File | Key Classes | Description |
+|------|-------------|-------------|
+| `quantization_plan.cpp` | SaqDataMaker | Joint DP over 64-dim blocks, variance computation, binary serialization |
+| `rotator.cpp` | Rotator | Per-segment random orthogonal rotation (Householder QR) |
+| `caq_encoder.cpp` | CAQEncoder | Scalar quantize + code adjustment + factor computation |
+| `fast_scan.cpp` | — | AVX-512/AVX2 fastscan primitives (pack, accumulate, LUT) |
+| `lut.cpp` | Lut | SIMD lookup table for high-accuracy fast IP |
+| `cluster_data.cpp` | CAQClusterData, SaqCluData | Per-segment and multi-segment cluster storage |
+| `cluster_packer.cpp` | ClusterPacker | Pack short/long codes + factors into cluster format |
+| `single_data.cpp` | CaqSingleDataWrapper | Single-vector data wrappers |
+| `quantizer.cpp` | QuantizerCluster, QuantizerSingle | Per-segment batch and single-vector encoding |
+| `saq_quantizer.cpp` | SAQuantizer | Multi-segment cluster encoding orchestrator |
+| `caq_estimator.cpp` | CaqCluEstimator | 3-stage SIMD distance (variance, fastscan, accurate) |
+| `saq_estimator.cpp` | SaqCluEstimator | Multi-segment distance aggregation |
+| `saq_searcher.cpp` | SAQSearcher | Block-level 3-stage search with early termination |
+| `ivf_index.cpp` | IVF | IVF index: construct, search, save/load |
 
 ## OpenMP Parallelization
 
-The following functions use `#pragma omp parallel for` (guarded by `SAQ_USE_OPENMP`):
-
-- `saq_quantizer.cpp`: `EncodeBatch()` — parallel per-vector encoding
-- `distance_estimator.cpp`: `EstimateScalarIPBatch()`, `EstimateDistancesBatch()`
-- `pca_projection.cpp`: `ComputeCovariance()`, `ProjectBatch()`
-- `dimension_segmentation.cpp`: `ComputeStats()` — thread-local accumulators
-- `ivf_index.cpp`: `Build()` encoding loop, `SearchBatch()` — parallel per-query
+Index construction (`IVF::construct`) parallelizes per-cluster encoding with `#pragma omp parallel for` (guarded by `SAQ_USE_OPENMP`).
