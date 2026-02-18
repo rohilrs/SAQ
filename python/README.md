@@ -63,16 +63,62 @@ The C++ sample expects: `vectors_pca.fvecs`, `queries_pca.fvecs`, `centroids_{K}
 
 ## Python Bindings (pybind11)
 
-**Status: Needs updating.** The bindings in `bindings/saq_bindings.cpp` reference the old C++ API (`SAQQuantizer`, `IVFIndex`, etc.) which was replaced during the reference alignment refactor. The current C++ API uses `SAQuantizer`, `IVF`, `QuantizeConfig`, `SearcherConfig`, etc.
+The bindings in `bindings/saq_bindings.cpp` wrap the C++ SAQ library for use from Python via pybind11. numpy arrays are automatically converted to/from Eigen matrices.
 
-To use SAQ from Python, use the preprocessing scripts above and run the C++ benchmark directly.
-
-### Building (when bindings are updated)
+### Building
 
 ```bash
-cmake -B build -DSAQ_BUILD_PYTHON=ON
+# Point CMake to the conda/venv Python interpreter
+cmake -B build -DSAQ_BUILD_PYTHON=ON -DPYTHON_EXECUTABLE=$(which python)
 cmake --build build --target _saq_core
 ```
+
+This builds `python/saq/_saq_core.{version}.pyd` (Windows) or `.so` (Linux) and copies required DLLs (glog, fmt) next to it.
+
+### Usage
+
+```python
+import sys; sys.path.insert(0, "python")
+import saq
+import numpy as np
+
+# Configure quantization
+cfg = saq.QuantizeConfig()
+cfg.avg_bits = 4.0
+cfg.enable_segmentation = True
+cfg.single.quant_type = saq.BaseQuantType.CAQ
+cfg.single.random_rotation = True
+cfg.single.use_fastscan = True
+cfg.single.caq_adj_rd_lmt = 6
+
+# Build index
+index = saq.IVF(n_vectors, dim, n_clusters, cfg)
+index.set_variance(variances)  # optional: per-dim variance from PCA
+index.construct(data, centroids, cluster_ids, num_threads=8)
+
+# Search
+scfg = saq.SearcherConfig()
+scfg.dist_type = saq.DistType.L2Sqr
+results = index.search_batch(queries, topk=10, nprobe=200, config=scfg)
+
+# Save/load
+index.save("index.bin")
+index2 = saq.IVF()
+index2.load("index.bin")
+```
+
+### Exposed API
+
+| Python Class/Enum | C++ Type | Fields/Methods |
+|-------------------|----------|----------------|
+| `DistType` | `saq::DistType` | `L2Sqr`, `IP` |
+| `BaseQuantType` | `saq::BaseQuantType` | `CAQ`, `RBQ`, `LVQ` |
+| `QuantSingleConfig` | `saq::QuantSingleConfig` | `quant_type`, `random_rotation`, `use_fastscan`, `caq_adj_rd_lmt`, `caq_adj_eps` |
+| `QuantizeConfig` | `saq::QuantizeConfig` | `avg_bits`, `enable_segmentation`, `use_compact_layout`, `single` |
+| `SearcherConfig` | `saq::SearcherConfig` | `dist_type`, `searcher_vars_bound_m` |
+| `IVF` | `saq::IVF` | `construct()`, `search()`, `search_batch()`, `save()`, `load()`, `set_variance()` |
+| `load_fvecs()` | `saq::load_something<float>` | Load `.fvecs` file to numpy array |
+| `load_ivecs()` | `saq::load_something<uint32_t>` | Load `.ivecs` file to numpy array |
 
 ## Utility Scripts
 
@@ -83,7 +129,7 @@ cmake --build build --target _saq_core
 | `preprocessing/compute_gt.py` | `preprocessing/` | Brute-force ground truth |
 | `preprocessing/utils/io.py` | `preprocessing/utils/` | Read/write fvecs/ivecs/fbin/ibin |
 | `ivf_clustering.py` | root | Standalone K-means clustering utility |
-| `benchmark_saq.py` | root | Python benchmark (requires updated bindings) |
+| `benchmark_saq.py` | root | Python benchmark using bindings |
 
 ## Requirements
 

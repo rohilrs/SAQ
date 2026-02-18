@@ -50,7 +50,6 @@ def simple_kmeans(data: np.ndarray, k: int, n_iter: int = 10,
 def compute_ground_truth(data: np.ndarray, queries: np.ndarray,
                          k: int) -> np.ndarray:
     """Brute-force k-NN ground truth."""
-    n = data.shape[0]
     nq = queries.shape[0]
     gt = np.zeros((nq, k), dtype=np.uint32)
 
@@ -78,12 +77,12 @@ def compute_recall(results_indices: np.ndarray,
 
 def run_benchmark(n_vectors: int, dim: int, n_clusters: int,
                   n_queries: int, k: int, nprobe: int,
-                  total_bits: int, seed: int = 42):
+                  bpd: float, seed: int = 42):
     """Run a single benchmark configuration."""
     print(f"\n=== IVF Scalar Search Benchmark (Python) ===")
     print(f"Vectors: {n_vectors}, Dim: {dim}, Clusters: {n_clusters}")
     print(f"Queries: {n_queries}, k: {k}, nprobe: {nprobe}")
-    print(f"Total bits: {total_bits}")
+    print(f"Bits per dim: {bpd}")
     print()
 
     rng = np.random.RandomState(seed)
@@ -108,30 +107,37 @@ def run_benchmark(n_vectors: int, dim: int, n_clusters: int,
 
     # Build IVF index
     print("Building IVF index...", end=" ", flush=True)
-    index = saq.IVFIndex()
-    config = saq.IVFTrainConfig()
-    config.ivf.num_clusters = n_clusters
-    config.ivf.nprobe = nprobe
-    config.saq.total_bits = total_bits
-    config.seed = seed
+    cfg = saq.QuantizeConfig()
+    cfg.avg_bits = bpd
+    cfg.enable_segmentation = True
+    cfg.single.quant_type = saq.BaseQuantType.CAQ
+    cfg.single.random_rotation = True
+    cfg.single.use_fastscan = True
+    cfg.single.caq_adj_rd_lmt = 6
+
+    index = saq.IVF(n_vectors, dim, n_clusters, cfg)
 
     t0 = time.perf_counter()
-    index.build(data, centroids, assignments, config)
+    index.construct(data, centroids, assignments, num_threads=4)
     build_time = (time.perf_counter() - t0) * 1000
     print(f"done ({build_time:.2f} ms)")
 
+    # Configure search
+    search_cfg = saq.SearcherConfig()
+    search_cfg.dist_type = saq.DistType.L2Sqr
+
     # Warmup
-    index.search_batch(queries[:10], k, nprobe)
+    index.search_batch(queries[:10], k, nprobe, search_cfg)
 
     # Benchmark search
     print("Searching...", end=" ", flush=True)
     t0 = time.perf_counter()
-    indices, distances = index.search_batch(queries, k, nprobe)
+    results = index.search_batch(queries, k, nprobe, search_cfg)
     search_time = (time.perf_counter() - t0) * 1000
     print("done")
 
     # Compute recall
-    recall = compute_recall(indices, ground_truth, k)
+    recall = compute_recall(results, ground_truth, k)
 
     # Results
     qps = n_queries / (search_time / 1000)
@@ -160,15 +166,15 @@ def main():
 
     configs = [
         {"n_vectors": 10000, "dim": 128, "n_clusters": 100,
-         "n_queries": 100, "k": 10, "nprobe": 10, "total_bits": 64},
+         "n_queries": 100, "k": 10, "nprobe": 10, "bpd": 4.0},
     ]
 
     if not args.small_only:
         configs.extend([
             {"n_vectors": 50000, "dim": 128, "n_clusters": 256,
-             "n_queries": 100, "k": 10, "nprobe": 20, "total_bits": 64},
+             "n_queries": 100, "k": 10, "nprobe": 20, "bpd": 4.0},
             {"n_vectors": 100000, "dim": 128, "n_clusters": 512,
-             "n_queries": 100, "k": 10, "nprobe": 32, "total_bits": 64},
+             "n_queries": 100, "k": 10, "nprobe": 32, "bpd": 4.0},
         ])
 
     results = []
