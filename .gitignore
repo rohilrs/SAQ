@@ -33,6 +33,7 @@ bin/
 
 # MSVC debug artifacts
 *.pdb
+*.ilk
 
 # Python compiled modules
 *.pyd
