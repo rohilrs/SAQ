@@ -1,6 +1,6 @@
 # SAQ: Scalar Additive Quantization
 
-A C++20 implementation of **Scalar Additive Quantization** for approximate nearest neighbor search, based on arXiv:2509.12086 and aligned with the [reference repository](https://github.com/howarlii/SAQ).
+A C++20 implementation of **Scalar Additive Quantization** for approximate nearest neighbor search, based on arXiv:2509.12086.
 
 ## Features
 
