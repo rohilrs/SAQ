@@ -15,3 +15,23 @@ target_sources(saq
     ${CMAKE_CURRENT_SOURCE_DIR}/saq_searcher.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ivf_index.cpp
 )
+
+if(SAQ_BUILD_CUDA)
+  # CUDA kernel sources (compiled by nvcc)
+  target_sources(saq PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_utils.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_encoder.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_packer.cu
+  )
+  set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_utils.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_encoder.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_packer.cu
+    PROPERTIES LANGUAGE CUDA
+  )
+  # GPU orchestrator (compiled by host CXX — includes Eigen which is not CUDA-compatible)
+  target_sources(saq PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_ivf_construct.cpp
+  )
+  target_include_directories(saq PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+endif()

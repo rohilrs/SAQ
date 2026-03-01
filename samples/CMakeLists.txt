@@ -26,3 +26,16 @@ if(MSVC)
 else()
   target_compile_options(saq_dbpedia_sample PRIVATE -mavx512f -mavx512bw -mavx512dq -mavx512vl)
 endif()
+
+if(SAQ_BUILD_CUDA)
+  add_executable(gpu_benchmark_sample
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_benchmark_sample.cpp
+  )
+  target_link_libraries(gpu_benchmark_sample PRIVATE saq)
+  target_include_directories(gpu_benchmark_sample PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  if(MSVC)
+    target_compile_options(gpu_benchmark_sample PRIVATE /arch:AVX512)
+  else()
+    target_compile_options(gpu_benchmark_sample PRIVATE -mavx512f -mavx512bw -mavx512dq -mavx512vl)
+  endif()
+endif()
