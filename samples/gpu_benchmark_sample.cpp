@@ -81,12 +81,16 @@ int main(int argc, char** argv) {
     // ---- GPU Encode ----
     {
         LOG(INFO) << "--- GPU Encode ---";
-        StopW sw;
-        gpu::GpuIVF gpu_ivf(N, D, K, cfg);
-        gpu_ivf.set_variance(variances.row(0));
-        gpu_ivf.construct(vectors, centroids, cids.data());
-        auto gpu_ms = sw.getElapsedTimeMicro() / 1000.0;
-        LOG(INFO) << "GPU encode time: " << gpu_ms << " ms (" << gpu_ms / 1e3 << " s)";
+        try {
+            StopW sw;
+            gpu::GpuIVF gpu_ivf(N, D, K, cfg);
+            gpu_ivf.set_variance(variances.row(0));
+            gpu_ivf.construct(vectors, centroids, cids.data());
+            auto gpu_ms = sw.getElapsedTimeMicro() / 1000.0;
+            LOG(INFO) << "GPU encode time: " << gpu_ms << " ms (" << gpu_ms / 1e3 << " s)";
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "GPU encode failed: " << e.what();
+        }
     }
 
     // ---- CPU Encode (for comparison) ----

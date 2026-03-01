@@ -113,8 +113,9 @@ if(SAQ_BUILD_CUDA)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-  # A100=80, RTX3090=86, RTX4090=89, H100=90, RTX5090=100
-  set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90;100" CACHE STRING "CUDA architectures")
+  # A100=80, RTX3090=86, RTX4090=89, H100=90, B200=100, RTX5090=120
+  # Use -real to produce CUBIN only (avoids PTX "unsupported toolchain" rejection)
+  set(CMAKE_CUDA_ARCHITECTURES "80-real;86-real;89-real;90-real;100-real;120-real" CACHE STRING "CUDA architectures")
   find_package(CUDAToolkit REQUIRED)
   target_link_libraries(saq PUBLIC CUDA::cublas CUDA::cudart)
   target_compile_definitions(saq PUBLIC SAQ_USE_CUDA=1)
