@@ -187,11 +187,10 @@ The GPU's lane-parallel code adjustment with periodic correction may converge to
 
 ### 5.1 Architecture Coverage
 
-The implementation targets CUDA compute capabilities 7.5-12.1:
+The default build configuration (`CMAKE_CUDA_ARCHITECTURES`) targets SM 80-120:
 
 | Architecture | SM | GPU Examples | Status |
 |-------------|-----|-------------|--------|
-| Turing | 75 | RTX 2080 Ti | Compilable (untested) |
 | Ampere | 80 | A100, RTX 3090 | Compilable, data-center target |
 | Ampere | 86 | RTX 3060/3070 | Compilable (untested) |
 | Ada Lovelace | 89 | RTX 4090 | Compilable (untested) |
@@ -199,29 +198,29 @@ The implementation targets CUDA compute capabilities 7.5-12.1:
 | Blackwell | 100 | B200, GB200 | Compilable |
 | Blackwell | 120 | RTX 5090 | Tested (this report) |
 
-All architectures use a warp size of 32 threads, so the warp-cooperative encode kernel is universally applicable without modification.
+Older architectures (Turing SM 75, Volta SM 70) are not included in the default build but could be added to `CMAKE_CUDA_ARCHITECTURES` without code changes. All architectures use a warp size of 32 threads, so the warp-cooperative encode kernel is universally applicable without modification.
 
 ### 5.2 Performance Implications by Architecture
 
-**Memory bandwidth (the dominant factor):**
+**Device memory bandwidth (determines kernel performance):**
 
-| GPU | BW (TB/s) | Relative to RTX 5090 | Expected Upload Speedup |
-|-----|-----------|----------------------|------------------------|
-| A100 (80GB) | 2.0 | 1.12x | 1.12x |
-| H100 (80GB) | 3.35 | 1.87x | 1.87x |
-| RTX 5090 | 1.79 | 1.0x | 1.0x |
+| GPU | HBM/GDDR BW (TB/s) | Relative to RTX 5090 | Expected Kernel Speedup |
+|-----|---------------------|----------------------|------------------------|
+| A100 (80GB) | 2.0 | 1.12x | ~1.1x |
+| H100 (80GB) | 3.35 | 1.87x | ~1.5-1.9x |
+| RTX 5090 | 1.79 | 1.0x | 1.0x (baseline) |
 
-Note: H2D upload via PCIe is only ~120ms at N=99K (PCIe 5.0, ~4.8 GB/s). The dominant bottleneck is CUDA API overhead (cluster allocation + scatter), not bandwidth. HBM bandwidth matters for kernel-internal memory access patterns, not host transfers.
+Since the CAQ encode kernel is memory-bandwidth-limited (~4 FLOP/byte), kernel performance tracks device memory bandwidth, not FP32 TFLOPS. The H100's HBM3 bandwidth advantage would translate directly to faster kernels. Note that H2D upload is PCIe-bound (~120ms at N=99K via PCIe 5.0), independent of device memory bandwidth.
 
-**Compute throughput (matters at scale):**
+**Raw compute throughput (reference only — not the bottleneck):**
 
-| GPU | FP32 TFLOPS | SMs | Expected Kernel Speedup |
-|-----|-------------|-----|------------------------|
-| A100 | 19.5 | 108 | 0.6x (fewer SMs) |
-| H100 | 67.0 | 132 | 1.1x |
-| RTX 5090 | ~180 | 170 | 1.0x (baseline) |
+| GPU | FP32 TFLOPS | SMs | Notes |
+|-----|-------------|-----|-------|
+| A100 | 19.5 | 108 | Memory-BW-limited; FLOPS underutilized |
+| H100 | 67.0 | 132 | Memory-BW-limited; FLOPS underutilized |
+| RTX 5090 | ~180 | 170 | Memory-BW-limited; FLOPS underutilized |
 
-The RTX 5090 has more raw FP32 throughput than the H100, but the double-precision warp shuffles used in CAQ are dominated by shuffle latency, not FP32 throughput. At scale (N > 1M), the H100's superior memory bandwidth would likely make it faster overall.
+FP32 throughput is not the limiting factor for the CAQ encode kernel. At ~4 FLOP/byte arithmetic intensity, even the A100 (19.5 TFLOPS / 2.0 TB/s = 9.75 FLOP/byte operational intensity) has more compute than needed. Performance differences across GPUs are driven by memory bandwidth and warp shuffle latency, not FLOPS.
 
 ### 5.3 Will It Work "Optimally" on A100/H100?
 
@@ -270,3 +269,11 @@ Ordered by expected impact (based on measured overhead breakdown):
 7. **Fastscan reorder kernel:** Implement the 32-vector interleaved layout on GPU for direct compatibility with GPU-side search.
 
 8. **Multi-GPU support:** Partition clusters across GPUs, each GPU encodes its subset. Requires load balancing (clusters have variable sizes).
+
+## 8. Conclusion
+
+The GPU encode pipeline demonstrates that the CAQ algorithm parallelizes effectively at the vector/dimension level via warp cooperation. The core encode kernels achieve a **4.1-4.8x speedup** over an optimized 8-thread AVX-512 CPU implementation on the RTX 5090. However, at the N=99K scale tested, CUDA API overhead (per-cluster memory allocation and D2D scatter) consumes 79% of wall time, making the end-to-end GPU pipeline 2.5-3x slower than CPU.
+
+This is a solvable engineering problem, not a fundamental algorithmic limitation. The two highest-impact optimizations — a pooled memory allocator and a GPU scatter kernel — would eliminate ~1,230ms of overhead and bring end-to-end GPU time to ~330ms, yielding a **1.5-2x speedup** over CPU even at this small dataset size. At scale (N > 1M), the GPU's parallelism would be better utilized and the overhead further amortized.
+
+The implementation is architecture-portable across all CUDA SM 80+ GPUs. On datacenter GPUs (A100, H100), the memory-bandwidth-limited encode kernels would benefit from HBM's higher bandwidth, with the H100 expected to achieve ~1.5-1.9x faster kernels than the RTX 5090. The warp-cooperative design (32 threads per vector, double-precision shuffles for numerical stability) requires no architecture-specific tuning.
