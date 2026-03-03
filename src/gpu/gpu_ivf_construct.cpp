@@ -32,6 +32,7 @@ void GpuIVF::construct(const FloatRowMat& data,
                        const PID* cluster_ids) {
     LOG(INFO) << "Starting GPU IVF construction...";
     StopW stopw;
+    StopW phase_timer;
 
     const size_t N = num_data_;
     const size_t D = num_dim_;
@@ -81,9 +82,11 @@ void GpuIVF::construct(const FloatRowMat& data,
         sorted_data.row(i) = data.row(order[i]);
     }
 
-    LOG(INFO) << "Data sorted by cluster. Uploading to GPU...";
+    auto cpu_prep_ms = stopw.getElapsedTimeMicro() / 1000.0;
+    LOG(INFO) << "[TIMING] CPU prep (sort+metadata): " << cpu_prep_ms << " ms";
 
     // 3. Upload to GPU
+    phase_timer.reset();
     auto d_vectors = device_alloc<float>(N * D);
     auto d_centroids = device_alloc<float>(K * D);
     auto d_cluster_ids = device_alloc<uint32_t>(N);
@@ -91,8 +94,12 @@ void GpuIVF::construct(const FloatRowMat& data,
     upload(d_vectors.get(), sorted_data.data(), N * D);
     upload(d_centroids.get(), centroids.data(), K * D);
     upload(d_cluster_ids.get(), h_sorted_cids.data(), N);
+    SAQ_CUDA_CHECK(cudaDeviceSynchronize());
+    auto upload_ms = phase_timer.getElapsedTimeMicro() / 1000.0;
+    LOG(INFO) << "[TIMING] H2D upload (vectors+centroids+cids): " << upload_ms << " ms";
 
     // 4. Allocate GPU cluster data
+    phase_timer.reset();
     gpu_clusters_.clear();
     gpu_clusters_.resize(K);
     for (size_t c = 0; c < K; ++c) {
@@ -104,11 +111,16 @@ void GpuIVF::construct(const FloatRowMat& data,
                    cluster_sizes[c]);
         }
     }
+    SAQ_CUDA_CHECK(cudaDeviceSynchronize());
+    auto alloc_ms = phase_timer.getElapsedTimeMicro() / 1000.0;
+    LOG(INFO) << "[TIMING] GPU cluster alloc + ID upload: " << alloc_ms << " ms";
 
     // cuBLAS handle
     CublasHandle cublas;
 
     // 5. Process each segment
+    double total_kernel_ms = 0.0;
+    double total_scatter_ms = 0.0;
     size_t dim_offset = 0;
     for (size_t seg = 0; seg < num_segments; ++seg) {
         size_t D_seg = quant_plan[seg].first;
@@ -116,6 +128,7 @@ void GpuIVF::construct(const FloatRowMat& data,
         const auto& bdata = base_datas[seg];
 
         LOG(INFO) << "Segment " << seg << ": dim=" << D_seg << " bits=" << num_bits;
+        phase_timer.reset();
 
         // Allocate per-segment temporaries
         auto d_residuals = device_alloc<float>(N * D_seg);
@@ -201,7 +214,11 @@ void GpuIVF::construct(const FloatRowMat& data,
 
         // 5f. Scatter to per-cluster GpuSaqCluData
         SAQ_CUDA_CHECK(cudaDeviceSynchronize());
+        auto seg_kernel_ms = phase_timer.getElapsedTimeMicro() / 1000.0;
+        total_kernel_ms += seg_kernel_ms;
+        LOG(INFO) << "[TIMING] Segment " << seg << " kernels: " << seg_kernel_ms << " ms";
 
+        phase_timer.reset();
         for (size_t c = 0; c < K; ++c) {
             size_t clu_size = cluster_sizes[c];
             if (clu_size == 0) continue;
@@ -241,12 +258,25 @@ void GpuIVF::construct(const FloatRowMat& data,
             }
         }
 
+        SAQ_CUDA_CHECK(cudaDeviceSynchronize());
+        auto seg_scatter_ms = phase_timer.getElapsedTimeMicro() / 1000.0;
+        total_scatter_ms += seg_scatter_ms;
+        LOG(INFO) << "[TIMING] Segment " << seg << " scatter: " << seg_scatter_ms << " ms";
+
         dim_offset += D_seg;
     }
 
     SAQ_CUDA_CHECK(cudaDeviceSynchronize());
     auto tm_ms = stopw.getElapsedTimeMicro() / 1000.0;
     LOG(INFO) << "GPU IVF construction done. Time: " << tm_ms / 1e3 << " s";
+    LOG(INFO) << "[TIMING] === Summary ===";
+    LOG(INFO) << "[TIMING] CPU prep:       " << cpu_prep_ms << " ms";
+    LOG(INFO) << "[TIMING] H2D upload:     " << upload_ms << " ms";
+    LOG(INFO) << "[TIMING] GPU alloc:      " << alloc_ms << " ms";
+    LOG(INFO) << "[TIMING] GPU kernels:    " << total_kernel_ms << " ms";
+    LOG(INFO) << "[TIMING] GPU scatter:    " << total_scatter_ms << " ms";
+    LOG(INFO) << "[TIMING] Kernel+scatter: " << (total_kernel_ms + total_scatter_ms) << " ms";
+    LOG(INFO) << "[TIMING] Total wall:     " << tm_ms << " ms";
 }
 
 } // namespace saq::gpu

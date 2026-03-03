@@ -10,40 +10,65 @@ This document analyzes the GPU implementation of the SAQ (Scalar Additive Quanti
 **Dataset:** DBpedia 100K (N=99,000 vectors, D=1,536 dimensions, K=4,096 clusters)
 **Build:** MSVC 19.50 (VS 2025), CUDA 13.1, Release mode (`-O2`), `CMAKE_CUDA_ARCHITECTURES=native`
 
-### 2.1 Encode Timing
+### 2.1 End-to-End Encode Timing
 
-| Bits/dim | Segment Plan | GPU Total (ms) | GPU Kernel (ms) | CPU 8T (ms) | Speedup |
-|----------|-------------|----------------|-----------------|-------------|---------|
-| 1.0 | 64d/5b + 256d/3b + 320d/1b + 896d/0b | 1,594 | ~543 | 514 | 0.32x |
-| 2.0 | 128d/6b + 256d/4b + 576d/2b + 576d/0b | 1,618 | ~571 | 601 | 0.37x |
-| 4.0 | 192d/8b + 448d/5b + 384d/3b + 512d/2b | 1,708 | ~662 | 715 | 0.42x |
+| Bits/dim | Segment Plan | GPU Total (ms) | GPU Kernel (ms) | CPU 8T (ms) | Wall Speedup |
+|----------|-------------|----------------|-----------------|-------------|--------------|
+| 1.0 | 64d/5b + 256d/3b + 320d/1b + 896d/0b | 1,533 | 115 | 475 | 0.31x |
+| 2.0 | 128d/6b + 256d/4b + 576d/2b + 576d/0b | 1,566 | 118 | 506 | 0.32x |
+| 4.0 | 192d/8b + 448d/5b + 384d/3b + 512d/2b | 1,633 | 135 | 641 | 0.39x |
 
-*GPU Kernel time estimated by subtracting ~1,050ms data upload overhead (measured from sort+upload log timestamps).*
+### 2.2 Transfer-Excluded Timing (Data Already on GPU)
 
-### 2.2 Time Breakdown (2.0 bpd)
+In a production pipeline where data already resides on GPU (e.g., after GPU-based PCA or K-means), the relevant comparison excludes H2D transfer and cluster allocation overhead:
 
-| Phase | GPU (ms) | Notes |
-|-------|----------|-------|
-| CPU sort by cluster | ~75 | `std::stable_sort` on 99K indices |
-| GPU upload (N x D float32) | ~1,048 | 580 MB via `cudaMemcpy` H2D |
-| Segment 0 (128d, 6b) | ~133 | Subtract + GEMM + CAQ + pack |
-| Segment 1 (256d, 4b) | ~112 | |
-| Segment 2 (576d, 2b) | ~141 | |
-| Segment 3 (576d, 0b) | ~79 | Zero-bit: L2 norm only |
-| Per-cluster scatter | ~29 | 4096 cudaMemcpy D2D calls |
-| Total GPU wall | 1,618 | |
+| Bits/dim | GPU Kernels (ms) | GPU Scatter (ms) | GPU K+S (ms) | CPU 8T (ms) | Kernel Speedup | K+S Speedup |
+|----------|-----------------|------------------|-------------|-------------|----------------|-------------|
+| 1.0 | **115** | 319 | 434 | 475 | **4.1x** | **1.1x** |
+| 2.0 | **118** | 338 | 456 | 506 | **4.3x** | **1.1x** |
+| 4.0 | **135** | 386 | 521 | 641 | **4.8x** | **1.2x** |
 
-The dominant cost is **host-to-device data transfer** (~65% of total GPU time). Kernel execution across all 4 segments totals ~465ms. The CPU's 8-thread OpenMP implementation achieves 601ms by avoiding any data movement penalty and leveraging aggressive MSVC auto-vectorization with AVX-512.
+The GPU's raw encode kernels (subtract + rotate + CAQ encode + pack) are **4.1-4.8x faster** than the 8-thread CPU implementation. Including the scatter phase (which copies encoded data into per-cluster structures), the GPU achieves **1.1-1.2x speedup** — essentially at parity with the CPU.
 
-### 2.3 Key Observation: Transfer-Bound Regime
+The scatter phase is the primary optimization target: replacing 16,384 small `cudaMemcpy` D2D calls with a single GPU scatter kernel would bring the effective speedup close to the kernel-only 4-5x figure.
 
-At N=99K, the GPU encode is **transfer-bound**, not compute-bound. The arithmetic intensity of the CAQ encode kernel is approximately:
+### 2.3 Detailed Time Breakdown
+
+**2.0 bpd (128d/6b + 256d/4b + 576d/2b + 576d/0b):**
+
+| Phase | Time (ms) | % of Total | Notes |
+|-------|-----------|-----------|-------|
+| CPU prep (sort+metadata) | 77 | 4.9% | `std::stable_sort` on 99K indices |
+| H2D upload | 120 | 7.7% | ~580 MB via PCIe 5.0 (~4.8 GB/s) |
+| GPU cluster alloc + ID upload | 899 | 57.4% | 4,096 `cudaMalloc` calls |
+| Segment 0 kernels (128d, 6b) | 37 | 2.4% | Subtract + GEMM + CAQ + pack |
+| Segment 0 scatter | 94 | 6.0% | |
+| Segment 1 kernels (256d, 4b) | 16 | 1.0% | |
+| Segment 1 scatter | 97 | 6.2% | |
+| Segment 2 kernels (576d, 2b) | 40 | 2.6% | Largest segment |
+| Segment 2 scatter | 99 | 6.3% | |
+| Segment 3 kernels (576d, 0b) | 26 | 1.7% | Zero-bit: L2 norm only |
+| Segment 3 scatter | 48 | 3.1% | Fewer codes to copy |
+| **GPU kernels total** | **118** | **7.5%** | |
+| **GPU scatter total** | **338** | **21.6%** | |
+| **Total wall** | **1,566** | **100%** | |
+
+The dominant cost is **GPU cluster allocation** (~57% of total). This is 4,096 `cudaMalloc` calls for per-cluster segment data structures, each requiring CUDA driver interaction. A pooled memory allocator or bulk allocation strategy would eliminate this overhead. The second-largest cost is the **scatter phase** (~22%), which copies flat encoded arrays into per-cluster structures via ~16,384 small D2D memcpy calls.
+
+### 2.4 Key Observation: Overhead-Bound Regime
+
+At N=99K, the GPU encode is **overhead-bound**, not compute-bound. Only 7.5% of wall time is spent in actual encode kernels. The arithmetic intensity of the CAQ encode kernel is approximately:
 
 $$\text{AI} = \frac{2 \cdot N \cdot D_\text{seg} \cdot (\text{adj\_rounds} + 2)}{N \cdot D_\text{seg} \cdot 4} \approx \frac{2(r+2)}{4} \approx 4 \text{ FLOP/byte}$$
 
 For `caq_adj_rd_lmt=6`, this yields ~4 FLOP/byte, which is below the RTX 5090's operational intensity threshold (~100 FLOP/byte for compute-bound workloads at 1.79 TB/s bandwidth and ~180 TFLOPS FP32). The workload is firmly memory-bandwidth-limited, and at 99K vectors the GPU's massive parallelism is underutilized.
 
-**Break-even analysis:** GPU encode becomes competitive when kernel time dominates transfer time. With current implementation, this requires approximately N > 500K vectors (where transfer is amortized and GPU's bandwidth advantage materializes), or when data already resides on GPU from a preceding pipeline stage (e.g., GPU-based PCA or K-means).
+**Break-even analysis:** With the current implementation, the three overhead sources (cluster alloc: 900ms, scatter: 340ms, H2D upload: 120ms) total ~1,360ms of non-compute work. Even with kernel-only times of 115-135ms, the GPU cannot overcome this overhead at N=99K. The GPU becomes competitive when:
+1. Data already resides on GPU (eliminates H2D upload)
+2. Cluster allocation uses a memory pool (eliminates alloc overhead)
+3. A GPU scatter kernel replaces D2D memcpy calls (reduces scatter to ~5ms)
+
+With all three optimizations, the estimated GPU encode time would be ~120-140ms vs ~500-640ms CPU — a **3.5-4.8x speedup** at N=99K. At N > 1M, the speedup would increase further as the GPU's parallelism is better utilized.
 
 ## 3. Architectural Divergences from CPU Implementation
 
@@ -128,7 +153,7 @@ The CPU applies per-segment rotation using Eigen matrix multiplication (`result 
 
 **GPU:** The GPU processes all N vectors simultaneously, producing flat output arrays (codes, factors) indexed by sorted vector position. A subsequent **scatter phase** copies per-vector results into per-cluster `GpuSaqCluData` structures. This scatter consists of K x segments `cudaMemcpy` device-to-device calls from the CPU, which is inherently sequential and imposes O(K) latency.
 
-For K=4,096 clusters and 4 segments, this is ~16,384 small memcpy calls. Each call has ~5us overhead (CUDA driver dispatch), totaling ~80ms. This is a minor but non-trivial cost that could be eliminated by:
+For K=4,096 clusters and 4 segments, this is ~16,384 small memcpy calls plus `launch_store_factors` kernel calls. Measured scatter time is **320-390ms** (~20us per call including factor store kernel dispatch), making it the second-largest overhead after cluster allocation. This cost could be eliminated by:
 1. A GPU scatter kernel that processes all clusters in one launch
 2. Fused encode-and-scatter kernels that write directly to per-cluster storage
 3. Using CUDA graphs to batch the memcpy operations
@@ -186,7 +211,7 @@ All architectures use a warp size of 32 threads, so the warp-cooperative encode 
 | H100 (80GB) | 3.35 | 1.87x | 1.87x |
 | RTX 5090 | 1.79 | 1.0x | 1.0x |
 
-Since the workload is transfer-bound at N=99K, the H100's 3.35 TB/s HBM3 bandwidth would reduce upload time from ~1,050ms to ~560ms, making the total GPU encode ~1,130ms vs ~600ms CPU (still slower than optimized CPU at this scale).
+Note: H2D upload via PCIe is only ~120ms at N=99K (PCIe 5.0, ~4.8 GB/s). The dominant bottleneck is CUDA API overhead (cluster allocation + scatter), not bandwidth. HBM bandwidth matters for kernel-internal memory access patterns, not host transfers.
 
 **Compute throughput (matters at scale):**
 
@@ -218,25 +243,30 @@ The RTX 5090 has more raw FP32 throughput than the H100, but the double-precisio
 
 | Scenario | Recommendation |
 |----------|---------------|
-| N < 100K, one-shot index build | CPU (8+ threads) is faster |
-| N > 500K, one-shot index build | GPU likely faster (amortized transfer) |
+| N < 100K, current implementation | CPU (8+ threads) is faster due to CUDA API overhead |
+| N < 100K, with pooled alloc + GPU scatter | GPU ~4x faster (kernel-only: 115-135ms vs CPU 475-641ms) |
+| N > 500K, one-shot index build | GPU likely faster (overhead amortized over more vectors) |
 | N > 1M, data already on GPU | GPU significantly faster (~10-50x expected) |
-| Real-time incremental updates | CPU (no transfer overhead) |
+| Real-time incremental updates | CPU (no allocation/transfer overhead) |
 | Multi-GPU cluster with NVLink | GPU with peer-to-peer transfers |
-| Preprocessing pipeline on GPU | GPU (avoid D2H/H2D roundtrip) |
+| Preprocessing pipeline on GPU | GPU (avoid D2H/H2D roundtrip, 4-5x kernel speedup) |
 
 ## 7. Future Optimizations
 
-1. **Fused pipeline:** Combine subtract_centroid + rotation + CAQ encode into a single kernel to eliminate intermediate buffers and reduce global memory traffic.
+Ordered by expected impact (based on measured overhead breakdown):
 
-2. **Persistent kernel:** Process all segments in a single kernel launch, keeping data in registers/shared memory across segments.
+1. **Pooled memory allocator** (eliminates ~900ms, 57% of wall time): Replace per-cluster `cudaMalloc` calls with a single bulk allocation. Pre-compute total memory needed from cluster sizes and segment plans, allocate once, and assign sub-regions to each cluster's `GpuSaqCluData`. This alone would reduce GPU wall time from ~1,560ms to ~660ms.
 
-3. **GPU scatter kernel:** Replace the per-cluster `cudaMemcpy` D2D loop with a single kernel that scatters to all clusters simultaneously.
+2. **GPU scatter kernel** (eliminates ~330ms, 21% of wall time): Replace the per-cluster `cudaMemcpy` D2D loop with a single kernel that scatters codes and factors to all clusters simultaneously using pre-computed cluster offsets. Combined with item 1, this would reduce GPU wall time to ~330ms — a **1.5x speedup** over CPU at N=99K.
 
-4. **Stream pipelining:** Overlap segment N's scatter with segment N+1's encode using CUDA streams.
+3. **Fused pipeline:** Combine subtract_centroid + rotation + CAQ encode into a single kernel to eliminate intermediate buffers and reduce global memory traffic.
 
-5. **FP16 rotation:** Use cuBLAS FP16 TensorCore GEMM with FP32 accumulation for rotation, reducing memory traffic by 2x.
+4. **Persistent kernel:** Process all segments in a single kernel launch, keeping data in registers/shared memory across segments.
 
-6. **Fastscan reorder kernel:** Implement the 32-vector interleaved layout on GPU for direct compatibility with GPU-side search.
+5. **Stream pipelining:** Overlap segment N's scatter with segment N+1's encode using CUDA streams.
 
-7. **Multi-GPU support:** Partition clusters across GPUs, each GPU encodes its subset. Requires load balancing (clusters have variable sizes).
+6. **FP16 rotation:** Use cuBLAS FP16 TensorCore GEMM with FP32 accumulation for rotation, reducing memory traffic by 2x.
+
+7. **Fastscan reorder kernel:** Implement the 32-vector interleaved layout on GPU for direct compatibility with GPU-side search.
+
+8. **Multi-GPU support:** Partition clusters across GPUs, each GPU encodes its subset. Requires load balancing (clusters have variable sizes).
