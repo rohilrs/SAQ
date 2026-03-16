@@ -26,6 +26,11 @@
 #include "saq/stopw.h"
 #include "saq/gpu/gpu_ivf.h"
 #include "index/ivf_index.h"
+#include "saq/caq_estimator.h"
+#include "saq/saq_estimator.h"
+#include "saq/fast_scan.h"
+#include "saq/lut.h"
+#include "saq/code_helper.h"
 
 using namespace saq;
 
@@ -254,6 +259,129 @@ int main(int argc, char** argv) {
         // Check: which cluster does cpu_top1 belong to?
         PID cpu_top1_cluster = cids[cpu_top1];
         LOG(INFO) << "CPU top-1 belongs to cluster " << cpu_top1_cluster;
+
+        // === CPU-side reference: manually walk through compAccurateDist ===
+        {
+            LOG(INFO) << "=== CPU-side compAccurateDist reference for vec " << cpu_res[0] << " ===";
+            PID target = cpu_res[0];
+            PID tclu = cids[target];
+            const auto& saq_data = *cpu_ivf.get_saq_data();
+            const auto& pclusters = cpu_ivf.get_pclusters();
+            const auto& pcluster = pclusters[tclu];
+            size_t num_segs = saq_data.quant_plan.size();
+
+            // Find target vector's position within the cluster
+            int target_pos = -1;
+            for (size_t i = 0; i < pcluster.num_vec_; ++i) {
+                if (pcluster.get_segment(0).ids()[i] == target) {
+                    target_pos = (int)i;
+                    break;
+                }
+            }
+            LOG(INFO) << "  Target vec " << target << " at pos " << target_pos
+                      << " in cluster " << tclu << " (size=" << pcluster.num_vec_ << ")";
+
+            if (target_pos >= 0) {
+                float total_cpu_dist = 0.0f;
+                size_t dim_off = 0;
+
+                for (size_t s = 0; s < num_segs; ++s) {
+                    const auto& seg = pcluster.get_segment(s);
+                    const auto& bdata = saq_data.base_datas[s];
+                    size_t D_seg = saq_data.quant_plan[s].first;
+                    size_t bits = saq_data.quant_plan[s].second;
+                    float sq_delta = (bits > 0) ? 2.0f / (float)(1 << bits) : 0.0f;
+
+                    // Rotate query segment
+                    FloatVec q_seg = diag_queries.row(0).segment(dim_off, D_seg);
+                    FloatVec q_rot = bdata.rotator ? (q_seg * bdata.rotator->get_P()).eval() : q_seg;
+
+                    // For L2: query residual = rotated_query - centroid
+                    FloatVec q_resid = q_rot - seg.centroid();
+                    float q_l2sqr = q_resid.squaredNorm();
+                    float sum_q = q_resid.sum();
+
+                    // Get factors
+                    size_t blk = target_pos / KFastScanSize;
+                    size_t j = target_pos % KFastScanSize;
+                    float o_l2norm = seg.factor_o_l2norm(blk)[j];
+                    float o_l2sqr = o_l2norm * o_l2norm;
+
+                    if (bits == 0) {
+                        float seg_dist = o_l2sqr + q_l2sqr;
+                        LOG(INFO) << "  Seg " << s << " (D=" << D_seg << " bits=0): "
+                                  << "o_l2sqr=" << o_l2sqr << " q_l2sqr=" << q_l2sqr
+                                  << " seg_dist=" << seg_dist;
+                        total_cpu_dist += seg_dist;
+                        dim_off += D_seg;
+                        continue;
+                    }
+
+                    // Build LUT manually (same as Lut::prepare)
+                    size_t num_codebooks = D_seg / 4;
+                    constexpr int kPos[16] = {3,3,2,3,1,3,2,3,0,3,2,3,1,3,2,3};
+
+                    // Compute ip_xb_qprime: LUT sum for this vector's short codes
+                    // First need to build the float LUT
+                    std::vector<float> lut_float(num_codebooks * 16);
+                    for (size_t cb = 0; cb < num_codebooks; ++cb) {
+                        float* lut16 = lut_float.data() + cb * 16;
+                        const float* q4 = q_resid.data() + cb * 4;
+                        lut16[0] = 0.0f;
+                        for (int jj = 1; jj < 16; ++jj) {
+                            int lb = jj & (-jj);
+                            lut16[jj] = lut16[jj - lb] + q4[kPos[jj]];
+                        }
+                    }
+
+                    // Now we need the short code for this vector to look up the LUT
+                    // But CPU short codes are in fastscan-packed layout, not raw...
+                    // Instead, let's use the Lut class directly
+                    Lut lut(D_seg, bits > 1 ? bits - 1 : 0);
+                    lut.prepare(q_resid);
+                    float q_l2sqr_lut = lut.getQL2Sqr();
+
+                    // compFastIP to get ip_xb_qprime
+                    // This needs the short codes in fastscan layout
+                    // Let's just use compAccurateDist via the estimator
+
+                    // Actually, let's just build a CaqCluEstimator and call compAccurateDist
+                    CaqCluEstimator<DistType::L2Sqr> estimator(bdata, diag_cfg, diag_queries.row(0));
+                    estimator.prepare(&seg);
+
+                    // compFastIP to fill ip_xb_qprime
+                    float dummy_fast[32];
+                    __m512 fst[2];
+                    estimator.compFastDist(blk, fst);
+
+                    float cpu_acc_dist = estimator.compAccurateDist(target_pos);
+
+                    // Get the factors to print
+                    const ExFactor& ex_fac = seg.long_factor(target_pos);
+
+                    // Manually compute getExtIP
+                    const uint8_t* long_code = seg.long_code(target_pos);
+                    auto IP_FUNC = get_IP_FUNC(bits > 1 ? bits - 1 : 0);
+                    float ext_ip = IP_FUNC(q_resid.data(), long_code, D_seg);
+
+                    LOG(INFO) << "  Seg " << s << " (D=" << D_seg << " bits=" << bits << "):";
+                    LOG(INFO) << "    o_l2norm=" << o_l2norm << " o_l2sqr=" << o_l2sqr
+                              << " q_l2sqr=" << q_l2sqr << " (lut q_l2sqr=" << q_l2sqr_lut << ")";
+                    LOG(INFO) << "    sum_q=" << sum_q << " sq_delta=" << sq_delta;
+                    LOG(INFO) << "    rescale=" << ex_fac.rescale << " error=" << ex_fac.error;
+                    LOG(INFO) << "    ext_ip(IP_FUNC)=" << ext_ip;
+                    LOG(INFO) << "    compAccurateDist=" << cpu_acc_dist;
+
+                    total_cpu_dist += cpu_acc_dist;
+                    dim_off += D_seg;
+                }
+                LOG(INFO) << "  Total CPU compAccurateDist: " << total_cpu_dist;
+
+                // Brute-force for reference
+                float bf = (diag_queries.row(0) - vectors.row(target)).squaredNorm();
+                LOG(INFO) << "  Brute-force L2: " << bf;
+            }
+        }
 
         // Check if GPU searched that cluster (it should if nprobe=200 and K=4096)
         // We can verify by checking if ANY vector from that cluster appears in GPU results
