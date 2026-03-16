@@ -148,13 +148,10 @@ void GpuIVF::construct(const FloatRowMat& data,
         }
 
         if (bdata.rotator) {
-            // L1: GEMM on raw vector segment → rotated, then fused encode subtracts rotated centroid
-            // Extract vector segment via cublasSgeam (can't slice in cuBLAS directly)
+            // L1: GEMM on raw vector segment, fused encode subtracts rotated centroid
             auto d_vec_seg = device_alloc<float>(N * D_seg);
             {
                 float alpha = 1.0f, beta = 0.0f;
-                // Row-major [N x D] = column-major [D x N]
-                // Extract columns [dim_offset, dim_offset+D_seg) = rows in row-major
                 SAQ_CUBLAS_CHECK(cublasSgeam(cublas.get(),
                     CUBLAS_OP_N, CUBLAS_OP_N,
                     (int)D_seg, (int)N,
@@ -163,24 +160,19 @@ void GpuIVF::construct(const FloatRowMat& data,
                     d_vec_seg.get(), (int)D_seg));
             }
 
-            // Rotate: d_rotated = d_vec_seg * P
             auto d_rotated = device_alloc<float>(N * D_seg);
             auto d_P = device_alloc<float>(D_seg * D_seg);
             upload(d_P.get(), bdata.rotator->get_P().data(), D_seg * D_seg);
-
             {
                 float alpha = 1.0f, beta = 0.0f;
                 SAQ_CUBLAS_CHECK(cublasSgemm(cublas.get(),
                     CUBLAS_OP_N, CUBLAS_OP_N,
                     (int)D_seg, (int)N, (int)D_seg,
-                    &alpha,
-                    d_P.get(), (int)D_seg,
+                    &alpha, d_P.get(), (int)D_seg,
                     d_vec_seg.get(), (int)D_seg,
-                    &beta,
-                    d_rotated.get(), (int)D_seg));
+                    &beta, d_rotated.get(), (int)D_seg));
             }
 
-            // Compute rotated centroids on CPU, upload
             auto d_rotated_centroids = device_alloc<float>(K * D_seg);
             FloatRowMat cent_seg(K, D_seg);
             for (size_t c = 0; c < K; ++c)
@@ -188,7 +180,6 @@ void GpuIVF::construct(const FloatRowMat& data,
             FloatRowMat cent_rotated = cent_seg * bdata.rotator->get_P();
             upload(d_rotated_centroids.get(), cent_rotated.data(), K * D_seg);
 
-            // Fused encode: subtract rotated centroid + encode + pack
             launch_fused_caq_encode(
                 d_rotated.get(), d_rotated_centroids.get(), d_cluster_ids.get(),
                 d_o_l2norm.get(), d_fac_rescale.get(), d_fac_error.get(), d_ip_cent_oa.get(),

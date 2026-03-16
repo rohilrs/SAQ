@@ -13,6 +13,7 @@
 
 #ifdef SAQ_USE_CUDA
 
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -160,8 +161,9 @@ int main(int argc, char** argv) {
         LOG(INFO) << "--- CPU Encode (" << num_threads << " threads) ---";
         StopW sw;
         IVF cpu_ivf(N, D, K, cfg);
+        std::srand(42);  // Seed BEFORE set_variance (which triggers rotation generation)
         cpu_ivf.set_variance(variances.row(0));
-        cpu_ivf.construct(vectors, centroids, cids.data(), num_threads);
+        cpu_ivf.construct(vectors, centroids, cids.data(), 1);  // Single-threaded for deterministic rotations
         auto cpu_ms = sw.getElapsedTimeMicro() / 1000.0;
         LOG(INFO) << "CPU encode time: " << cpu_ms << " ms (" << cpu_ms / 1e3 << " s)";
 
@@ -189,8 +191,9 @@ int main(int argc, char** argv) {
 
         // Now check GPU top-5 — re-read from the GPU search results above
         // (The GPU search was already run in the search section)
-        // Re-run GPU search on a fresh index to get results
+        // Re-run GPU search on a fresh index with SAME random seed as CPU
         gpu::GpuIVF gpu_diag(N, D, K, cfg);
+        std::srand(42);  // Same seed BEFORE set_variance
         gpu_diag.set_variance(variances.row(0));
         gpu_diag.construct(vectors, centroids, cids.data());
         std::vector<PID> gpu_diag_res(100);
@@ -259,6 +262,24 @@ int main(int argc, char** argv) {
         // Check: which cluster does cpu_top1 belong to?
         PID cpu_top1_cluster = cids[cpu_top1];
         LOG(INFO) << "CPU top-1 belongs to cluster " << cpu_top1_cluster;
+
+        // Check rotation matrices match
+        {
+            const auto& cpu_saq = *cpu_ivf.get_saq_data();
+            const auto& gpu_saq = *gpu_diag.get_saq_data();
+            for (size_t s = 0; s < 2 && s < cpu_saq.base_datas.size(); ++s) {
+                const auto& cpu_rot = cpu_saq.base_datas[s].rotator;
+                const auto& gpu_rot = gpu_saq.base_datas[s].rotator;
+                if (cpu_rot && gpu_rot) {
+                    auto cpu_p = cpu_rot->get_P();
+                    auto gpu_p = gpu_rot->get_P();
+                    LOG(INFO) << "Rotation seg " << s << " CPU P[0,0:3]="
+                              << cpu_p(0,0) << " " << cpu_p(0,1) << " " << cpu_p(0,2);
+                    LOG(INFO) << "Rotation seg " << s << " GPU P[0,0:3]="
+                              << gpu_p(0,0) << " " << gpu_p(0,1) << " " << gpu_p(0,2);
+                }
+            }
+        }
 
         // === CPU-side reference: manually walk through compAccurateDist ===
         {
@@ -364,7 +385,16 @@ int main(int argc, char** argv) {
                     auto IP_FUNC = get_IP_FUNC(bits > 1 ? bits - 1 : 0);
                     float ext_ip = IP_FUNC(q_resid.data(), long_code, D_seg);
 
+                    // Compute v_mx from rotated residual (same as encoder)
+                    FloatVec v_seg_raw = vectors.row(target).segment(dim_off, D_seg);
+                    FloatVec c_seg_raw = centroids.row(tclu).segment(dim_off, D_seg);
+                    FloatVec resid_raw = v_seg_raw - c_seg_raw;
+                    FloatVec resid_rot_v = bdata.rotator ? (resid_raw * bdata.rotator->get_P()).eval() : resid_raw;
+                    float cpu_v_mx = resid_rot_v.cwiseAbs().maxCoeff();
+                    float cpu_delta = 2.0f * cpu_v_mx / (float)((1 << bits));
+
                     LOG(INFO) << "  Seg " << s << " (D=" << D_seg << " bits=" << bits << "):";
+                    LOG(INFO) << "    v_mx=" << cpu_v_mx << " delta=" << cpu_delta;
                     LOG(INFO) << "    o_l2norm=" << o_l2norm << " o_l2sqr=" << o_l2sqr
                               << " q_l2sqr=" << q_l2sqr << " (lut q_l2sqr=" << q_l2sqr_lut << ")";
                     LOG(INFO) << "    sum_q=" << sum_q << " sq_delta=" << sq_delta;
@@ -380,6 +410,63 @@ int main(int argc, char** argv) {
                 // Brute-force for reference
                 float bf = (diag_queries.row(0) - vectors.row(target)).squaredNorm();
                 LOG(INFO) << "  Brute-force L2: " << bf;
+            }
+        }
+
+        // Compare CPU vs GPU short codes for vec 63099
+        {
+            PID target = cpu_res[0];
+            PID tclu = cids[target];
+            const auto& pclusters = cpu_ivf.get_pclusters();
+            const auto& seg0 = pclusters[tclu].get_segment(0);
+            const auto& gpu_pool = gpu_diag.get_pool();
+            const auto& gpu_saq = *gpu_diag.get_saq_data();
+            size_t D_seg0 = gpu_saq.quant_plan[0].first;
+            size_t bits0 = gpu_saq.quant_plan[0].second;
+
+            // Find CPU position of target
+            int cpu_pos = -1;
+            for (size_t i = 0; i < seg0.num_vec(); ++i) {
+                if (seg0.ids()[i] == target) { cpu_pos = (int)i; break; }
+            }
+
+            // Find GPU position of target
+            size_t gpu_clu_off = gpu_pool.cluster_offsets[tclu];
+            size_t gpu_clu_sz = gpu_pool.cluster_offsets[tclu+1] - gpu_clu_off;
+            std::vector<uint32_t> gpu_ids(gpu_clu_sz);
+            gpu::download(gpu_ids.data(), gpu_pool.ids.get() + gpu_clu_off, gpu_clu_sz);
+            int gpu_pos = -1;
+            for (size_t i = 0; i < gpu_clu_sz; ++i) {
+                if (gpu_ids[i] == (uint32_t)target) { gpu_pos = (int)i; break; }
+            }
+
+            LOG(INFO) << "Code comparison for vec " << target << " seg0 (D=" << D_seg0
+                      << " bits=" << bits0 << "): cpu_pos=" << cpu_pos << " gpu_pos=" << gpu_pos;
+
+            if (cpu_pos >= 0 && gpu_pos >= 0) {
+                // Download GPU short codes (in GPU blocked layout)
+                size_t num_cb = D_seg0 / 4;
+                size_t gpu_blk_off = gpu_pool.block_offsets[tclu];
+                size_t gpu_blk = gpu_pos / 32;
+                size_t gpu_vec_in_blk = gpu_pos % 32;
+                std::vector<uint8_t> gpu_sc(num_cb);
+                gpu::download(gpu_sc.data(),
+                    gpu_pool.segments[0].short_codes.get() + (gpu_blk_off + gpu_blk) * 32 * num_cb + gpu_vec_in_blk * num_cb,
+                    num_cb);
+
+                // CPU short codes are in fastscan-packed layout — can't easily compare byte-by-byte
+                // Instead, download GPU rescale and compare with CPU
+                float gpu_resc = 0;
+                gpu::download(&gpu_resc, gpu_pool.segments[0].factor_rescale.get() + gpu_clu_off + gpu_pos, 1);
+                ExFactor cpu_fac = seg0.long_factor(cpu_pos);
+
+                LOG(INFO) << "  CPU rescale=" << cpu_fac.rescale << " GPU rescale=" << gpu_resc
+                          << " CPU error=" << cpu_fac.error;
+                LOG(INFO) << "  GPU warp_id for this vec = " << (gpu_clu_off + gpu_pos);
+                LOG(INFO) << "  GPU short codes[0:7]=" << (int)gpu_sc[0] << " " << (int)gpu_sc[1]
+                          << " " << (int)gpu_sc[2] << " " << (int)gpu_sc[3]
+                          << " " << (int)gpu_sc[4] << " " << (int)gpu_sc[5]
+                          << " " << (int)gpu_sc[6] << " " << (int)gpu_sc[7];
             }
         }
 

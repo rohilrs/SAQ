@@ -196,7 +196,8 @@ __global__ void kernel_fused_caq_encode(
 
     // ---- Step 4: Compute factors ----
     double scale_rate = (v_mx > 0.0f) ? 1.0 / v_mx : 0.0;
-    float fac_rescale = (ip_o_oa != 0.0) ? (float)(o_l2sqr / ip_o_oa) : 0.0f;
+    // rescale_vmx_to1: CPU encoder multiplies fac_rescale by v_mx after computing it
+    float fac_rescale = (ip_o_oa != 0.0) ? (float)(o_l2sqr / ip_o_oa * v_mx) : 0.0f;
     float o_l2norm = sqrtf((float)o_l2sqr);
 
     constexpr float kConstEpsilon = 1.9f;
@@ -451,7 +452,8 @@ __global__ void kernel_fused_caq_encode_no_rotation(
 
     // Factors
     double scale_rate = (v_mx > 0.0f) ? 1.0 / v_mx : 0.0;
-    float fac_rescale_val = (ip_o_oa != 0.0) ? (float)(o_l2sqr / ip_o_oa) : 0.0f;
+    // rescale_vmx_to1: multiply by v_mx (matching CPU encoder)
+    float fac_rescale_val = (ip_o_oa != 0.0) ? (float)(o_l2sqr / ip_o_oa * v_mx) : 0.0f;
     float o_l2norm_val = sqrtf((float)o_l2sqr);
     constexpr float kConstEpsilon = 1.9f;
     float fac_error_val = 0.0f;
