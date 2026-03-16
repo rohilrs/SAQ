@@ -244,7 +244,10 @@ __global__ void kernel_search(
                 }
 
                 float ip_o_q = rescale * full_ip;
-                acc_dist += o_l2sqr + q_l2sqr_s - 2.0f * ip_o_q;
+                float seg_dist = o_l2sqr + q_l2sqr_s - 2.0f * ip_o_q;
+                acc_dist += seg_dist;
+
+                // Debug output removed for commit
             }
         }
 
