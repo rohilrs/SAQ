@@ -10,6 +10,7 @@
 #include "saq/quantization_plan.h"
 #include "saq/initializer.h"
 #include "saq/gpu/gpu_cluster_data.cuh"
+#include "saq/gpu/gpu_memory_pool.h"
 
 namespace saq::gpu {
 
@@ -25,6 +26,7 @@ class GpuIVF {
     std::unique_ptr<SaqData> saq_data_;
     std::unique_ptr<SaqDataMaker> saq_data_maker_;
 
+    GpuMemoryPool pool_;
     std::vector<GpuSaqCluData> gpu_clusters_;
 
 public:

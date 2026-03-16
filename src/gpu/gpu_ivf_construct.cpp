@@ -98,22 +98,24 @@ void GpuIVF::construct(const FloatRowMat& data,
     auto upload_ms = phase_timer.getElapsedTimeMicro() / 1000.0;
     LOG(INFO) << "[TIMING] H2D upload (vectors+centroids+cids): " << upload_ms << " ms";
 
-    // 4. Allocate GPU cluster data
+    // 4. Allocate GPU memory via pool
     phase_timer.reset();
+    pool_ = GpuMemoryPool{};  // reset if previously used
+    pool_.allocate(K, cluster_sizes, quant_plan);
+
+    // Set up cluster views
     gpu_clusters_.clear();
     gpu_clusters_.resize(K);
     for (size_t c = 0; c < K; ++c) {
-        gpu_clusters_[c].allocate(cluster_sizes[c], quant_plan);
-        // Upload original IDs for this cluster
-        if (cluster_sizes[c] > 0) {
-            upload(gpu_clusters_[c].d_ids.get(),
-                   h_sorted_original_ids.data() + cluster_offsets[c],
-                   cluster_sizes[c]);
-        }
+        pool_.assign_pointers(gpu_clusters_[c], c);
     }
+
+    // Upload original IDs into pool
+    upload(pool_.ids.get(), h_sorted_original_ids.data(), N);
+
     SAQ_CUDA_CHECK(cudaDeviceSynchronize());
     auto alloc_ms = phase_timer.getElapsedTimeMicro() / 1000.0;
-    LOG(INFO) << "[TIMING] GPU cluster alloc + ID upload: " << alloc_ms << " ms";
+    LOG(INFO) << "[TIMING] GPU pool alloc + ID upload: " << alloc_ms << " ms";
 
     // cuBLAS handle
     CublasHandle cublas;
