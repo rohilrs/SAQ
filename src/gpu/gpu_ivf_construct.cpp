@@ -3,7 +3,6 @@
 #include "saq/gpu/gpu_ivf.h"
 #include "saq/gpu/gpu_utils.cuh"
 #include "saq/gpu/gpu_encoder.cuh"
-#include "saq/gpu/gpu_packer.cuh"
 #include "saq/gpu/gpu_scatter.cuh"
 #include "saq/gpu/gpu_cluster_data.cuh"
 #include "saq/initializer.h"
@@ -133,61 +132,11 @@ void GpuIVF::construct(const FloatRowMat& data,
         LOG(INFO) << "Segment " << seg << ": dim=" << D_seg << " bits=" << num_bits;
         phase_timer.reset();
 
-        // Allocate per-segment temporaries
-        auto d_residuals = device_alloc<float>(N * D_seg);
-        auto d_rotated = device_alloc<float>(N * D_seg);
-
-        // 5a. Subtract centroids
-        launch_subtract_centroid(
-            d_vectors.get(), d_centroids.get(), d_cluster_ids.get(),
-            d_residuals.get(), dim_offset, D_seg, D, N);
-
-        // 5b. Rotation: d_rotated = d_residuals * P^T
-        if (bdata.rotator) {
-            // Upload rotation matrix
-            auto d_P = device_alloc<float>(D_seg * D_seg);
-            upload(d_P.get(), bdata.rotator->get_P().data(), D_seg * D_seg);
-
-            // cuBLAS GEMM: C = A * B
-            // A = d_residuals [N x D_seg], B = P [D_seg x D_seg]
-            // In row-major: cublasSgemm with transposed args
-            float alpha = 1.0f, beta = 0.0f;
-            SAQ_CUBLAS_CHECK(cublasSgemm(
-                cublas.get(),
-                CUBLAS_OP_N, CUBLAS_OP_N,
-                (int)D_seg, (int)N, (int)D_seg,
-                &alpha,
-                d_P.get(), (int)D_seg,         // B (column-major = P^T row-major)
-                d_residuals.get(), (int)D_seg,  // A (column-major view)
-                &beta,
-                d_rotated.get(), (int)D_seg));  // C
-        } else {
-            // No rotation: copy residuals to rotated
-            SAQ_CUDA_CHECK(cudaMemcpy(d_rotated.get(), d_residuals.get(),
-                N * D_seg * sizeof(float), cudaMemcpyDeviceToDevice));
-        }
-
-        // Also rotate centroids for ip_cent_oa computation
-        auto d_centroids_seg = device_alloc<float>(K * D_seg);
-        if (bdata.rotator) {
-            // Extract centroid segment and rotate on CPU, then upload
-            FloatRowMat cent_seg(K, D_seg);
-            for (size_t c = 0; c < K; ++c) {
-                cent_seg.row(c) = centroids.row(c).segment(dim_offset, D_seg);
-            }
-            FloatRowMat cent_rotated = cent_seg * bdata.rotator->get_P();
-            upload(d_centroids_seg.get(), cent_rotated.data(), K * D_seg);
-        } else {
-            // Extract and upload unrotated centroid segments
-            FloatRowMat cent_seg(K, D_seg);
-            for (size_t c = 0; c < K; ++c) {
-                cent_seg.row(c) = centroids.row(c).segment(dim_offset, D_seg);
-            }
-            upload(d_centroids_seg.get(), cent_seg.data(), K * D_seg);
-        }
-
-        // 5c. CAQ Encode
-        auto d_codes = device_alloc<int>(N * D_seg);
+        // Allocate outputs
+        size_t short_code_bytes = D_seg / 8;
+        size_t long_code_bytes = (num_bits > 1) ? D_seg * (num_bits - 1) / 8 : 0;
+        auto d_short_raw = device_alloc<uint8_t>(N * (short_code_bytes > 0 ? short_code_bytes : 1));
+        auto d_long_raw = device_alloc<uint8_t>(N * (long_code_bytes > 0 ? long_code_bytes : 1));
         auto d_o_l2norm = device_alloc<float>(N);
         auto d_fac_rescale = device_alloc<float>(N);
         auto d_fac_error = device_alloc<float>(N);
@@ -198,22 +147,79 @@ void GpuIVF::construct(const FloatRowMat& data,
             code_max = (1 << bdata.cfg.caq_ori_qB) - 1;
         }
 
-        launch_caq_encode(
-            d_rotated.get(), d_codes.get(),
-            d_o_l2norm.get(), d_fac_rescale.get(), d_fac_error.get(), d_ip_cent_oa.get(),
-            d_centroids_seg.get(), d_cluster_ids.get(),
-            D_seg, N, K, num_bits, code_max,
-            bdata.cfg.caq_adj_rd_lmt, bdata.cfg.caq_adj_eps, bdata.cfg.caq_ori_qB);
+        if (bdata.rotator) {
+            // L1: GEMM on raw vector segment → rotated, then fused encode subtracts rotated centroid
+            // Extract vector segment via cublasSgeam (can't slice in cuBLAS directly)
+            auto d_vec_seg = device_alloc<float>(N * D_seg);
+            {
+                float alpha = 1.0f, beta = 0.0f;
+                // Row-major [N x D] = column-major [D x N]
+                // Extract columns [dim_offset, dim_offset+D_seg) = rows in row-major
+                SAQ_CUBLAS_CHECK(cublasSgeam(cublas.get(),
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    (int)D_seg, (int)N,
+                    &alpha, d_vectors.get() + dim_offset, (int)D,
+                    &beta,  d_vec_seg.get(), (int)D_seg,
+                    d_vec_seg.get(), (int)D_seg));
+            }
 
-        // 5d. Pack short codes (per-vector)
-        size_t short_code_bytes = D_seg / 8;
-        auto d_short_raw = device_alloc<uint8_t>(N * short_code_bytes);
-        launch_pack_short_codes(d_codes.get(), d_short_raw.get(), D_seg, N, num_bits);
+            // Rotate: d_rotated = d_vec_seg * P
+            auto d_rotated = device_alloc<float>(N * D_seg);
+            auto d_P = device_alloc<float>(D_seg * D_seg);
+            upload(d_P.get(), bdata.rotator->get_P().data(), D_seg * D_seg);
 
-        // 5e. Pack long codes (per-vector)
-        size_t long_code_bytes = (num_bits > 1) ? D_seg * (num_bits - 1) / 8 : 0;
-        auto d_long_raw = device_alloc<uint8_t>(N * (long_code_bytes > 0 ? long_code_bytes : 1));
-        launch_pack_long_codes(d_codes.get(), d_long_raw.get(), D_seg, N, num_bits);
+            {
+                float alpha = 1.0f, beta = 0.0f;
+                SAQ_CUBLAS_CHECK(cublasSgemm(cublas.get(),
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    (int)D_seg, (int)N, (int)D_seg,
+                    &alpha,
+                    d_P.get(), (int)D_seg,
+                    d_vec_seg.get(), (int)D_seg,
+                    &beta,
+                    d_rotated.get(), (int)D_seg));
+            }
+
+            // Compute rotated centroids on CPU, upload
+            auto d_rotated_centroids = device_alloc<float>(K * D_seg);
+            FloatRowMat cent_seg(K, D_seg);
+            for (size_t c = 0; c < K; ++c)
+                cent_seg.row(c) = centroids.row(c).segment(dim_offset, D_seg);
+            FloatRowMat cent_rotated = cent_seg * bdata.rotator->get_P();
+            upload(d_rotated_centroids.get(), cent_rotated.data(), K * D_seg);
+
+            // Fused encode: subtract rotated centroid + encode + pack
+            launch_fused_caq_encode(
+                d_rotated.get(), d_rotated_centroids.get(), d_cluster_ids.get(),
+                d_o_l2norm.get(), d_fac_rescale.get(), d_fac_error.get(), d_ip_cent_oa.get(),
+                d_short_raw.get(), d_long_raw.get(),
+                D_seg, N, K, num_bits, code_max,
+                bdata.cfg.caq_adj_rd_lmt, bdata.cfg.caq_adj_eps, bdata.cfg.caq_ori_qB);
+        } else {
+            // No rotation: fused encode subtracts centroid inline from raw vectors
+            launch_fused_caq_encode_no_rotation(
+                d_vectors.get(), d_centroids.get(), d_cluster_ids.get(),
+                dim_offset, D_seg, D,
+                d_o_l2norm.get(), d_fac_rescale.get(), d_fac_error.get(), d_ip_cent_oa.get(),
+                d_short_raw.get(), d_long_raw.get(),
+                N, K, num_bits, code_max,
+                bdata.cfg.caq_adj_rd_lmt, bdata.cfg.caq_adj_eps, bdata.cfg.caq_ori_qB);
+        }
+
+        // Compute rotated centroids for scatter (needed for pool centroid storage)
+        auto d_centroids_seg = device_alloc<float>(K * D_seg);
+        if (bdata.rotator) {
+            FloatRowMat cent_seg(K, D_seg);
+            for (size_t c = 0; c < K; ++c)
+                cent_seg.row(c) = centroids.row(c).segment(dim_offset, D_seg);
+            FloatRowMat cent_rotated = cent_seg * bdata.rotator->get_P();
+            upload(d_centroids_seg.get(), cent_rotated.data(), K * D_seg);
+        } else {
+            FloatRowMat cent_seg(K, D_seg);
+            for (size_t c = 0; c < K; ++c)
+                cent_seg.row(c) = centroids.row(c).segment(dim_offset, D_seg);
+            upload(d_centroids_seg.get(), cent_seg.data(), K * D_seg);
+        }
 
         // 5f. Scatter to per-cluster GpuSaqCluData
         SAQ_CUDA_CHECK(cudaDeviceSynchronize());
