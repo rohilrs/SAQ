@@ -4,6 +4,7 @@
 #include "saq/gpu/gpu_utils.cuh"
 #include "saq/gpu/gpu_encoder.cuh"
 #include "saq/gpu/gpu_packer.cuh"
+#include "saq/gpu/gpu_scatter.cuh"
 #include "saq/gpu/gpu_cluster_data.cuh"
 #include "saq/initializer.h"
 #include "saq/stopw.h"
@@ -221,43 +222,37 @@ void GpuIVF::construct(const FloatRowMat& data,
         LOG(INFO) << "[TIMING] Segment " << seg << " kernels: " << seg_kernel_ms << " ms";
 
         phase_timer.reset();
-        for (size_t c = 0; c < K; ++c) {
-            size_t clu_size = cluster_sizes[c];
-            if (clu_size == 0) continue;
-            size_t clu_offset = cluster_offsets[c];
-            auto& gpu_seg = gpu_clusters_[c].segments[seg];
 
-            // Copy centroid
-            SAQ_CUDA_CHECK(cudaMemcpy(
-                gpu_seg.d_centroid,
-                d_centroids_seg.get() + c * D_seg,
-                D_seg * sizeof(float), cudaMemcpyDeviceToDevice));
+        // Scatter centroids (simple D2D memcpy — same contiguous layout)
+        copy_centroids_to_pool(
+            d_centroids_seg.get(), pool_.segments[seg].centroids.get(),
+            D_seg, K);
 
-            // Copy factors
-            launch_store_factors(
-                d_o_l2norm.get(), d_ip_cent_oa.get(),
-                d_fac_rescale.get(), d_fac_error.get(),
-                gpu_seg.d_factor_o_l2norm, gpu_seg.d_factor_ip_cent_oa,
-                gpu_seg.d_long_factor_rescale, gpu_seg.d_long_factor_error,
-                clu_size, clu_offset);
+        // Scatter factors (blocked + per-vector layout)
+        launch_scatter_factors(
+            d_o_l2norm.get(), d_ip_cent_oa.get(),
+            d_fac_rescale.get(), d_fac_error.get(),
+            pool_.segments[seg].factor_o_l2norm.get(),
+            pool_.segments[seg].factor_ip_cent_oa.get(),
+            pool_.segments[seg].factor_rescale.get(),
+            pool_.segments[seg].factor_error.get(),
+            pool_.d_cluster_offsets.get(), pool_.d_block_offsets.get(),
+            d_cluster_ids.get(), N);
 
-            // Copy short codes
-            if (num_bits > 0 && gpu_seg.d_short_codes) {
-                // TODO: fastscan reorder needed for GPU search
-                // For now, copy raw short codes
-                SAQ_CUDA_CHECK(cudaMemcpy(
-                    gpu_seg.d_short_codes,
-                    d_short_raw.get() + clu_offset * short_code_bytes,
-                    clu_size * short_code_bytes, cudaMemcpyDeviceToDevice));
-            }
+        // Scatter short codes (with fastscan reorder to GPU blocked layout)
+        if (num_bits > 0) {
+            launch_scatter_short_codes(
+                d_short_raw.get(), pool_.segments[seg].short_codes.get(),
+                pool_.d_cluster_offsets.get(), pool_.d_block_offsets.get(),
+                d_cluster_ids.get(), D_seg, N, num_bits);
+        }
 
-            // Copy long codes
-            if (long_code_bytes > 0 && gpu_seg.d_long_codes) {
-                SAQ_CUDA_CHECK(cudaMemcpy(
-                    gpu_seg.d_long_codes,
-                    d_long_raw.get() + clu_offset * long_code_bytes,
-                    clu_size * long_code_bytes, cudaMemcpyDeviceToDevice));
-            }
+        // Scatter long codes
+        if (long_code_bytes > 0) {
+            launch_scatter_long_codes(
+                d_long_raw.get(), pool_.segments[seg].long_codes.get(),
+                pool_.d_cluster_offsets.get(), d_cluster_ids.get(),
+                long_code_bytes, N);
         }
 
         SAQ_CUDA_CHECK(cudaDeviceSynchronize());
