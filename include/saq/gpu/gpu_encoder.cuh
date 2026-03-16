@@ -7,36 +7,36 @@
 
 namespace saq::gpu {
 
-/// Subtract each vector's cluster centroid from its segment slice.
-void launch_subtract_centroid(
-    const float* d_vectors,
-    const float* d_centroids,
-    const uint32_t* d_cluster_ids,
-    float* d_residuals,
-    size_t seg_offset,
-    size_t D_seg,
-    size_t D_total,
-    size_t N,
+/// Fused encode: subtract rotated centroid + CAQ encode + pack short/long codes.
+/// Input: GEMM output (raw vectors rotated, NOT residuals) + rotated centroids.
+/// Eliminates d_residuals and d_codes intermediate buffers.
+void launch_fused_caq_encode(
+    const float* d_vectors_rotated,    // [N * D_seg] GEMM output on raw vectors
+    const float* d_rotated_centroids,  // [K * D_seg] precomputed on CPU
+    const uint32_t* d_cluster_ids,     // [N]
+    float* d_o_l2norm,                 // [N] output
+    float* d_fac_rescale,              // [N] output
+    float* d_fac_error,                // [N] output
+    float* d_ip_cent_oa,               // [N] output
+    uint8_t* d_short_raw,              // [N * D_seg/8] output (1-bit packed, descending)
+    uint8_t* d_long_raw,               // [N * long_bytes] output
+    size_t D_seg, size_t N, size_t K,
+    size_t num_bits, uint16_t code_max,
+    int caq_adj_rd_lmt, float caq_adj_eps, int caq_ori_qB,
     cudaStream_t stream = 0);
 
-/// Warp-cooperative CAQ encode kernel.
-void launch_caq_encode(
-    const float* d_rotated,
-    int* d_codes,
-    float* d_o_l2norm,
-    float* d_fac_rescale,
-    float* d_fac_error,
-    float* d_ip_cent_oa,
-    const float* d_centroids_seg,
+/// No-rotation variant: reads raw vectors + centroids with segment offset.
+void launch_fused_caq_encode_no_rotation(
+    const float* d_vectors,            // [N * D_total] full vectors
+    const float* d_centroids,          // [K * D_total] full centroids
     const uint32_t* d_cluster_ids,
-    size_t D_seg,
-    size_t N,
-    size_t K,
-    size_t num_bits,
-    uint16_t code_max,
-    int caq_adj_rd_lmt,
-    float caq_adj_eps,
-    int caq_ori_qB,
+    size_t seg_offset, size_t D_seg, size_t D_total,
+    float* d_o_l2norm, float* d_fac_rescale,
+    float* d_fac_error, float* d_ip_cent_oa,
+    uint8_t* d_short_raw, uint8_t* d_long_raw,
+    size_t N, size_t K,
+    size_t num_bits, uint16_t code_max,
+    int caq_adj_rd_lmt, float caq_adj_eps, int caq_ori_qB,
     cudaStream_t stream = 0);
 
 } // namespace saq::gpu
