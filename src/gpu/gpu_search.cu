@@ -168,7 +168,10 @@ __global__ void kernel_search(
     if (threadIdx.x == 0) *smem_work = 0;
     __syncthreads();
 
-    // ---- Phase 1+2: Warp-level search ----
+    // ---- Phase 1: Compute accurate distance for ALL vectors ----
+    // Skip stage 2 fast distance filtering. Compute full accurate distance
+    // using LUT (short codes) + long code IP for every valid vector.
+    // This guarantees correct recall at the cost of computing more distances.
     int lane = threadIdx.x % 32;
 
     // Per-warp candidate buffer
@@ -188,124 +191,82 @@ __global__ void kernel_search(
         if ((size_t)block_idx >= clu.num_blocks) break;
 
         uint32_t global_block = blk_off_c + block_idx;
-        uint32_t vec_pos = block_idx * 32 + lane; // position in cluster
+        uint32_t vec_pos = block_idx * 32 + lane;
         bool valid_vec = (vec_pos < clu.num_vec);
 
-        // STAGE 2: LUT fastscan — accumulate approximate IP across segments
-        float fast_dist = 0.0f;
-
-        // Per-segment LUT sums (saved for stage 3)
-        float seg_lut_sums[8]; // max 8 segments
-        float seg_o_l2n[8];
-
-        for (size_t s = 0; s < num_segments; ++s) {
-            const auto& seg = d_seg_descs[s];
-            float q_l2sqr_s = smem_consts_f[s * kConstsPerSeg + 3];
-
-            if (seg.num_bits == 0) {
-                float o_l2n = valid_vec ? seg.factor_o_l2norm[global_block * 32 + lane] : 0.0f;
-                seg_o_l2n[s] = o_l2n;
-                seg_lut_sums[s] = 0.0f;
-                fast_dist += o_l2n * o_l2n + q_l2sqr_s;
-                continue;
-            }
-
-            float sum_q_s = smem_consts_f[s * kConstsPerSeg + 2];
-            float q_l2norm_s = smem_consts_f[s * kConstsPerSeg + 4];
-            float one_over_sqrtD_s = smem_consts_f[s * kConstsPerSeg + 5];
-
-            // LUT accumulation
-            float lut_sum = 0.0f;
-            if (valid_vec) {
-                const uint8_t* short_base = seg.short_codes
-                    + (size_t)global_block * 32 * seg.num_codebooks;
-                const uint8_t* my_codes = short_base + lane * seg.num_codebooks;
-                for (size_t cb = 0; cb < seg.num_codebooks; ++cb) {
-                    lut_sum += smem_lut_f[(seg_cb_offsets[s] + cb) * 16 + my_codes[cb]];
-                }
-            }
-            seg_lut_sums[s] = lut_sum;
-
-            // Fast distance: ip_xb_qprime is the LUT sum (approx IP of residual query with 1-bit codes)
-            // fast_ip = (lut_sum - (0.5*sum_q - 0.58*q_l2norm)) * (4.0/0.8/sqrt(D)) * o_l2norm
-            float o_l2n = valid_vec ? seg.factor_o_l2norm[global_block * 32 + lane] : 0.0f;
-            seg_o_l2n[s] = o_l2n;
-
-            constexpr float const_bound = 0.58f;
-            constexpr float est_ip_o_oa = 0.8f;
-            float fast_ip = (lut_sum - (0.5f * sum_q_s - const_bound * q_l2norm_s))
-                          * (4.0f / est_ip_o_oa * one_over_sqrtD_s)
-                          * o_l2n;
-
-            float seg_dist = o_l2n * o_l2n + q_l2sqr_s - fast_ip;
-            fast_dist += fmaxf(0.0f, seg_dist);
-        }
-
-        if (!valid_vec) fast_dist = FLT_MAX;
-
-        // Check which vectors pass the fast distance threshold
-        uint32_t candidates = __ballot_sync(0xFFFFFFFF, valid_vec && fast_dist < distk);
-        if (candidates == 0) continue;
-
-        // STAGE 3: Accurate distance for candidates
-        if ((candidates & (1u << lane)) && valid_vec) {
-            float acc_dist = 0.0f;
+        // Compute accurate distance for this vector across all segments
+        float acc_dist = 0.0f;
+        if (valid_vec) {
             uint32_t vec_offset = d_cluster_offsets[c] + vec_pos;
 
             for (size_t s = 0; s < num_segments; ++s) {
                 const auto& seg = d_seg_descs[s];
                 float q_l2sqr_s = smem_consts_f[s * kConstsPerSeg + 3];
-                float o_l2sqr = seg_o_l2n[s] * seg_o_l2n[s];
+                float o_l2n = seg.factor_o_l2norm[global_block * 32 + lane];
+                float o_l2sqr = o_l2n * o_l2n;
 
                 if (seg.num_bits == 0) {
+                    // Zero-bit: distance = o_l2sqr + q_l2sqr (no IP approximation)
                     acc_dist += o_l2sqr + q_l2sqr_s;
                     continue;
                 }
 
                 float sum_q_s = smem_consts_f[s * kConstsPerSeg + 2];
                 float sq_delta_s = smem_consts_f[s * kConstsPerSeg + 6];
-                float ip_xb_qprime = seg_lut_sums[s];
+
+                // LUT sum: approximate IP from 1-bit (short) codes
+                float lut_sum = 0.0f;
+                {
+                    const uint8_t* short_base = seg.short_codes
+                        + (size_t)global_block * 32 * seg.num_codebooks;
+                    const uint8_t* my_codes = short_base + lane * seg.num_codebooks;
+                    for (size_t cb = 0; cb < seg.num_codebooks; ++cb) {
+                        lut_sum += smem_lut_f[(seg_cb_offsets[s] + cb) * 16 + my_codes[cb]];
+                    }
+                }
 
                 float rescale = seg.factor_rescale[vec_offset];
                 float full_ip;
 
                 if (seg.num_bits > 1 && seg.long_bytes_per_vec > 0) {
+                    // Full IP using long codes
                     const float* resid_seg = smem_resid_query + seg_dim_offsets[s];
                     const uint8_t* long_code = seg.long_codes
                         + vec_offset * seg.long_bytes_per_vec;
                     float ext_ip = gpu_long_code_ip(resid_seg, long_code,
                                                      seg.D_seg, seg.num_bits);
-                    full_ip = ip_xb_qprime + ext_ip * sq_delta_s
+                    full_ip = lut_sum + ext_ip * sq_delta_s
                             + (-1.0f + sq_delta_s / 2.0f) * sum_q_s;
                 } else {
-                    full_ip = ip_xb_qprime;
+                    // 1-bit or no long codes: still apply the bias term
+                    // ext_ip = 0, so full_ip = lut_sum + 0 + (vl + sq_delta/2) * sum_q
+                    full_ip = lut_sum + (-1.0f + sq_delta_s / 2.0f) * sum_q_s;
                 }
 
                 float ip_o_q = rescale * full_ip;
                 acc_dist += o_l2sqr + q_l2sqr_s - 2.0f * ip_o_q;
             }
-
-            fast_dist = fmaxf(0.0f, acc_dist);
         }
 
-        // Lane 0 collects candidates via shuffle
-        for (int src_lane = 0; src_lane < 32; ++src_lane) {
-            if (!(candidates & (1u << src_lane))) continue;
+        float my_dist = valid_vec ? fmaxf(0.0f, acc_dist) : FLT_MAX;
 
-            float dist_val = __shfl_sync(0xFFFFFFFF, fast_dist, src_lane);
+        // All valid vectors are candidates — collect via shuffle
+        uint32_t valid_mask = __ballot_sync(0xFFFFFFFF, valid_vec);
+
+        for (int src_lane = 0; src_lane < 32; ++src_lane) {
+            if (!(valid_mask & (1u << src_lane))) continue;
+
+            float dist_val = __shfl_sync(0xFFFFFFFF, my_dist, src_lane);
             if (dist_val >= distk) continue;
 
             if (lane == 0 && warp_cand_count < kWarpMaxCandidates) {
                 warp_cand_dists[warp_cand_count] = dist_val;
-                // Get the original vector ID
                 uint32_t vec_p = block_idx * 32 + src_lane;
-                warp_cand_ids[warp_cand_count] = (vec_p < clu.num_vec)
-                    ? clu.ids[vec_p] : 0xFFFFFFFF;
+                warp_cand_ids[warp_cand_count] = clu.ids[vec_p];
                 warp_cand_count++;
 
-                // Update distk if buffer is full (evict worst)
+                // Evict worst when buffer full
                 if (warp_cand_count >= kWarpMaxCandidates) {
-                    // Find and evict the worst candidate
                     int worst_idx = 0;
                     float worst_dist = warp_cand_dists[0];
                     for (int k = 1; k < warp_cand_count; ++k) {
@@ -314,19 +275,16 @@ __global__ void kernel_search(
                             worst_idx = k;
                         }
                     }
-                    // Remove worst by swapping with last
                     warp_cand_count--;
                     warp_cand_dists[worst_idx] = warp_cand_dists[warp_cand_count];
                     warp_cand_ids[worst_idx] = warp_cand_ids[warp_cand_count];
 
-                    // Recompute distk
                     worst_dist = -FLT_MAX;
                     for (int k = 0; k < warp_cand_count; ++k)
                         worst_dist = fmaxf(worst_dist, warp_cand_dists[k]);
                     distk = worst_dist;
                 }
             }
-            // Broadcast updated distk to all lanes
             distk = __shfl_sync(0xFFFFFFFF, distk, 0);
         }
     }

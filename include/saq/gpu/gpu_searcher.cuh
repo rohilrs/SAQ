@@ -45,7 +45,7 @@ struct QuerySegmentConstants {
 };
 
 /// Maximum candidates a single (query, cluster) block can output.
-constexpr size_t kMaxCandidatesPerBlock = 64;
+constexpr size_t kMaxCandidatesPerBlock = 256;
 
 /// Launch the main search kernel: build LUT + 3-stage search.
 /// Grid: dim3(Q, nprobe), Block: 128 threads (4 warps).

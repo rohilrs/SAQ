@@ -34,12 +34,14 @@ __global__ void kernel_scatter_short_codes(
     for (size_t cb = 0; cb < num_codebooks; ++cb) {
         size_t dim_base = cb * 4;
         uint8_t code4 = 0;
+        // LUT convention (from kPos): bit 3 = dim 0, bit 2 = dim 1, bit 1 = dim 2, bit 0 = dim 3
+        // So dim j maps to bit (3 - j)
         for (int j = 0; j < 4; ++j) {
             size_t dim = dim_base + j;
             size_t byte_idx = dim / 8;
-            size_t bit_pos = 7 - (dim % 8);  // descending bit order
+            size_t bit_pos = 7 - (dim % 8);  // descending bit order in packed bytes
             uint8_t bit = (src[byte_idx] >> bit_pos) & 1;
-            code4 |= (bit << j);
+            code4 |= (bit << (3 - j));  // dim 0 → bit 3, dim 3 → bit 0
         }
         size_t dst_idx = (size_t)global_block * 32 * num_codebooks
                        + (size_t)vec_in_block * num_codebooks + cb;
