@@ -174,10 +174,11 @@ void launch_scatter_factors(
     size_t N,
     cudaStream_t stream = 0);
 
-// Scatter centroids: one thread per cluster
-void launch_scatter_centroids(
+// Copy centroids into pool: simple cudaMemcpy D2D (K * D_seg floats).
+// Both source and pool are [K * D_seg] contiguous, so no scatter needed.
+void copy_centroids_to_pool(
     const float* d_centroids_seg,      // [K * D_seg]
-    float* pool_centroids,
+    float* pool_centroids,             // [K * D_seg] in pool
     size_t D_seg, size_t K,
     cudaStream_t stream = 0);
 
@@ -205,10 +206,14 @@ kernel_scatter_short_codes:
     // Read D_seg/8 bytes of linear 1-bit-per-dim packed short codes for vector i
     src = flat_short + i * (D_seg / 8)
 
+    // Bit order convention: the fused encode packs in DESCENDING order within each byte
+    // (matching the existing kernel_pack_short_codes): dim 0 → bit 7, dim 7 → bit 0.
+    // This matches the CPU pack convention.
+
     // For each codebook cb (group of 4 consecutive dimensions):
     //   dim_base = cb * 4
-    //   Extract 4 individual bits from the linear packed bytes:
-    //     bit_j = (src[dim_base + j) / 8] >> ((dim_base + j) % 8)) & 1   for j in 0..3
+    //   Extract 4 individual bits from the linear packed bytes (descending order):
+    //     bit_j = (src[(dim_base + j) / 8] >> (7 - (dim_base + j) % 8)) & 1   for j in 0..3
     //   Form 4-bit codebook index:
     //     code4 = bit_0 | (bit_1 << 1) | (bit_2 << 2) | (bit_3 << 3)
     //   Write as 1 byte to GPU blocked layout:
@@ -283,11 +288,11 @@ if (caq_ori_qB > 0) {
         codes[d] >>= shift;
 }
 
-// Pack short: extract MSB, pack 8 per byte
+// Pack short: extract MSB, pack 8 per byte (DESCENDING bit order: dim 0 → bit 7)
 for (g = 0; g < dims_per_lane / 8; ++g) {
     uint8_t byte = 0;
     for (b = 0; b < 8; ++b)
-        byte |= ((codes[g*8 + b] >> (num_bits - 1)) & 1) << b;
+        byte |= ((codes[g*8 + b] >> (num_bits - 1)) & 1) << (7 - b);
     d_short_raw[vec_idx * short_bytes + lane_offset + g] = byte;
 }
 
@@ -448,8 +453,11 @@ struct GpuSegmentDescriptor {
     size_t num_codebooks;          // D_seg / 4
     size_t D_seg;
     size_t num_bits;
-    size_t long_bytes_per_vec;     // D_seg * (bits-1) / 8, or 0
+    size_t long_bytes_per_vec;     // D_seg * (bits-1) / 8, or 0 for bits <= 1
 };
+// Precondition: D_seg is always a multiple of 8 (guaranteed by the DP optimizer
+// which allocates in 64-dim blocks, and the padding logic in quantization_plan.h).
+// This ensures D_seg/8, D_seg/4, and D_seg*(bits-1)/8 are always integers.
 
 // Device-side per-cluster descriptor (uploaded as array of K)
 struct GpuClusterDescriptor {
@@ -534,14 +542,19 @@ Phase 1+2 — Warp-level 32-vector block processing:
 
         // STAGE 2: Shared-memory LUT fastscan
         // lane = vector index within 32-vec block
+        // global_block = d_block_offsets[c] + block_idx (used for short codes AND factors)
+        global_block = d_block_offsets[c] + block_idx
+
         float approx_dist = 0
         for each segment s:
             seg = d_seg_descs[s]
-            short_code_base = seg.short_codes
-                            + (d_block_offsets[c] + block_idx) * 32 * seg.num_codebooks
+            short_code_base = seg.short_codes + global_block * 32 * seg.num_codebooks
             for each codebook cb:
                 code4 = short_code_base[lane * seg.num_codebooks + cb]
                 approx_dist += lut[s][cb][code4]  // shared memory read
+
+            // Read o_l2norm from blocked factor layout (same global_block index):
+            o_l2norm = seg.factor_o_l2norm[global_block * 32 + lane]
             // Apply scaling: delta, sum_vl_lut, o_l2norm
             // Convert to distance estimate
 
@@ -556,7 +569,17 @@ Phase 1+2 — Warp-level 32-vector block processing:
             // Compute full-precision IP using all bits
             // Formula: ip = fast_ip + long_ip * delta + (vl + delta/2) * sum_q
             //          dist_L2 = o_l2sqr + q_l2sqr - 2 * ip * rescale * o_l2norm
-            // Update warp-local distk if improved
+            my_dist = computed_distance
+        else:
+            my_dist = FLT_MAX
+
+        // Update warp-local distk via warp reduce:
+        float warp_best = warp_reduce_min(my_dist)  // min across 32 lanes
+        if (warp_best < distk):
+            distk = warp_best  // all lanes update (broadcast via reduce)
+            // Insert candidates with dist < distk into warp-local buffer
+            // Buffer is bounded at max_candidates_per_warp (e.g., topk)
+            // When full, evict worst candidate and tighten distk further
 
 Phase 3 — Output:
     Merge 4 warps' candidates into per-block output buffer
@@ -578,7 +601,9 @@ void launch_merge_topk(
     cudaStream_t stream = 0);
 ```
 
-One block per query. Loads all candidates from nprobe clusters (~200 × ~5 candidates = ~1,000 entries typical, ~4,800 worst case), performs partial sort (radix select or bitonic sort) to find top-K, writes final results. The max candidate count per block should be bounded (e.g., 64) to keep output buffer sizes predictable.
+One block per query. Loads all candidates from nprobe clusters (~200 × ~5 candidates = ~1,000 entries typical, ~4,800 worst case), performs partial sort (radix select or bitonic sort) to find top-K, writes final results.
+
+Each (query, cluster) search block writes at most `max_candidates_per_block` results (e.g., `topk` or a fixed cap like 64). Enforcement: the per-warp candidate buffer has fixed capacity; when full, the worst candidate is evicted and `distk` tightened. The output buffer is pre-allocated as `Q * nprobe * max_candidates_per_block` entries. The merge kernel reads `d_candidate_counts[q * nprobe + cluster_rank]` to know how many valid entries exist per slot.
 
 ### Accurate Distance Device Function
 
@@ -614,8 +639,8 @@ RTX 5090: 128KB shared memory per SM. At 13KB/block, up to 9 blocks/SM — excel
 - **0-bit segments**: No short codes, no LUT entries. Skip this segment in stage 2. Stage 3 long decode also skipped. Only factor `o_l2norm` contributes to distance.
 - **1-bit segments**: Short codes only, no long codes. Stage 2 processes normally. Stage 3 skips long code decode for this segment.
 - **Empty clusters** (size=0): `d_clu_descs[c].num_blocks == 0`, so the work-stealing loop exits immediately. No wasted compute.
-- **`distk` scope**: `distk` is per-warp, initialized to `FLT_MAX`. It is NOT shared across blocks — cross-block pruning would require atomic updates to global memory and add complexity. Per-warp `distk` is sufficient since it tightens as each warp processes successive blocks within its assigned cluster.
-- **Pool `allocate()` idempotency**: `allocate()` is single-use. Calling it again leaks the previous allocation. For index rebuild, destroy and recreate the `GpuMemoryPool`.
+- **`distk` scope**: `distk` is per-warp, initialized to `FLT_MAX`. It is NOT shared across warps within a block or across blocks. Cross-warp sharing would require shared-memory atomics with potential serialization overhead that outweighs the pruning benefit — at ~24 vectors per cluster (~1 block), most blocks are processed by a single warp anyway. Cross-block sharing (across the nprobe=200 clusters for a query) would require global atomics and is intentionally omitted: the merge kernel handles cross-cluster top-K selection.
+- **Pool `allocate()` idempotency**: `allocate()` is single-use. The method should assert `segments.empty()` at entry to fail loudly on accidental re-allocation. For index rebuild, destroy and recreate the `GpuMemoryPool`.
 
 ### Precomputed Data Uploaded Once
 
@@ -649,8 +674,8 @@ Per batch upload:
 | `src/gpu/gpu_ivf_construct.cpp` | Use pool, call fused encode, call scatter kernels. |
 | `src/gpu/gpu_encoder.cu` | Replace encode kernel with fused version (subtract + encode + pack). |
 | `include/saq/gpu/gpu_encoder.cuh` | Updated `launch_fused_caq_encode` signature. |
-| `src/gpu/gpu_packer.cu` | Remove pack kernels (folded into fused encode). Retain file for scatter if needed, or merge into `gpu_scatter.cu`. |
-| `include/saq/gpu/gpu_packer.cuh` | Remove pack function declarations. |
+| `src/gpu/gpu_packer.cu` | Delete entirely. Pack kernels folded into fused encode; `launch_store_factors` replaced by scatter kernel. |
+| `include/saq/gpu/gpu_packer.cuh` | Delete entirely. All declarations moved to `gpu_encoder.cuh` (fused pack) or `gpu_scatter.cuh`. |
 | `src/CMakeLists.txt` | Add `gpu_scatter.cu`, `gpu_search.cu`. |
 | `samples/gpu_benchmark_sample.cpp` | Add search benchmark comparing GPU batch vs CPU. |
 
