@@ -104,29 +104,64 @@ __global__ void kernel_search(
         dim_offset += d_seg_descs[s].D_seg;
     }
 
-    // Use float LUT (4 bytes per entry). For D=1536: 384*16*4 = 24KB, fits in 128KB shmem.
+    // Shared memory layout:
+    // [0..total_codebooks*16): float LUT (24KB for D=1536)
+    // [after LUT): per-segment constants (7 floats per segment)
+    // [after consts): work-stealing counter
+    // [after counter): per-segment residual query (for stage 3 accurate distance)
+    constexpr int kConstsPerSeg = 7;  // delta, sum_vl_lut, sum_q_resid, q_l2sqr_resid, q_l2norm_resid, one_over_sqrtD, sq_delta
     float* smem_lut_f = (float*)smem_raw;
     float* smem_consts_f = smem_lut_f + total_codebooks * 16;
-    int* smem_work = (int*)(smem_consts_f + num_segments * 6);
+    int* smem_work = (int*)(smem_consts_f + num_segments * kConstsPerSeg);
+    float* smem_resid_query = (float*)((char*)(smem_work + 1));
+    // smem_resid_query: [total_D_seg] floats — residual query = rotated_query - centroid
 
-    // Rebuild LUT as float
+    // ---- Phase 0: Build LUT from (query - centroid) ----
+    // For L2 distance, the CPU builds LUT from the residual query.
+    // We subtract the cluster's centroid per segment.
     for (size_t s = 0; s < num_segments; ++s) {
         const auto& seg = d_seg_descs[s];
         const auto& qc = d_query_consts[q_idx * num_segments + s];
         const float* query_seg = d_rotated_queries + q_idx * total_D_seg + seg_dim_offsets[s];
+        const float* centroid_seg = seg.centroids + c * seg.D_seg;
 
-        if (threadIdx.x == 0) {
-            smem_consts_f[s * 6 + 0] = qc.delta;
-            smem_consts_f[s * 6 + 1] = qc.sum_vl_lut;
-            smem_consts_f[s * 6 + 2] = qc.sum_q;
-            smem_consts_f[s * 6 + 3] = qc.q_l2sqr;
-            smem_consts_f[s * 6 + 4] = qc.q_l2norm;
-            smem_consts_f[s * 6 + 5] = qc.one_over_sqrtD;
+        // Cooperatively compute residual query = query - centroid, store in shared memory
+        float* resid_seg = smem_resid_query + seg_dim_offsets[s];
+        for (size_t d = threadIdx.x; d < seg.D_seg; d += blockDim.x) {
+            resid_seg[d] = query_seg[d] - centroid_seg[d];
         }
+    }
+    __syncthreads();
 
+    // Now build LUT from residual query and compute per-segment constants
+    for (size_t s = 0; s < num_segments; ++s) {
+        const auto& seg = d_seg_descs[s];
+        const auto& qc = d_query_consts[q_idx * num_segments + s];
+        float* resid_seg = smem_resid_query + seg_dim_offsets[s];
+
+        // Build LUT from residual query
         for (size_t cb = threadIdx.x; cb < seg.num_codebooks; cb += blockDim.x) {
             float* dst = smem_lut_f + (seg_cb_offsets[s] + cb) * 16;
-            build_codebook_lut(query_seg + cb * 4, dst);
+            build_codebook_lut(resid_seg + cb * 4, dst);
+        }
+
+        // Compute residual query constants (thread 0 does sequential sum)
+        if (threadIdx.x == 0) {
+            float sum_q_resid = 0.0f;
+            float q_l2sqr_resid = 0.0f;
+            for (size_t d = 0; d < seg.D_seg; ++d) {
+                sum_q_resid += resid_seg[d];
+                q_l2sqr_resid += resid_seg[d] * resid_seg[d];
+            }
+            float q_l2norm_resid = sqrtf(q_l2sqr_resid);
+
+            smem_consts_f[s * kConstsPerSeg + 0] = qc.delta;
+            smem_consts_f[s * kConstsPerSeg + 1] = qc.sum_vl_lut;
+            smem_consts_f[s * kConstsPerSeg + 2] = sum_q_resid;
+            smem_consts_f[s * kConstsPerSeg + 3] = q_l2sqr_resid;
+            smem_consts_f[s * kConstsPerSeg + 4] = q_l2norm_resid;
+            smem_consts_f[s * kConstsPerSeg + 5] = qc.one_over_sqrtD;
+            smem_consts_f[s * kConstsPerSeg + 6] = qc.sq_delta;
         }
     }
 
@@ -137,7 +172,7 @@ __global__ void kernel_search(
     int lane = threadIdx.x % 32;
 
     // Per-warp candidate buffer
-    constexpr int kWarpMaxCandidates = 16;
+    constexpr int kWarpMaxCandidates = 64;
     float warp_cand_dists[kWarpMaxCandidates];
     uint32_t warp_cand_ids[kWarpMaxCandidates];
     int warp_cand_count = 0;
@@ -159,64 +194,99 @@ __global__ void kernel_search(
         // STAGE 2: LUT fastscan — accumulate approximate IP across segments
         float fast_dist = 0.0f;
 
+        // Per-segment LUT sums (saved for stage 3)
+        float seg_lut_sums[8]; // max 8 segments
+        float seg_o_l2n[8];
+
         for (size_t s = 0; s < num_segments; ++s) {
             const auto& seg = d_seg_descs[s];
+            float q_l2sqr_s = smem_consts_f[s * kConstsPerSeg + 3];
+
             if (seg.num_bits == 0) {
-                // Zero-bit segment: only contributes o_l2norm^2 + q_l2sqr
                 float o_l2n = valid_vec ? seg.factor_o_l2norm[global_block * 32 + lane] : 0.0f;
-                float q_l2sqr_s = smem_consts_f[s * 6 + 3];
+                seg_o_l2n[s] = o_l2n;
+                seg_lut_sums[s] = 0.0f;
                 fast_dist += o_l2n * o_l2n + q_l2sqr_s;
                 continue;
             }
 
-            float sum_q_s = smem_consts_f[s * 6 + 2];
-            float q_l2sqr_s = smem_consts_f[s * 6 + 3];
-            float q_l2norm_s = smem_consts_f[s * 6 + 4];
-            float one_over_sqrtD_s = smem_consts_f[s * 6 + 5];
+            float sum_q_s = smem_consts_f[s * kConstsPerSeg + 2];
+            float q_l2norm_s = smem_consts_f[s * kConstsPerSeg + 4];
+            float one_over_sqrtD_s = smem_consts_f[s * kConstsPerSeg + 5];
 
-            // LUT accumulation for this vector
+            // LUT accumulation
             float lut_sum = 0.0f;
             if (valid_vec) {
                 const uint8_t* short_base = seg.short_codes
                     + (size_t)global_block * 32 * seg.num_codebooks;
                 const uint8_t* my_codes = short_base + lane * seg.num_codebooks;
-
                 for (size_t cb = 0; cb < seg.num_codebooks; ++cb) {
-                    uint8_t code4 = my_codes[cb];
-                    lut_sum += smem_lut_f[(seg_cb_offsets[s] + cb) * 16 + code4];
+                    lut_sum += smem_lut_f[(seg_cb_offsets[s] + cb) * 16 + my_codes[cb]];
                 }
             }
+            seg_lut_sums[s] = lut_sum;
 
-            // Convert LUT sum to fast distance estimate
-            // ip_xb_qprime = lut_sum (already the partial IP from LUT)
-            // fast_ip = (ip_xb_qprime - (0.5*sum_q - 0.58*q_l2norm)) * (4.0/0.8/sqrt(D)) * o_l2norm
+            // Fast distance: ip_xb_qprime is the LUT sum (approx IP of residual query with 1-bit codes)
+            // fast_ip = (lut_sum - (0.5*sum_q - 0.58*q_l2norm)) * (4.0/0.8/sqrt(D)) * o_l2norm
             float o_l2n = valid_vec ? seg.factor_o_l2norm[global_block * 32 + lane] : 0.0f;
-            float ip_xb = lut_sum; // this IS the approximate IP(x_binary, q')
+            seg_o_l2n[s] = o_l2n;
 
             constexpr float const_bound = 0.58f;
             constexpr float est_ip_o_oa = 0.8f;
-            float fast_ip = (ip_xb - (0.5f * sum_q_s - const_bound * q_l2norm_s))
+            float fast_ip = (lut_sum - (0.5f * sum_q_s - const_bound * q_l2norm_s))
                           * (4.0f / est_ip_o_oa * one_over_sqrtD_s)
                           * o_l2n;
 
-            // L2 distance contribution from this segment
             float seg_dist = o_l2n * o_l2n + q_l2sqr_s - fast_ip;
-            seg_dist = fmaxf(0.0f, seg_dist);
-            fast_dist += seg_dist;
+            fast_dist += fmaxf(0.0f, seg_dist);
         }
 
         if (!valid_vec) fast_dist = FLT_MAX;
 
         // Check which vectors pass the fast distance threshold
-        uint32_t candidates = __ballot_sync(0xFFFFFFFF, fast_dist < distk);
+        uint32_t candidates = __ballot_sync(0xFFFFFFFF, valid_vec && fast_dist < distk);
         if (candidates == 0) continue;
 
-        // STAGE 3: Accurate distance (deferred — requires per-vector delta storage)
-        // For this first implementation, use fast_dist from stage 2 as the distance
-        // estimate. This gives lower recall than the CPU's full 3-stage pipeline but
-        // proves the GPU search architecture works. Full accurate distance support
-        // requires storing per-vector quantization delta (v_mx) in the pool.
-        // TODO: Add per-vector delta to pool and implement full stage 3.
+        // STAGE 3: Accurate distance for candidates
+        if ((candidates & (1u << lane)) && valid_vec) {
+            float acc_dist = 0.0f;
+            uint32_t vec_offset = d_cluster_offsets[c] + vec_pos;
+
+            for (size_t s = 0; s < num_segments; ++s) {
+                const auto& seg = d_seg_descs[s];
+                float q_l2sqr_s = smem_consts_f[s * kConstsPerSeg + 3];
+                float o_l2sqr = seg_o_l2n[s] * seg_o_l2n[s];
+
+                if (seg.num_bits == 0) {
+                    acc_dist += o_l2sqr + q_l2sqr_s;
+                    continue;
+                }
+
+                float sum_q_s = smem_consts_f[s * kConstsPerSeg + 2];
+                float sq_delta_s = smem_consts_f[s * kConstsPerSeg + 6];
+                float ip_xb_qprime = seg_lut_sums[s];
+
+                float rescale = seg.factor_rescale[vec_offset];
+                float full_ip;
+
+                if (seg.num_bits > 1 && seg.long_bytes_per_vec > 0) {
+                    const float* resid_seg = smem_resid_query + seg_dim_offsets[s];
+                    const uint8_t* long_code = seg.long_codes
+                        + vec_offset * seg.long_bytes_per_vec;
+                    float ext_ip = gpu_long_code_ip(resid_seg, long_code,
+                                                     seg.D_seg, seg.num_bits);
+                    full_ip = ip_xb_qprime + ext_ip * sq_delta_s
+                            + (-1.0f + sq_delta_s / 2.0f) * sum_q_s;
+                } else {
+                    full_ip = ip_xb_qprime;
+                }
+
+                float ip_o_q = rescale * full_ip;
+                acc_dist += o_l2sqr + q_l2sqr_s - 2.0f * ip_o_q;
+            }
+
+            fast_dist = fmaxf(0.0f, acc_dist);
+        }
 
         // Lane 0 collects candidates via shuffle
         for (int src_lane = 0; src_lane < 32; ++src_lane) {
@@ -368,15 +438,12 @@ void launch_search(
     if (Q == 0 || nprobe == 0) return;
 
     // Compute shared memory size
-    // Float LUT: total_codebooks * 16 * sizeof(float)
-    // For D=1536: total_codebooks = 384, = 384*16*4 = 24576 bytes
-    // Constants: num_segments * 6 * sizeof(float)
-    // Work counter: sizeof(int)
-    // Candidate buffers: kMaxCandidatesPerBlock * (sizeof(float) + sizeof(uint32_t))
     size_t total_codebooks = total_D_seg / 4;
-    size_t shmem_bytes = total_codebooks * 16 * sizeof(float)   // LUT
-                       + num_segments * 6 * sizeof(float)        // constants
-                       + sizeof(int)                              // work counter
+    constexpr int kConstsPerSeg = 7;
+    size_t shmem_bytes = total_codebooks * 16 * sizeof(float)          // LUT
+                       + num_segments * kConstsPerSeg * sizeof(float)  // constants
+                       + sizeof(int)                                    // work counter
+                       + total_D_seg * sizeof(float)                    // residual query
                        + kMaxCandidatesPerBlock * (sizeof(float) + sizeof(uint32_t)); // candidate buffer
 
     dim3 grid(Q, nprobe);

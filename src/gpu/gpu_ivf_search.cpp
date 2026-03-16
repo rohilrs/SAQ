@@ -107,6 +107,8 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
             // delta and sum_vl_lut are used in the CPU's quantized LUT path but not needed
             // when using float LUT. We store them for potential future use.
 
+            size_t bits = quant_plan[s].second;
+
             auto& qc = h_query_consts[q * num_segments + s];
             qc.delta = (vr - vl) / (65535.0f - 0.01f);
             qc.sum_vl_lut = (vl + 0.5f * qc.delta) * (float)num_codebooks;
@@ -114,6 +116,7 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
             qc.q_l2sqr = q_l2sqr;
             qc.q_l2norm = q_l2norm;
             qc.one_over_sqrtD = 1.0f / std::sqrt((float)D_seg);
+            qc.sq_delta = (bits > 0) ? 2.0f / (float)(1 << bits) : 0.0f;
 
             dim_offset += D_seg;
         }

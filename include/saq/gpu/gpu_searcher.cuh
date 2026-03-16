@@ -35,12 +35,13 @@ struct GpuClusterDescriptor {
 
 /// Per-segment query constants computed on the host.
 struct QuerySegmentConstants {
-    float delta;                   // LUT quantization step
-    float sum_vl_lut;              // (vl + 0.5*delta) * num_codebooks
-    float sum_q;                   // sum of rotated query segment
-    float q_l2sqr;                 // squared norm of rotated query segment
-    float q_l2norm;                // norm of rotated query segment
+    float delta;                   // LUT quantization step (unused for float LUT)
+    float sum_vl_lut;              // (vl + 0.5*delta) * num_codebooks (unused for float LUT)
+    float sum_q;                   // sum of rotated query segment (raw, before centroid sub)
+    float q_l2sqr;                 // squared norm (raw, before centroid sub)
+    float q_l2norm;                // norm (raw, before centroid sub)
     float one_over_sqrtD;          // 1 / sqrt(D_seg)
+    float sq_delta;                // 2.0 / (1 << num_bits), for accurate distance
 };
 
 /// Maximum candidates a single (query, cluster) block can output.
