@@ -31,9 +31,10 @@ if(SAQ_BUILD_CUDA)
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_search.cu
     PROPERTIES LANGUAGE CUDA
   )
-  # GPU orchestrator (compiled by host CXX — includes Eigen which is not CUDA-compatible)
+  # GPU orchestrators (compiled by host CXX — include Eigen which is not CUDA-compatible)
   target_sources(saq PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_ivf_construct.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_ivf_search.cpp
   )
   target_include_directories(saq PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 endif()

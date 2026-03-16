@@ -11,6 +11,7 @@
 #include "saq/initializer.h"
 #include "saq/gpu/gpu_cluster_data.cuh"
 #include "saq/gpu/gpu_memory_pool.h"
+#include "saq/config.h"
 
 namespace saq::gpu {
 
@@ -49,8 +50,15 @@ public:
                    const FloatRowMat& centroids,
                    const PID* cluster_ids);
 
-    /// Access GPU clusters directly (for future GPU search).
+    /// Access GPU clusters directly.
     const std::vector<GpuSaqCluData>& get_gpu_clusters() const { return gpu_clusters_; }
+    const GpuMemoryPool& get_pool() const { return pool_; }
+
+    /// GPU-accelerated batch search.
+    void search_batch(const FloatRowMat& queries,
+                      size_t topk, size_t nprobe,
+                      SearcherConfig cfg,
+                      PID* results);
 };
 
 } // namespace saq::gpu
