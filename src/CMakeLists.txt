@@ -22,11 +22,13 @@ if(SAQ_BUILD_CUDA)
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_utils.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_encoder.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_packer.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_scatter.cu
   )
   set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_utils.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_encoder.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_packer.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu/gpu_scatter.cu
     PROPERTIES LANGUAGE CUDA
   )
   # GPU orchestrator (compiled by host CXX — includes Eigen which is not CUDA-compatible)
