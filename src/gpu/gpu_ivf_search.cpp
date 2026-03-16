@@ -170,6 +170,11 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
     auto d_candidate_counts = device_alloc<uint32_t>(Q * nprobe);
     auto d_results = device_alloc<uint32_t>(Q * topk);
 
+    // Workspace for merge kernel
+    size_t max_total_cands = nprobe * kMaxCandidatesPerBlock;
+    auto d_work_dists = device_alloc<float>(Q * max_total_cands);
+    auto d_work_ids = device_alloc<uint32_t>(Q * max_total_cands);
+
     SAQ_CUDA_CHECK(cudaDeviceSynchronize());
     auto upload_ms = stopw.getElapsedTimeMicro() / 1000.0 - centroid_ms - prep_ms;
     LOG(INFO) << "[SEARCH TIMING] Upload: " << upload_ms << " ms";
@@ -191,7 +196,8 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
     kernel_timer.reset();
     launch_merge_topk(
         d_candidate_dists.get(), d_candidate_ids.get(), d_candidate_counts.get(),
-        d_results.get(), Q, nprobe, topk);
+        d_work_dists.get(), d_work_ids.get(),
+        d_results.get(), Q, nprobe, topk, max_total_cands);
 
     SAQ_CUDA_CHECK(cudaDeviceSynchronize());
     auto merge_ms = kernel_timer.getElapsedTimeMicro() / 1000.0;

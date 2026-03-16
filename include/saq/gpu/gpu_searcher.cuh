@@ -64,13 +64,16 @@ void launch_search(
     cudaStream_t stream = 0);
 
 /// Merge per-block candidates into final top-K results.
-/// Grid: Q blocks, Block: 256 threads.
+/// Grid: Q blocks, Block: 1 thread (sequential selection sort).
 void launch_merge_topk(
     const float* d_candidate_dists,
     const uint32_t* d_candidate_ids,
     const uint32_t* d_candidate_counts,
+    float* d_work_dists,                        // [Q * max_total_cands] workspace
+    uint32_t* d_work_ids,                       // [Q * max_total_cands] workspace
     uint32_t* d_results,                        // [Q * topk] output
     size_t Q, size_t nprobe, size_t topk,
+    size_t max_total_cands,
     cudaStream_t stream = 0);
 
 } // namespace saq::gpu

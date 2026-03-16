@@ -298,53 +298,51 @@ __global__ void kernel_search(
 // Top-K merge kernel: one block per query
 // ============================================================================
 
+// Merge kernel uses candidate buffers directly from global memory (no shared memory needed).
+// Thread 0 of each block does sequential selection sort — sufficient for ~1K candidates.
 __global__ void kernel_merge_topk(
     const float* __restrict__ d_candidate_dists,
     const uint32_t* __restrict__ d_candidate_ids,
     const uint32_t* __restrict__ d_candidate_counts,
+    float* __restrict__ d_work_dists,          // [Q * max_total_cands] workspace
+    uint32_t* __restrict__ d_work_ids,         // [Q * max_total_cands] workspace
     uint32_t* __restrict__ d_results,
-    size_t Q, size_t nprobe, size_t topk)
+    size_t Q, size_t nprobe, size_t topk,
+    size_t max_total_cands)
 {
     size_t q = blockIdx.x;
     if (q >= Q) return;
 
-    extern __shared__ char merge_smem[];
-    float* all_dists = (float*)merge_smem;
-    uint32_t* all_ids = (uint32_t*)(all_dists + nprobe * kMaxCandidatesPerBlock);
-
-    int total_cands = 0;
-
-    // Thread 0 loads all candidates (sequential — sufficient for ~1K candidates)
     if (threadIdx.x == 0) {
+        float* all_dists = d_work_dists + q * max_total_cands;
+        uint32_t* all_ids = d_work_ids + q * max_total_cands;
+        int total_cands = 0;
+
         for (size_t cr = 0; cr < nprobe; ++cr) {
             int cnt = d_candidate_counts[q * nprobe + cr];
             size_t base = (q * nprobe + cr) * kMaxCandidatesPerBlock;
-            for (int k = 0; k < cnt && total_cands < (int)(nprobe * kMaxCandidatesPerBlock); ++k) {
+            for (int k = 0; k < cnt && total_cands < (int)max_total_cands; ++k) {
                 all_dists[total_cands] = d_candidate_dists[base + k];
                 all_ids[total_cands] = d_candidate_ids[base + k];
                 total_cands++;
             }
         }
 
-        // Simple selection sort for top-K (sufficient for small K)
+        // Simple selection sort for top-K
         for (size_t i = 0; i < topk && i < (size_t)total_cands; ++i) {
-            int best = i;
-            for (int j = i + 1; j < total_cands; ++j) {
+            int best = (int)i;
+            for (int j = (int)i + 1; j < total_cands; ++j) {
                 if (all_dists[j] < all_dists[best])
                     best = j;
             }
-            // Swap
             if (best != (int)i) {
                 float tmp_d = all_dists[i]; all_dists[i] = all_dists[best]; all_dists[best] = tmp_d;
                 uint32_t tmp_id = all_ids[i]; all_ids[i] = all_ids[best]; all_ids[best] = tmp_id;
             }
             d_results[q * topk + i] = all_ids[i];
         }
-
-        // Fill remaining with invalid
-        for (size_t i = total_cands; i < topk; ++i) {
+        for (size_t i = total_cands; i < topk; ++i)
             d_results[q * topk + i] = 0xFFFFFFFF;
-        }
     }
 }
 
@@ -396,18 +394,19 @@ void launch_merge_topk(
     const float* d_candidate_dists,
     const uint32_t* d_candidate_ids,
     const uint32_t* d_candidate_counts,
+    float* d_work_dists,
+    uint32_t* d_work_ids,
     uint32_t* d_results,
     size_t Q, size_t nprobe, size_t topk,
+    size_t max_total_cands,
     cudaStream_t stream)
 {
     if (Q == 0) return;
 
-    // Shared memory for merge: max candidates * 2 arrays
-    size_t shmem_bytes = nprobe * kMaxCandidatesPerBlock * (sizeof(float) + sizeof(uint32_t));
-
-    kernel_merge_topk<<<Q, 256, shmem_bytes, stream>>>(
+    kernel_merge_topk<<<Q, 1, 0, stream>>>(
         d_candidate_dists, d_candidate_ids, d_candidate_counts,
-        d_results, Q, nprobe, topk);
+        d_work_dists, d_work_ids, d_results,
+        Q, nprobe, topk, max_total_cands);
     SAQ_CUDA_CHECK(cudaGetLastError());
 }
 

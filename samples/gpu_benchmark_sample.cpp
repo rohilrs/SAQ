@@ -4,11 +4,12 @@
 /// Loads pre-computed PCA-transformed data and runs GPU encode via GpuIVF::construct,
 /// comparing timing against CPU encode via IVF::construct.
 ///
-/// Usage: gpu_benchmark_sample <data_dir> <bpd> <K> [num_threads]
+/// Usage: gpu_benchmark_sample <data_dir> <bpd> <K> [num_threads] [nprobe]
 ///   data_dir:      Path to dataset (e.g., data/datasets/dbpedia_100k)
 ///   bpd:           Bits per dimension (e.g., 2.0)
 ///   K:             Number of clusters (e.g., 4096)
 ///   num_threads:   CPU thread count for comparison (default: 8)
+///   nprobe:        Number of clusters to search (default: 200)
 
 #ifdef SAQ_USE_CUDA
 
@@ -42,8 +43,10 @@ int main(int argc, char** argv) {
     float bpd = std::stof(argv[2]);
     int K = std::stoi(argv[3]);
     int num_threads = (argc > 4) ? std::stoi(argv[4]) : 8;
+    int nprobe = (argc > 5) ? std::stoi(argv[5]) : 200;
 
-    LOG(INFO) << "GPU Benchmark: data=" << data_dir << " bpd=" << bpd << " K=" << K;
+    LOG(INFO) << "GPU Benchmark: data=" << data_dir << " bpd=" << bpd << " K=" << K
+              << " nprobe=" << nprobe;
 
     // Load data
     std::string k_str = std::to_string(K);
@@ -90,6 +93,60 @@ int main(int argc, char** argv) {
             LOG(INFO) << "GPU encode time: " << gpu_ms << " ms (" << gpu_ms / 1e3 << " s)";
         } catch (const std::exception& e) {
             LOG(ERROR) << "GPU encode failed: " << e.what();
+        }
+    }
+
+    // ---- GPU Search ----
+    {
+        LOG(INFO) << "--- GPU Batch Search ---";
+
+        // Load queries and ground truth
+        std::string query_file = data_dir + "/queries_pca.fvecs";
+        std::string gt_file = data_dir + "/groundtruth.ivecs";
+
+        FloatRowMat queries;
+        UintRowMat gt;
+        load_something<float, FloatRowMat>(query_file.c_str(), queries);
+        load_something<uint32_t, UintRowMat>(gt_file.c_str(), gt);
+
+        size_t Q = queries.rows();
+        size_t topk = std::min((size_t)100, (size_t)gt.cols());
+
+        // Re-build GPU index for search (need the gpu_ivf object to persist)
+        gpu::GpuIVF gpu_ivf2(N, D, K, cfg);
+        gpu_ivf2.set_variance(variances.row(0));
+        gpu_ivf2.construct(vectors, centroids, cids.data());
+
+        SearcherConfig search_cfg;
+        search_cfg.dist_type = DistType::L2Sqr;
+
+        std::vector<PID> gpu_results(Q * topk);
+
+        try {
+            StopW sw;
+            gpu_ivf2.search_batch(queries, topk, nprobe, search_cfg, gpu_results.data());
+            auto gpu_search_ms = sw.getElapsedTimeMicro() / 1000.0;
+            LOG(INFO) << "GPU batch search: Q=" << Q << " nprobe=" << nprobe
+                      << " topk=" << topk
+                      << " time=" << gpu_search_ms << " ms"
+                      << " QPS=" << (Q * 1000.0 / gpu_search_ms);
+
+            // Compute recall vs ground truth
+            size_t correct = 0;
+            for (size_t q = 0; q < Q; ++q) {
+                for (size_t k = 0; k < topk && k < (size_t)gt.cols(); ++k) {
+                    for (size_t r = 0; r < topk; ++r) {
+                        if (gpu_results[q * topk + r] == (PID)gt(q, k)) {
+                            correct++;
+                            break;
+                        }
+                    }
+                }
+            }
+            double recall = 100.0 * correct / (Q * std::min(topk, (size_t)gt.cols()));
+            LOG(INFO) << "GPU Recall@" << topk << " = " << recall << "%";
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "GPU search failed: " << e.what();
         }
     }
 
