@@ -29,6 +29,7 @@ class GpuIVF {
 
     GpuMemoryPool pool_;
     std::vector<GpuSaqCluData> gpu_clusters_;
+    DevicePtr<float> d_centroids_raw_;  // [K × D] raw centroids for GPU centroid search
 
 public:
     GpuIVF() = default;

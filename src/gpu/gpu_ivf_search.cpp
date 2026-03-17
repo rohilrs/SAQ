@@ -28,18 +28,22 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
     LOG(INFO) << "GPU batch search: Q=" << Q << " topk=" << topk << " nprobe=" << nprobe;
     StopW stopw;
 
-    // 1. Find nprobe nearest centroids per query (CPU)
+    // 1. Find nprobe nearest centroids per query (GPU)
+    auto d_queries_full = device_alloc<float>(Q * D);
+    upload(d_queries_full.get(), queries.data(), Q * D);
+
+    auto d_centroid_ids = device_alloc<uint32_t>(Q * nprobe);
+    launch_batch_centroid_search(
+        d_queries_full.get(), d_centroids_raw_.get(), d_centroid_ids.get(),
+        Q, K, D, nprobe);
+    SAQ_CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Download centroid IDs for host-side query prep
     std::vector<uint32_t> h_centroid_ids(Q * nprobe);
-    for (size_t q = 0; q < Q; ++q) {
-        std::vector<Candidate> centroid_dist(nprobe);
-        initer_->centroids_distances(
-            queries.row(q), nprobe, cfg.dist_type, centroid_dist);
-        for (size_t i = 0; i < nprobe; ++i) {
-            h_centroid_ids[q * nprobe + i] = centroid_dist[i].id;
-        }
-    }
+    download(h_centroid_ids.data(), d_centroid_ids.get(), Q * nprobe);
+
     auto centroid_ms = stopw.getElapsedTimeMicro() / 1000.0;
-    LOG(INFO) << "[SEARCH TIMING] Centroid search: " << centroid_ms << " ms";
+    LOG(INFO) << "[SEARCH TIMING] Centroid search (GPU): " << centroid_ms << " ms";
 
     // 2. Rotate queries per segment and compute constants (CPU)
     size_t total_D_seg = 0;
@@ -163,8 +167,7 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
     auto d_query_consts = device_alloc<QuerySegmentConstants>(Q * num_segments);
     upload(d_query_consts.get(), h_query_consts.data(), Q * num_segments);
 
-    auto d_centroid_ids = device_alloc<uint32_t>(Q * nprobe);
-    upload(d_centroid_ids.get(), h_centroid_ids.data(), Q * nprobe);
+    // d_centroid_ids already on GPU from centroid search step
 
     // Allocate output buffers
     size_t cand_buf_size = Q * nprobe * kMaxCandidatesPerBlock;

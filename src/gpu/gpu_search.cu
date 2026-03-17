@@ -438,4 +438,175 @@ void launch_merge_topk(
     SAQ_CUDA_CHECK(cudaGetLastError());
 }
 
+// ============================================================================
+// GPU batch centroid search: GEMM-based L2 distance + top-nprobe selection
+// ============================================================================
+
+// Per-query top-nprobe selection from K distances.
+// One block per query, 256 threads cooperatively find top-nprobe smallest.
+__global__ void kernel_topk_centroids(
+    const float* __restrict__ d_dists,  // [Q * K] pairwise distances
+    uint32_t* __restrict__ d_ids,       // [Q * nprobe] output
+    size_t Q, size_t K, size_t nprobe)
+{
+    size_t q = blockIdx.x;
+    if (q >= Q) return;
+
+    const float* dists = d_dists + q * K;
+    uint32_t* out = d_ids + q * nprobe;
+
+    // Thread 0 does sequential partial selection (sufficient for K=4096, nprobe=200)
+    if (threadIdx.x == 0) {
+        // Use a simple max-heap of size nprobe
+        // For K=4096, nprobe=200: selection sort is fast enough
+        // Allocate a local buffer for top-nprobe tracking
+        float best_dists[512];  // max nprobe supported
+        uint32_t best_ids[512];
+        size_t np = min(nprobe, (size_t)512);
+
+        // Initialize with first nprobe elements
+        for (size_t i = 0; i < np && i < K; ++i) {
+            best_dists[i] = dists[i];
+            best_ids[i] = (uint32_t)i;
+        }
+
+        // Find the current worst in the buffer
+        size_t worst_idx = 0;
+        float worst_val = best_dists[0];
+        for (size_t i = 1; i < np; ++i) {
+            if (best_dists[i] > worst_val) {
+                worst_val = best_dists[i];
+                worst_idx = i;
+            }
+        }
+
+        // Scan remaining elements
+        for (size_t i = np; i < K; ++i) {
+            float d = dists[i];
+            if (d < worst_val) {
+                best_dists[worst_idx] = d;
+                best_ids[worst_idx] = (uint32_t)i;
+                // Find new worst
+                worst_val = best_dists[0];
+                worst_idx = 0;
+                for (size_t j = 1; j < np; ++j) {
+                    if (best_dists[j] > worst_val) {
+                        worst_val = best_dists[j];
+                        worst_idx = j;
+                    }
+                }
+            }
+        }
+
+        // Sort the top-nprobe by distance (selection sort)
+        for (size_t i = 0; i < np; ++i) {
+            size_t min_idx = i;
+            for (size_t j = i + 1; j < np; ++j) {
+                if (best_dists[j] < best_dists[min_idx])
+                    min_idx = j;
+            }
+            if (min_idx != i) {
+                float td = best_dists[i]; best_dists[i] = best_dists[min_idx]; best_dists[min_idx] = td;
+                uint32_t ti = best_ids[i]; best_ids[i] = best_ids[min_idx]; best_ids[min_idx] = ti;
+            }
+            out[i] = best_ids[i];
+        }
+    }
+}
+
+// Compute squared row norms: norms[i] = sum(data[i*D + d]^2 for d in 0..D-1)
+// One block per row, 256 threads cooperatively reduce.
+__global__ void kernel_row_norms(
+    const float* __restrict__ data,
+    float* __restrict__ norms,
+    size_t N, size_t D)
+{
+    size_t row = blockIdx.x;
+    if (row >= N) return;
+
+    const float* r = data + row * D;
+    float partial = 0.0f;
+    for (size_t d = threadIdx.x; d < D; d += blockDim.x)
+        partial += r[d] * r[d];
+
+    // Warp reduce
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xFFFFFFFF, partial, offset);
+
+    // Block reduce via shared memory
+    __shared__ float warp_sums[8]; // max 256 threads = 8 warps
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    if (lane == 0) warp_sums[warp] = partial;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float total = 0;
+        for (int w = 0; w < (int)(blockDim.x + 31) / 32; ++w)
+            total += warp_sums[w];
+        norms[row] = total;
+    }
+}
+
+// Add squared norms to distance matrix: dists[q*K+k] += q_norms[q] + c_norms[k]
+// One thread per element.
+__global__ void kernel_add_norms(
+    float* __restrict__ dists,
+    const float* __restrict__ q_norms,
+    const float* __restrict__ c_norms,
+    size_t Q, size_t K)
+{
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= Q * K) return;
+    size_t q = idx / K;
+    size_t k = idx % K;
+    dists[idx] += q_norms[q] + c_norms[k];
+}
+
+void launch_batch_centroid_search(
+    const float* d_queries,
+    const float* d_centroids,
+    uint32_t* d_centroid_ids,
+    size_t Q, size_t K, size_t D, size_t nprobe,
+    cudaStream_t stream)
+{
+    if (Q == 0) return;
+
+    // Step 1: Compute -2 * query · centroid via cuBLAS GEMM
+    auto d_dists = device_alloc<float>(Q * K);
+
+    CublasHandle cublas;
+    float alpha = -2.0f, beta = 0.0f;
+    // Row-major: C[Q×K] = A[Q×D] × B[K×D]^T
+    // Column-major: C[K×Q] = B[D×K]^T × A[D×Q]
+    SAQ_CUBLAS_CHECK(cublasSgemm(cublas.get(),
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        (int)K, (int)Q, (int)D,
+        &alpha,
+        d_centroids, (int)D,
+        d_queries, (int)D,
+        &beta,
+        d_dists.get(), (int)K));
+
+    // Step 2: Compute norms and add to distance matrix
+    auto d_q_norms = device_alloc<float>(Q);
+    auto d_c_norms = device_alloc<float>(K);
+
+    kernel_row_norms<<<Q, 256, 0, stream>>>(d_queries, d_q_norms.get(), Q, D);
+    kernel_row_norms<<<K, 256, 0, stream>>>(d_centroids, d_c_norms.get(), K, D);
+
+    {
+        size_t total = Q * K;
+        int threads = 256;
+        int blocks = (int)((total + threads - 1) / threads);
+        kernel_add_norms<<<blocks, threads, 0, stream>>>(
+            d_dists.get(), d_q_norms.get(), d_c_norms.get(), Q, K);
+    }
+
+    // Step 3: Top-nprobe selection per query
+    kernel_topk_centroids<<<Q, 1, 0, stream>>>(
+        d_dists.get(), d_centroid_ids, Q, K, nprobe);
+    SAQ_CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace saq::gpu

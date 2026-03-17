@@ -77,6 +77,16 @@ void launch_merge_topk(
     size_t max_total_cands,
     cudaStream_t stream = 0);
 
+/// GPU batch centroid search: compute L2 distances from Q queries to K centroids
+/// via cuBLAS GEMM, then find top-nprobe per query.
+/// Replaces the CPU-side FlatInitializer loop.
+void launch_batch_centroid_search(
+    const float* d_queries,            // [Q * D] queries on device
+    const float* d_centroids,          // [K * D] centroids on device
+    uint32_t* d_centroid_ids,          // [Q * nprobe] output: top-nprobe cluster IDs per query
+    size_t Q, size_t K, size_t D, size_t nprobe,
+    cudaStream_t stream = 0);
+
 } // namespace saq::gpu
 
 #endif // SAQ_USE_CUDA

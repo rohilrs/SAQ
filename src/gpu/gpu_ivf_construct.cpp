@@ -88,11 +88,11 @@ void GpuIVF::construct(const FloatRowMat& data,
     // 3. Upload to GPU
     phase_timer.reset();
     auto d_vectors = device_alloc<float>(N * D);
-    auto d_centroids = device_alloc<float>(K * D);
+    d_centroids_raw_ = device_alloc<float>(K * D);  // kept as member for GPU search
     auto d_cluster_ids = device_alloc<uint32_t>(N);
 
     upload(d_vectors.get(), sorted_data.data(), N * D);
-    upload(d_centroids.get(), centroids.data(), K * D);
+    upload(d_centroids_raw_.get(), centroids.data(), K * D);
     upload(d_cluster_ids.get(), h_sorted_cids.data(), N);
     SAQ_CUDA_CHECK(cudaDeviceSynchronize());
     auto upload_ms = phase_timer.getElapsedTimeMicro() / 1000.0;
@@ -189,7 +189,7 @@ void GpuIVF::construct(const FloatRowMat& data,
         } else {
             // No rotation: fused encode subtracts centroid inline from raw vectors
             launch_fused_caq_encode_no_rotation(
-                d_vectors.get(), d_centroids.get(), d_cluster_ids.get(),
+                d_vectors.get(), d_centroids_raw_.get(), d_cluster_ids.get(),
                 dim_offset, D_seg, D,
                 d_o_l2norm.get(), d_fac_rescale.get(), d_fac_error.get(), d_ip_cent_oa.get(),
                 d_short_raw.get(), d_long_raw.get(),
