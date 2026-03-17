@@ -163,7 +163,7 @@ int main(int argc, char** argv) {
         IVF cpu_ivf(N, D, K, cfg);
         std::srand(42);  // Seed BEFORE set_variance (which triggers rotation generation)
         cpu_ivf.set_variance(variances.row(0));
-        cpu_ivf.construct(vectors, centroids, cids.data(), 1);  // Single-threaded for deterministic rotations
+        cpu_ivf.construct(vectors, centroids, cids.data(), num_threads);
         auto cpu_ms = sw.getElapsedTimeMicro() / 1000.0;
         LOG(INFO) << "CPU encode time: " << cpu_ms << " ms (" << cpu_ms / 1e3 << " s)";
 

@@ -10,7 +10,27 @@ This document analyzes the GPU implementation of the SAQ (Scalar Additive Quanti
 **Dataset:** DBpedia 100K (N=99,000 vectors, D=1,536 dimensions, K=4,096 clusters)
 **Build:** MSVC 19.50 (VS 2025), CUDA 13.1, Release mode (`-O2`), `CMAKE_CUDA_ARCHITECTURES=native`
 
-### 2.1 End-to-End Encode Timing
+### 2.1 Optimized Encode Timing (Current)
+
+After pooled memory allocator, GPU scatter kernels, and fused encode:
+
+| Bits/dim | GPU Total (ms) | CPU 8T (ms) | **Speedup** |
+|----------|---------------|-------------|------------|
+| 1.0 | **415** | 486 | **1.2x** |
+| 2.0 | **383** | 537 | **1.4x** |
+| 4.0 | **398** | 663 | **1.7x** |
+
+### 2.1.1 GPU Batch Search (Q=1000, nprobe=200)
+
+| Bits/dim | Search (ms) | QPS | GPU R@100 | CPU R@100 |
+|----------|------------|-----|-----------|-----------|
+| 1.0 | 508 | 1,969 | 86.6% | 86.0% |
+| 2.0 | 448 | 2,231 | 90.0% | 89.9% |
+| 4.0 | 528 | 1,895 | 90.9% | 90.8% |
+
+GPU recall matches CPU recall within 0.1-0.6% across all bit rates. The search kernel computes accurate distance for all vectors (no stage 2 fast-distance screening).
+
+### 2.1.2 Pre-Optimization Encode Timing (Baseline)
 
 | Bits/dim | Segment Plan | GPU Total (ms) | GPU Kernel (ms) | CPU 8T (ms) | Wall Speedup |
 |----------|-------------|----------------|-----------------|-------------|--------------|
@@ -32,7 +52,20 @@ The GPU's raw encode kernels (subtract + rotate + CAQ encode + pack) are **4.1-4
 
 The scatter phase is the primary optimization target: replacing 16,384 small `cudaMemcpy` D2D calls with a single GPU scatter kernel would bring the effective speedup close to the kernel-only 4-5x figure.
 
-### 2.3 Detailed Time Breakdown
+### 2.2.1 Optimized Time Breakdown (2.0 bpd)
+
+| Phase | Before (ms) | After (ms) | Change |
+|-------|------------|-----------|--------|
+| CPU prep (sort+metadata) | 77 | 77 | — |
+| H2D upload | 120 | 120 | — |
+| GPU cluster alloc | 899 | 2 | **450x** |
+| GPU kernels (encode) | 118 | 154 | +30% (fused includes cublasSgeam) |
+| GPU scatter | 338 | 1.5 | **225x** |
+| **Total** | **1,566** | **383** | **4.1x** |
+| **CPU 8T** | 506 | 537 | — |
+| **GPU vs CPU** | 0.32x | **1.4x** | |
+
+### 2.3 Pre-Optimization Detailed Time Breakdown
 
 **2.0 bpd (128d/6b + 256d/4b + 576d/2b + 576d/0b):**
 
@@ -242,38 +275,40 @@ FP32 throughput is not the limiting factor for the CAQ encode kernel. At ~4 FLOP
 
 | Scenario | Recommendation |
 |----------|---------------|
-| N < 100K, current implementation | CPU (8+ threads) is faster due to CUDA API overhead |
-| N < 100K, with pooled alloc + GPU scatter | GPU ~4x faster (kernel-only: 115-135ms vs CPU 475-641ms) |
-| N > 500K, one-shot index build | GPU likely faster (overhead amortized over more vectors) |
+| N < 100K, encode | GPU 1.2-1.7x faster than CPU 8T (pool+scatter+fused encode) |
+| N < 100K, batch search (Q=1000) | GPU 1,900-2,200 QPS at nprobe=200, recall matches CPU |
+| N > 500K, one-shot index build | GPU likely 3-5x faster (overhead further amortized) |
 | N > 1M, data already on GPU | GPU significantly faster (~10-50x expected) |
 | Real-time incremental updates | CPU (no allocation/transfer overhead) |
-| Multi-GPU cluster with NVLink | GPU with peer-to-peer transfers |
-| Preprocessing pipeline on GPU | GPU (avoid D2H/H2D roundtrip, 4-5x kernel speedup) |
+| Preprocessing pipeline on GPU | GPU (avoid D2H/H2D roundtrip) |
 
 ## 7. Future Optimizations
 
-Ordered by expected impact (based on measured overhead breakdown):
+Completed optimizations (marked with ✓):
 
-1. **Pooled memory allocator** (eliminates ~900ms, 57% of wall time): Replace per-cluster `cudaMalloc` calls with a single bulk allocation. Pre-compute total memory needed from cluster sizes and segment plans, allocate once, and assign sub-regions to each cluster's `GpuSaqCluData`. This alone would reduce GPU wall time from ~1,560ms to ~660ms.
+1. ✓ **Pooled memory allocator**: 900ms → 2ms (450x improvement)
+2. ✓ **GPU scatter kernel**: 340ms → 1.5ms (225x improvement)
+3. ✓ **Fused encode (L1+L2)**: Eliminated d_residuals and d_codes intermediate buffers
+4. ✓ **GPU batch search**: 3-stage kernel with shared-memory float LUT, recall matches CPU
 
-2. **GPU scatter kernel** (eliminates ~330ms, 21% of wall time): Replace the per-cluster `cudaMemcpy` D2D loop with a single kernel that scatters codes and factors to all clusters simultaneously using pre-computed cluster offsets. Combined with item 1, this would reduce GPU wall time to ~330ms — a **1.5x speedup** over CPU at N=99K.
+Remaining optimizations:
 
-3. **Fused pipeline:** Combine subtract_centroid + rotation + CAQ encode into a single kernel to eliminate intermediate buffers and reduce global memory traffic.
+5. **Stage 2 fast-distance filtering in search:** Re-enable LUT-based fast screening to reduce accurate distance computations from ~24 to ~5 per cluster. Requires calibrating the fast distance formula for the GPU's float LUT.
 
-4. **Persistent kernel:** Process all segments in a single kernel launch, keeping data in registers/shared memory across segments.
+6. **Parallel centroid search:** The 217ms CPU centroid search is single-threaded. OpenMP parallelization or GPU-based centroid search would cut total search time nearly in half.
 
-5. **Stream pipelining:** Overlap segment N's scatter with segment N+1's encode using CUDA streams.
+7. **Stream pipelining:** Overlap segment N's scatter with segment N+1's encode using CUDA streams.
 
-6. **FP16 rotation:** Use cuBLAS FP16 TensorCore GEMM with FP32 accumulation for rotation, reducing memory traffic by 2x.
+8. **FP16 rotation:** Use cuBLAS FP16 TensorCore GEMM with FP32 accumulation for rotation, reducing memory traffic by 2x.
 
-7. **Fastscan reorder kernel:** Implement the 32-vector interleaved layout on GPU for direct compatibility with GPU-side search.
-
-8. **Multi-GPU support:** Partition clusters across GPUs, each GPU encodes its subset. Requires load balancing (clusters have variable sizes).
+9. **Multi-GPU support:** Partition clusters across GPUs, each GPU encodes its subset. Requires load balancing (clusters have variable sizes).
 
 ## 8. Conclusion
 
-The GPU encode pipeline demonstrates that the CAQ algorithm parallelizes effectively at the vector/dimension level via warp cooperation. The core encode kernels achieve a **4.1-4.8x speedup** over an optimized 8-thread AVX-512 CPU implementation on the RTX 5090. However, at the N=99K scale tested, CUDA API overhead (per-cluster memory allocation and D2D scatter) consumes 79% of wall time, making the end-to-end GPU pipeline 2.5-3x slower than CPU.
+The GPU encode and search pipeline demonstrates that the SAQ algorithm parallelizes effectively on GPU. After implementing a pooled memory allocator (900ms→2ms), GPU scatter kernels (340ms→1.5ms), and a fused encode kernel (eliminating intermediate buffers), the GPU encode achieves a **1.2-1.7x speedup** over an optimized 8-thread AVX-512 CPU implementation on the RTX 5090 at N=99K.
 
-This is a solvable engineering problem, not a fundamental algorithmic limitation. The two highest-impact optimizations — a pooled memory allocator and a GPU scatter kernel — would eliminate ~1,230ms of overhead and bring end-to-end GPU time to ~330ms, yielding a **1.5-2x speedup** over CPU even at this small dataset size. At scale (N > 1M), the GPU's parallelism would be better utilized and the overhead further amortized.
+GPU batch search achieves **1,900-2,200 QPS** for 1,000 queries at nprobe=200, with recall matching the CPU within 0.1-0.6% across all bit rates (86.6-90.9%). The search kernel uses shared-memory float LUT and computes accurate distance for all vectors (no fast-distance screening yet).
 
-The implementation is architecture-portable across all CUDA SM 80+ GPUs. On datacenter GPUs (A100, H100), the memory-bandwidth-limited encode kernels would benefit from HBM's higher bandwidth, with the H100 expected to achieve ~1.5-1.9x faster kernels than the RTX 5090. The warp-cooperative design (32 threads per vector, double-precision shuffles for numerical stability) requires no architecture-specific tuning.
+The implementation is architecture-portable across all CUDA SM 80+ GPUs. On datacenter GPUs (A100, H100), the memory-bandwidth-limited kernels would benefit from HBM's higher bandwidth. The warp-cooperative design (32 threads per vector, double-precision shuffles for numerical stability) requires no architecture-specific tuning.
+
+See `docs/gpu-search-implementation.md` for detailed documentation of the search kernel architecture and the debugging process that brought recall from 4.6% to 90%.
