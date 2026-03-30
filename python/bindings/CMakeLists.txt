@@ -29,3 +29,36 @@ if(WIN32)
     COMMENT "Copying glog and fmt DLLs to python/saq/"
   )
 endif()
+
+# ---- GPU bindings (_saq_gpu) ----
+if(SAQ_BUILD_CUDA)
+  pybind11_add_module(_saq_gpu saq_gpu_bindings.cpp)
+  target_link_libraries(_saq_gpu PRIVATE saq)
+  target_include_directories(_saq_gpu PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+  )
+  target_compile_definitions(_saq_gpu PRIVATE SAQ_USE_CUDA)
+
+  if(SAQ_REQUIRE_AVX512)
+    if(MSVC)
+      target_compile_options(_saq_gpu PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX512>)
+    else()
+      target_compile_options(_saq_gpu PRIVATE -mavx512f -mavx512bw -mavx512dq -mavx512vl)
+    endif()
+  endif()
+
+  set_target_properties(_saq_gpu PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/python/saq"
+    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/python/saq"
+  )
+
+  if(WIN32)
+    add_custom_command(TARGET _saq_gpu POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:glog::glog> "${PROJECT_SOURCE_DIR}/python/saq/"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:fmt::fmt> "${PROJECT_SOURCE_DIR}/python/saq/"
+      COMMENT "Copying glog and fmt DLLs to python/saq/ (GPU)"
+    )
+  endif()
+endif()
