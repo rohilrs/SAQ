@@ -139,6 +139,7 @@ class SaqDataMaker {
     const size_t num_dim_;        ///< Original dimension
     const size_t num_dim_padded_; ///< Padded dimension (multiple of kDimPaddingSize)
     std::unique_ptr<SaqData> data_;
+    FloatRowMat optimal_costs_;   ///< D × (max_bits+1) precomputed optimal codebook MSE (optional)
 
   public:
     /// @brief Construct a SaqDataMaker with the given config and dimension.
@@ -171,6 +172,17 @@ class SaqDataMaker {
 
     /// @brief Compute per-dimension variance from data matrix.
     void compute_variance(const FloatRowMat &data);
+
+    /// @brief Set precomputed optimal codebook costs (D × num_bits matrix).
+    ///        When set, the DP uses these costs instead of variance/2^bits.
+    void set_optimal_costs(FloatRowMat costs) {
+        optimal_costs_ = std::move(costs);
+    }
+
+    /// @brief Check if optimal costs have been set.
+    bool has_optimal_costs() const {
+        return optimal_costs_.rows() > 0;
+    }
 
   protected:
     /// @brief Create BaseQuantizerData entries from the quantization plan.

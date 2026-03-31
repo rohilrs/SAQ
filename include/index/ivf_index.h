@@ -109,6 +109,12 @@ class IVF {
         saq_data_maker_->set_variance(std::move(vars));
     }
 
+    /// @brief Set precomputed optimal codebook costs for DP bit allocation.
+    ///        Must be called before construct(). Falls back to variance/2^bits if not set.
+    void set_optimal_costs(FloatRowMat costs) {
+        saq_data_maker_->set_optimal_costs(std::move(costs));
+    }
+
     void printQPlan(const SaqData *data) {
         LOG(INFO) << "Dynamic bits allocation plan:";
         size_t dims_sum = 0;

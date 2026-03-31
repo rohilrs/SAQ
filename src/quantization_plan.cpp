@@ -152,16 +152,40 @@ SaqDataMaker::QuantPlanT SaqDataMaker::dynamic_programming(
 
                     // Try extending with a new segment of j blocks with b bits each
                     double var_sum = 0;
+                    const bool use_opt = has_optimal_costs();
+                    const size_t max_opt_col = use_opt
+                        ? static_cast<size_t>(optimal_costs_.cols() - 1) : 0;
+                    const size_t max_opt_row = use_opt
+                        ? static_cast<size_t>(optimal_costs_.rows()) : 0;
+
+                    // Incrementally accumulate optimal costs per bit rate
+                    std::vector<double> opt_cost_sum(
+                        use_opt ? kMaxQuantBit + 1 : 0, 0.0);
+
                     for (size_t j = 1; (i + j) * kDimPaddingSize <= num_dim_padded_; j++) {
+                        size_t blk_start = (i + j - 1) * kDimPaddingSize;
                         var_sum += data_variance
-                                       .segment((i + j - 1) * kDimPaddingSize, kDimPaddingSize)
+                                       .segment(blk_start, kDimPaddingSize)
                                        .sum();
+
+                        if (use_opt) {
+                            for (size_t b = 1; b <= kMaxQuantBit; ++b) {
+                                size_t bc = std::min(b, max_opt_col);
+                                for (size_t d = blk_start;
+                                     d < blk_start + kDimPaddingSize && d < max_opt_row; d++) {
+                                    opt_cost_sum[b] +=
+                                        static_cast<double>(optimal_costs_(d, bc));
+                                }
+                            }
+                        }
 
                         for (size_t b = 1; b <= kMaxQuantBit; ++b) {
                             auto B_new = used_bits + b * j * kDimPaddingSize + num_bit_factors;
                             if (B_new > tot_bits)
                                 break;
-                            auto v = var_sum / (1 << b);
+                            double v = use_opt
+                                ? opt_cost_sum[b]
+                                : var_sum / (1 << b);
                             auto &f_to = f[ns + 1][i + j][B_new];
                             if (f_to.first > f[ns][i][used_bits].first + v) {
                                 f_to.first = f[ns][i][used_bits].first + v;
@@ -170,7 +194,15 @@ SaqDataMaker::QuantPlanT SaqDataMaker::dynamic_programming(
                         }
                     }
                     // Also try assigning 0 bits to remaining dimensions (unquantized tail)
-                    auto err0 = var_sum;
+                    double err0;
+                    if (use_opt) {
+                        err0 = 0.0;
+                        for (size_t d = i * kDimPaddingSize; d < num_dim_padded_ && d < max_opt_row; d++) {
+                            err0 += static_cast<double>(optimal_costs_(d, 0));
+                        }
+                    } else {
+                        err0 = var_sum;
+                    }
                     if (f[ns][i][used_bits].first + err0 < f[1 + ns][i_end][used_bits].first) {
                         f[1 + ns][i_end][used_bits].first = f[ns][i][used_bits].first + err0;
                         f[1 + ns][i_end][used_bits].second = (i << 4) + 0;
