@@ -14,8 +14,6 @@ For each dimension, we find the optimal 1D quantizer by dynamic programming on s
 - Cost per range computed in O(1) via prefix sums: `SSE(a,b) = Σx² - (Σx)²/n`
 - Backtrack to recover cluster centroids (the codebook)
 
-This is equivalent to exact 1D k-means (which always produces contiguous clusters).
-
 ### 2x2 Factorial Design
 
 Two independent variables:
