@@ -45,7 +45,13 @@ class SaqEstimatorBase {
             }
             auto vars2 = (data_variance.segment(offset, bdata.num_dim_pad).array() * curr_query.array().square()).sum();
 
-            estimators_.emplace_back(bdata, searcher_cfg, curr_query).setPruneBound(std::sqrt(vars2));
+            auto &est = estimators_.emplace_back(bdata, searcher_cfg, curr_query);
+            est.setPruneBound(std::sqrt(vars2));
+
+            // Pass segment codebooks if available
+            if (i < data.segment_codebooks.size() && !data.segment_codebooks[i].empty()) {
+                est.set_codebooks(&data.segment_codebooks[i]);
+            }
 
             offset += bdata.num_dim_pad;
         }
@@ -121,6 +127,26 @@ class SaqCluEstimator : public SaqEstimatorBase<CaqCluEstimator<kDistType>> {
         float acc_dist = 0;
         for (size_t c_i = 0; c_i < estimators_.size(); ++c_i) {
             acc_dist += estimators_[c_i].compAccurateDist(idx);
+        }
+        return acc_dist;
+    }
+
+    bool has_codebooks() const {
+        for (const auto &est : estimators_) {
+            if (est.has_codebooks()) return true;
+        }
+        return false;
+    }
+
+    float compAccurateDistCodebook(size_t idx) {
+        DCHECK_LT(idx, curr_saq_cluster_->num_vec_);
+        float acc_dist = 0;
+        for (size_t c_i = 0; c_i < estimators_.size(); ++c_i) {
+            if (estimators_[c_i].has_codebooks()) {
+                acc_dist += estimators_[c_i].compAccurateDistCodebook(idx);
+            } else {
+                acc_dist += estimators_[c_i].compAccurateDist(idx);
+            }
         }
         return acc_dist;
     }

@@ -83,9 +83,10 @@ static BenchResult RunBenchmark(
     QuantizeConfig cfg;
     cfg.avg_bits = bpd;
     cfg.single.quant_type = BaseQuantType::CAQ;
-    cfg.single.random_rotation = true;
+    // Disable rotation for both runs — codebooks are in PCA space
+    cfg.single.random_rotation = false;
     cfg.single.use_fastscan = true;
-    cfg.single.caq_adj_rd_lmt = 6;
+    cfg.single.caq_adj_rd_lmt = (codebooks == nullptr) ? 6 : 0;  // No CAQ adjustment for codebook
     cfg.enable_segmentation = true;
 
     size_t nv = static_cast<size_t>(data.rows());

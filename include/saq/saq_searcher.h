@@ -133,18 +133,26 @@ class SAQSearcher : public SaqCluEstimator<kDistType> {
                     _mm512_store_ps(clu_dist_ + c_i * KFastScanSize, clu_dist512_[c_i * FAST_ARRAY]);
                     _mm512_store_ps(clu_dist_ + c_i * KFastScanSize + 16, clu_dist512_[c_i * FAST_ARRAY + 1]);
                 }
+                const bool use_cb = this->has_codebooks();
                 for (size_t j = 0; j < KFastScanSize; ++j) {
                     if (curr_dist[j] < distk) {
                         auto idx = blk_begin + j;
                         if (idx >= num_points) {
                             break;
                         }
-                        float acc_dist = curr_dist[j];
-                        for (size_t c_i = 0; c_i < clus_num; ++c_i) {
-                            auto &estimator = estimators_[c_i];
-                            acc_dist += estimator.compAccurateDist(idx) - clu_dist_[c_i * KFastScanSize + j];
-                            if (acc_dist >= distk) {
-                                break;
+                        float acc_dist;
+                        if (use_cb) {
+                            // Codebook path: compute full distance from codebook lookup
+                            acc_dist = this->compAccurateDistCodebook(idx);
+                        } else {
+                            // Uniform path: incrementally replace fastscan with accurate
+                            acc_dist = curr_dist[j];
+                            for (size_t c_i = 0; c_i < clus_num; ++c_i) {
+                                auto &estimator = estimators_[c_i];
+                                acc_dist += estimator.compAccurateDist(idx) - clu_dist_[c_i * KFastScanSize + j];
+                                if (acc_dist >= distk) {
+                                    break;
+                                }
                             }
                         }
                         KNNs.insert(saq_clust->ids()[idx], acc_dist);
@@ -192,7 +200,9 @@ class SAQSearcher : public SaqCluEstimator<kDistType> {
                 auto idx = KFastScanSize * blk_idx + j;
                 mask -= lb;
                 PID id = clusters->ids()[idx];
-                auto ex_dist = estimator.compAccurateDist(idx);
+                auto ex_dist = estimator.has_codebooks()
+                    ? estimator.compAccurateDistCodebook(idx)
+                    : estimator.compAccurateDist(idx);
                 KNNs.insert(id, ex_dist);
                 distk = KNNs.distk();
             }

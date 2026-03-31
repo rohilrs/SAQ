@@ -36,6 +36,7 @@ class CodeHelper {
         assert(shift == 0);
     }
 
+  public:
     template <typename T>
     static void froce_decompact(const uint8_t *__restrict y, T *out, size_t D) {
         if (kBits == 0)
@@ -724,4 +725,25 @@ inline auto get_compacted_code8_func(int bits) -> void (*)(uint8_t *o_compact, c
     }
     return nullptr;
 }
+/// @brief Get decompact function for given bit width (long code bits, i.e. num_bits-1).
+inline auto get_decompact_func(int bits) -> void (*)(const uint8_t *, uint16_t *, size_t) {
+    // Wrap froce_decompact<uint16_t> into a uniform signature
+    switch (bits) {
+    case 0: return [](const uint8_t *, uint16_t *, size_t) {};
+    case 1: return [](const uint8_t *y, uint16_t *out, size_t D) { CodeHelper<1>::froce_decompact(y, out, D); };
+    case 2: return [](const uint8_t *y, uint16_t *out, size_t D) { CodeHelper<2>::froce_decompact(y, out, D); };
+    case 3: return [](const uint8_t *y, uint16_t *out, size_t D) { CodeHelper<3>::froce_decompact(y, out, D); };
+    case 4: return [](const uint8_t *y, uint16_t *out, size_t D) { CodeHelper<4>::froce_decompact(y, out, D); };
+    case 5: return [](const uint8_t *y, uint16_t *out, size_t D) { CodeHelper<5>::froce_decompact(y, out, D); };
+    case 6: return [](const uint8_t *y, uint16_t *out, size_t D) { CodeHelper<6>::froce_decompact(y, out, D); };
+    case 7: return [](const uint8_t *y, uint16_t *out, size_t D) { CodeHelper<7>::froce_decompact(y, out, D); };
+    case 8: return [](const uint8_t *y, uint16_t *out, size_t D) { CodeHelper<8>::froce_decompact(y, out, D); };
+    case 9: return [](const uint8_t *y, uint16_t *out, size_t D) { CodeHelper<9>::froce_decompact(y, out, D); };
+    case 10: return [](const uint8_t *y, uint16_t *out, size_t D) { CodeHelper<10>::froce_decompact(y, out, D); };
+    case 11: return [](const uint8_t *y, uint16_t *out, size_t D) { CodeHelper<11>::froce_decompact(y, out, D); };
+    case 12: return [](const uint8_t *y, uint16_t *out, size_t D) { CodeHelper<12>::froce_decompact(y, out, D); };
+    default: assert(false); return nullptr;
+    }
+}
+
 } // namespace saq

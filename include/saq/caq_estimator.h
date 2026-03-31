@@ -22,6 +22,8 @@
 
 #include "saq/defines.h"
 #include "saq/cluster_data.h"
+#include "saq/codebook_encoder.h"
+#include "saq/code_helper.h"
 #include "saq/config.h"
 #include "saq/lut.h"
 #include "saq/quantization_plan.h"
@@ -50,6 +52,8 @@ class CaqCluEstimator {
     float q_l2sqr_ = 0;
     Lut lut_;
     const CAQClusterData *curr_cluster_;
+    const std::vector<DimensionCodebook> *codebooks_ = nullptr;
+    void (*decompact_func_)(const uint8_t *, uint16_t *, size_t) = nullptr;
 
     QueryRuntimeMetrics runtime_statics_;
 
@@ -71,6 +75,14 @@ class CaqCluEstimator {
     }
 
     ~CaqCluEstimator() = default;
+
+    void set_codebooks(const std::vector<DimensionCodebook> *cb) {
+        codebooks_ = cb;
+        if (cb && !cb->empty() && ex_bits_ > 0) {
+            decompact_func_ = get_decompact_func(ex_bits_);
+        }
+    }
+    bool has_codebooks() const { return codebooks_ != nullptr && !codebooks_->empty(); }
 
     void setPruneBound(float vars) {
         without_ip_prune_bound_ = vars * cfg_.searcher_vars_bound_m;
@@ -173,6 +185,83 @@ class CaqCluEstimator {
         } else {
             float est_dist = o_l2sqr + q_l2sqr_ - 2 * ip_o_q;
             return est_dist;
+        }
+    }
+
+    /// @brief Codebook-aware accurate distance using actual centroid values.
+    ///        Decompacts codes, reconstructs via codebook lookup, computes true IP.
+    float compAccurateDistCodebook(size_t vec_idx) {
+        auto blk_idx = vec_idx / KFastScanSize;
+        auto j = vec_idx % KFastScanSize;
+        const auto o_l2norm = curr_cluster_->factor_o_l2norm(blk_idx)[j];
+        const float o_l2sqr = o_l2norm * o_l2norm;
+        if (num_bits_ == 0 || !has_codebooks()) {
+            return compAccurateDist(vec_idx);
+        }
+
+        const ExFactor &ex_fac = curr_cluster_->long_factor(vec_idx);
+
+        // Reconstruct full codes and compute IP via codebook lookup
+        // 1. Decompact long code (bits-1 bits per dim)
+        const uint8_t *long_code = curr_cluster_->long_code(vec_idx);
+        std::vector<uint16_t> long_vals(num_dim_padded_, 0);
+        if (ex_bits_ > 0 && decompact_func_) {
+            decompact_func_(long_code, long_vals.data(), num_dim_padded_);
+        }
+
+        // 2. Extract short code bits (MSB) for this vector
+        const uint8_t *sc = curr_cluster_->short_code_single(vec_idx);
+        const uint16_t short_bit = 1u << ex_bits_;  // = 1 << (num_bits - 1)
+
+        // 3. Combine and look up codebook centroids, compute IP with query
+        // The codebook centroids are in the original residual space (not normalized).
+        // The query is also in the original space. So <q, o_a> gives the true IP
+        // between query and codebook-reconstructed vector. We use rescale to
+        // correct for the approximation: ip_o_q ≈ (|o|^2 / <o, o_a>) * <o_a, q>
+        // Since rescale was computed from the normalized <o, o_a>, we need to
+        // use the original (un-normalized) relationship directly.
+        double ip_oa_q = 0.0;
+        const float *q = query_data_.data();
+        const auto &cbs = *codebooks_;
+        for (size_t d = 0; d < num_dim_padded_; d++) {
+            // Extract MSB from packed short code
+            size_t byte_idx = d / 8;
+            size_t bit_pos = 7 - (d % 8);  // MSB-first packing
+            // Account for the interleaved byte order in pack_short_codes
+            size_t byte_cov = byte_idx + 7 - 2 * (byte_idx % 8);
+            uint16_t msb = (sc[byte_cov] >> bit_pos) & 1;
+
+            uint16_t full_code = msb * short_bit + long_vals[d];
+
+            if (d < cbs.size() && full_code < cbs[d].num_entries) {
+                ip_oa_q += q[d] * static_cast<double>(cbs[d].centroids[full_code]);
+            }
+        }
+
+        // Use rescale to estimate <o, q> from <o_a, q>:
+        // ip_o_q = rescale * <o_a_normalized, q> in the original SAQ pipeline.
+        // But our <o_a, q> is in the original space, not normalized.
+        // The stored rescale = |o|^2 * v_mx / <o, o_a>_original (from rescale_vmx_to1).
+        // We want: ip_o_q = (|o|^2 / <o, o_a>) * <o_a, q>
+        // Since <o, o_a> was computed from codebook centroids in original space,
+        // and rescale = |o|^2 * v_mx / <o, o_a>, we have:
+        // ip_o_q = (rescale / v_mx) * <o_a, q>
+        // But v_mx is not stored. Instead, just use the direct formula:
+        // ip_o_q ≈ <o_a, q> * (|o|^2 / <o, o_a>)
+        // where <o, o_a> can be estimated from |o|^2 / rescale * v_mx.
+        // Simplification: just use <o_a, q> directly as the IP estimate.
+        // This skips the rescale correction but uses the actual codebook values.
+        // ip_oa_q is <codebook_residual, query_rotated> in original space.
+        // For L2: dist = |o|^2 + |q|^2 - 2*(<residual_approx, q> + <centroid, q>)
+        // ip_q_c_ = <centroid, q> computed in prepare()
+        float ip_o_q = static_cast<float>(ip_oa_q) + ip_q_c_;
+
+        runtime_statics_.acc_bitsum += num_dim_padded_ * num_bits_;
+
+        if (isIpDist()) {
+            return ip_o_q;
+        } else {
+            return o_l2sqr + q_l2sqr_ - 2 * ip_o_q;
         }
     }
 };
