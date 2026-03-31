@@ -34,6 +34,37 @@ void IVF::construct(const FloatRowMat &data, const FloatRowMat &centroids, const
         }
         saq_data_ = saq_data_maker_->return_data();
         printQPlan(saq_data_.get());
+
+        // Convert raw codebooks to per-segment DimensionCodebook vectors
+        if (has_codebooks()) {
+            saq_data_->segment_codebooks.clear();
+            size_t dim_offset = 0;
+            for (const auto &[seg_dims, seg_bits] : saq_data_->quant_plan) {
+                std::vector<DimensionCodebook> seg_cbs;
+                if (seg_bits > 0) {
+                    size_t k = 1u << seg_bits;
+                    size_t max_b = static_cast<size_t>(raw_codebooks_.cols()) / 256;
+                    size_t b_idx = std::min(seg_bits, max_b > 0 ? max_b - 1 : 0);
+                    for (size_t d = 0; d < seg_dims; d++) {
+                        DimensionCodebook cb;
+                        size_t global_dim = dim_offset + d;
+                        if (global_dim < static_cast<size_t>(raw_codebooks_.rows())) {
+                            cb.num_entries = std::min(k, static_cast<size_t>(256));
+                            cb.centroids.resize(cb.num_entries);
+                            for (size_t c = 0; c < cb.num_entries; c++) {
+                                cb.centroids[c] = raw_codebooks_(global_dim, b_idx * 256 + c);
+                            }
+                            // Sort centroids for binary search in nearest()
+                            std::sort(cb.centroids.begin(), cb.centroids.end());
+                        }
+                        seg_cbs.push_back(std::move(cb));
+                    }
+                }
+                saq_data_->segment_codebooks.push_back(std::move(seg_cbs));
+                dim_offset += seg_dims;
+            }
+            LOG(INFO) << "Codebooks prepared for " << saq_data_->segment_codebooks.size() << " segments";
+        }
     }
 
     // 3. prepare clusters

@@ -51,6 +51,7 @@ class IVF {
     std::vector<SaqCluData> parallel_clusters_;
     std::unique_ptr<SaqData> saq_data_;
     std::unique_ptr<SaqDataMaker> saq_data_maker_;
+    FloatRowMat raw_codebooks_;  ///< D × cb_cols raw codebook centroids (optional)
 
     void allocate_clusters(const std::vector<size_t> &cluster_sizes);
 
@@ -107,6 +108,17 @@ class IVF {
 
     void set_variance(FloatVec vars) {
         saq_data_maker_->set_variance(std::move(vars));
+    }
+
+    /// @brief Set raw codebook centroids matrix (D × cb_cols).
+    ///        Layout: row d, bits b -> centroids at [b*256 : b*256 + 2^b].
+    ///        Must be called before construct().
+    void set_codebooks(FloatRowMat codebooks) {
+        raw_codebooks_ = std::move(codebooks);
+    }
+
+    bool has_codebooks() const {
+        return raw_codebooks_.rows() > 0;
     }
 
     void printQPlan(const SaqData *data) {

@@ -15,6 +15,7 @@
 
 #include "saq/defines.h"
 #include "saq/caq_encoder.h"
+#include "saq/codebook_encoder.h"
 #include "saq/cluster_data.h"
 #include "saq/cluster_packer.h"
 #include "saq/code_helper.h"
@@ -35,6 +36,7 @@ class QuantizerCluster {
     const size_t num_bits_;
     const size_t num_dim_pad_;
     const BaseQuantizerData *data_;
+    const std::vector<DimensionCodebook> *codebooks_ = nullptr;
 
   public:
     mutable QuantMetrics metrics_;
@@ -42,6 +44,8 @@ class QuantizerCluster {
     QuantizerCluster(const BaseQuantizerData *data)
         : num_bits_(data->num_bits), num_dim_pad_(data->num_dim_pad), data_(data) {
     }
+
+    void set_codebooks(const std::vector<DimensionCodebook> *cb) { codebooks_ = cb; }
 
     virtual ~QuantizerCluster() {}
 
@@ -62,15 +66,28 @@ class QuantizerCluster {
 
         const size_t num_points = clus.num_vec();
         CHECK(data_->cfg.quant_type == BaseQuantType::CAQ) << "Only CAQ is supported for DataQuantizer";
-        CAQEncoder encoder(num_dim_pad_, num_bits_, data_->cfg);
-        ClusterPacker packer(num_dim_pad_, num_bits_, clus, data_->cfg.use_fastscan);
 
+        // Use codebook encoder if codebooks are available, else uniform CAQ
+        ClusterPacker packer(num_dim_pad_, num_bits_, clus, data_->cfg.use_fastscan);
         QuantBaseCode base_code;
-        for (size_t i = 0; i < num_points; ++i) {
-            const auto &curr_vec = o_vecs.row(i);
-            encoder.encode_and_fac(curr_vec, base_code, &centroid);
-            packer.store_and_pack(i, base_code);
-            metrics_.norm_ip_o_oa.insert(base_code.norm_ip_o_oa);
+
+        if (codebooks_ && !codebooks_->empty()) {
+            CodebookEncoder cb_encoder(num_dim_pad_, num_bits_, data_->cfg);
+            cb_encoder.set_codebooks(codebooks_);
+            for (size_t i = 0; i < num_points; ++i) {
+                const auto &curr_vec = o_vecs.row(i);
+                cb_encoder.encode_and_fac(curr_vec, base_code, &centroid);
+                packer.store_and_pack(i, base_code);
+                metrics_.norm_ip_o_oa.insert(base_code.norm_ip_o_oa);
+            }
+        } else {
+            CAQEncoder encoder(num_dim_pad_, num_bits_, data_->cfg);
+            for (size_t i = 0; i < num_points; ++i) {
+                const auto &curr_vec = o_vecs.row(i);
+                encoder.encode_and_fac(curr_vec, base_code, &centroid);
+                packer.store_and_pack(i, base_code);
+                metrics_.norm_ip_o_oa.insert(base_code.norm_ip_o_oa);
+            }
         }
         packer.finalize_and_store();
     }

@@ -36,8 +36,13 @@ class SAQuantizer {
         : num_dim_(data->num_dim),
           num_dim_padded_(rd_up_to_multiple_of(num_dim_, kDimPaddingSize)),
           data_(data) {
-        for (auto &bi : data_->base_datas) {
-            data_quans_.emplace_back(std::make_unique<QuantizerCluster>(&bi));
+        for (size_t i = 0; i < data_->base_datas.size(); i++) {
+            auto q = std::make_unique<QuantizerCluster>(&data_->base_datas[i]);
+            // Pass segment codebooks if available
+            if (i < data_->segment_codebooks.size() && !data_->segment_codebooks[i].empty()) {
+                q->set_codebooks(&data_->segment_codebooks[i]);
+            }
+            data_quans_.emplace_back(std::move(q));
         }
     }
 
