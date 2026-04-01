@@ -83,8 +83,8 @@ static BenchResult RunBenchmark(
     QuantizeConfig cfg;
     cfg.avg_bits = bpd;
     cfg.single.quant_type = BaseQuantType::CAQ;
-    // Baseline: full SAQ features. Codebook: no rotation (codebooks in PCA space)
-    cfg.single.random_rotation = (codebooks == nullptr);
+    // Enable rotation for both — Gaussian codebooks handle rotated dimensions
+    cfg.single.random_rotation = true;
     cfg.single.use_fastscan = true;
     cfg.single.caq_adj_rd_lmt = (codebooks == nullptr) ? 6 : 0;
     // For codebook runs, set very loose variance bound to disable stage 1+2 pruning.
@@ -179,7 +179,7 @@ int main(int argc, char* argv[]) {
     FloatVec variances = var_mat.row(0);
 
     // Load codebooks
-    std::string cb_file = data_dir + "/optimal_codebooks.fvecs";
+    std::string cb_file = data_dir + "/optimal_codebooks_gaussian.fvecs";
     FloatRowMat codebooks;
     if (file_exists(cb_file.c_str())) {
         load_something<float, FloatRowMat>(cb_file.c_str(), codebooks);
