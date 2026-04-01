@@ -47,6 +47,10 @@ class CAQClusterData {
     PID *ids_ = nullptr;               // PID of vectors
     FloatVec centroid_;                // Rotated centroid of clusters
 
+    // Optional: raw un-packed code indices for codebook distance computation.
+    // Layout: raw_codes_[vec_idx * num_dim_padded_ + d] = code index for dim d.
+    std::vector<int32_t> raw_codes_;
+
   public:
     /**
      * @brief Construct a new CAQClusterData object.
@@ -131,6 +135,20 @@ class CAQClusterData {
     auto num_blocks() const { return num_blocks_; }
     auto iter() const { return num_vec_ / KFastScanSize; }
     auto remain() const { return num_vec_ % KFastScanSize; }
+
+    /// Allocate raw code storage for codebook distance computation.
+    void allocate_raw_codes() {
+        raw_codes_.resize(num_vec_ * num_dim_padded_, 0);
+    }
+    bool has_raw_codes() const { return !raw_codes_.empty(); }
+    /// Get raw codes for vec_idx: array of num_dim_padded_ int32_t values.
+    const int32_t *raw_codes(size_t vec_idx) const {
+        if (raw_codes_.empty()) return nullptr;
+        return &raw_codes_[vec_idx * num_dim_padded_];
+    }
+    int32_t *raw_codes_mut(size_t vec_idx) {
+        return &raw_codes_[vec_idx * num_dim_padded_];
+    }
 };
 
 class SaqCluData {

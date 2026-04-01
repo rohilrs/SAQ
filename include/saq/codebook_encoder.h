@@ -129,21 +129,21 @@ class CodebookEncoder {
             return;
         }
 
-        // Rescale to v_mx=1 for storage compatibility
-        caq.rescale_vmx_to1();
-
+        // For codebook path: store raw rescale (|o|^2 / <o, o_a>)
+        // without the v_mx scaling that rescale_vmx_to1() adds.
+        // The codebook distance computation uses this directly.
         base_code.o_l2norm = static_cast<float>(caq.o_l2norm);
-        base_code.fac_rescale = static_cast<float>(caq.fac_rescale);
+        base_code.fac_rescale = static_cast<float>(caq.fac_rescale);  // = |o|^2 / <o, o_a>
         base_code.fac_error = static_cast<float>(caq.fac_error);
+
+        // Still need rescale_vmx_to1 for the packed code pipeline (fascscan uses it)
+        caq.rescale_vmx_to1();
 
         if (num_bits_ >= 1) {
             if (num_bits_ > 1 && centroid) {
-                // Compute <centroid, o_a> using codebook values
                 double ip_cent = 0;
                 for (size_t j = 0; j < num_dim_pad_ && j < codebooks_->size(); j++) {
                     float oa_val = (*codebooks_)[j].centroid_value(caq.code[j]);
-                    // Scale by 1/v_mx since we rescaled to v_mx=1
-                    oa_val /= (caq.v_mx > 0 ? caq.v_mx : 1.0);
                     ip_cent += (*centroid)[j] * oa_val;
                 }
                 base_code.ip_cent_oa = static_cast<float>(ip_cent);

@@ -135,7 +135,8 @@ class SAQSearcher : public SaqCluEstimator<kDistType> {
                 }
                 const bool use_cb = this->has_codebooks();
                 for (size_t j = 0; j < KFastScanSize; ++j) {
-                    if (curr_dist[j] < distk) {
+                    // For codebook mode: skip fascscan pruning (evaluate all vectors)
+                    if (use_cb || curr_dist[j] < distk) {
                         auto idx = blk_begin + j;
                         if (idx >= num_points) {
                             break;

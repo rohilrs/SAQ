@@ -68,6 +68,9 @@ class QuantizerCluster {
         CHECK(data_->cfg.quant_type == BaseQuantType::CAQ) << "Only CAQ is supported for DataQuantizer";
 
         // Use codebook encoder if codebooks are available, else uniform CAQ
+        if (codebooks_ && !codebooks_->empty()) {
+            clus.allocate_raw_codes();  // For codebook distance lookup
+        }
         ClusterPacker packer(num_dim_pad_, num_bits_, clus, data_->cfg.use_fastscan);
         QuantBaseCode base_code;
 

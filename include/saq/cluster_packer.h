@@ -79,6 +79,14 @@ class ClusterPacker {
             long_code_[j] = base_code.code[j] & (short_bit_ - 1);
         }
         compacted_code_func_(clus_.long_code(i), &long_code_(0, 0), num_dim_pad_);
+
+        // Store raw codes if allocated (for codebook distance computation)
+        if (clus_.has_raw_codes()) {
+            int32_t *raw = clus_.raw_codes_mut(i);
+            for (size_t j = 0; j < num_dim_pad_; ++j) {
+                raw[j] = base_code.code[j];
+            }
+        }
     }
 
     /**

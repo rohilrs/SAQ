@@ -86,7 +86,10 @@ static BenchResult RunBenchmark(
     // Disable rotation for both runs — codebooks are in PCA space
     cfg.single.random_rotation = false;
     cfg.single.use_fastscan = true;
-    cfg.single.caq_adj_rd_lmt = (codebooks == nullptr) ? 6 : 0;  // No CAQ adjustment for codebook
+    cfg.single.caq_adj_rd_lmt = (codebooks == nullptr) ? 6 : 0;
+    // For codebook runs, set very loose variance bound to disable stage 1+2 pruning.
+    // This lets all vectors reach stage 3 (codebook distance) without false pruning.
+    // Slower but gives true codebook recall measurement.
     cfg.enable_segmentation = true;
 
     size_t nv = static_cast<size_t>(data.rows());
@@ -114,6 +117,10 @@ static BenchResult RunBenchmark(
 
     SearcherConfig scfg;
     scfg.dist_type = DistType::L2Sqr;
+    if (codebooks) {
+        // Disable variance pruning for codebook runs so all vectors reach stage 3
+        scfg.searcher_vars_bound_m = 1e10f;
+    }
 
     std::vector<std::vector<PID>> results(nq, std::vector<PID>(TOPK));
     StopW search_timer;
