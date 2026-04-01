@@ -83,8 +83,8 @@ static BenchResult RunBenchmark(
     QuantizeConfig cfg;
     cfg.avg_bits = bpd;
     cfg.single.quant_type = BaseQuantType::CAQ;
-    // Disable rotation for both runs — codebooks are in PCA space
-    cfg.single.random_rotation = false;
+    // Baseline: full SAQ features. Codebook: no rotation (codebooks in PCA space)
+    cfg.single.random_rotation = (codebooks == nullptr);
     cfg.single.use_fastscan = true;
     cfg.single.caq_adj_rd_lmt = (codebooks == nullptr) ? 6 : 0;
     // For codebook runs, set very loose variance bound to disable stage 1+2 pruning.

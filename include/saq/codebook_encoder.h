@@ -91,6 +91,49 @@ class CodebookEncoder {
             oa_l2sqr += oa_val * oa_val;
         }
 
+        // Codebook-aware adjustment: greedily try ±1 to improve cosine similarity
+        if (cfg_.caq_adj_rd_lmt > 0 && oa_l2sqr > 0) {
+            const double adj_eps = cfg_.caq_adj_eps * oa_l2sqr;
+            for (int round = 0; round < cfg_.caq_adj_rd_lmt; round++) {
+                int adj_count = 0;
+                for (size_t j = 0; j < num_dim_pad_ && j < codebooks_->size(); j++) {
+                    const auto &cb = (*codebooks_)[j];
+                    if (cb.num_entries <= 1) continue;
+                    float val = o[j];
+                    int c = code[j];
+                    float oa = cb.centroid_value(c);
+                    double oa_l2sqr_tmp = oa_l2sqr - oa * oa;
+
+                    // Try increment
+                    if (c + 1 < static_cast<int>(cb.num_entries)) {
+                        float new_oa = cb.centroid_value(c + 1);
+                        double new_l2 = oa_l2sqr_tmp + new_oa * new_oa;
+                        double new_ip = ip_o_oa + val * (new_oa - oa);
+                        if ((ip_o_oa * ip_o_oa + adj_eps) * new_l2 < new_ip * new_ip * oa_l2sqr) {
+                            code[j] = c + 1;
+                            ip_o_oa = new_ip;
+                            oa_l2sqr = new_l2;
+                            adj_count++;
+                            continue;
+                        }
+                    }
+                    // Try decrement
+                    if (c > 0) {
+                        float new_oa = cb.centroid_value(c - 1);
+                        double new_l2 = oa_l2sqr_tmp + new_oa * new_oa;
+                        double new_ip = ip_o_oa + val * (new_oa - oa);
+                        if ((ip_o_oa * ip_o_oa + adj_eps) * new_l2 < new_ip * new_ip * oa_l2sqr) {
+                            code[j] = c - 1;
+                            ip_o_oa = new_ip;
+                            oa_l2sqr = new_l2;
+                            adj_count++;
+                        }
+                    }
+                }
+                if (adj_count == 0) break;
+            }
+        }
+
         caq.ip_o_oa = ip_o_oa;
         caq.oa_l2sqr = oa_l2sqr;
         caq.o_l2sqr = o.squaredNorm();
