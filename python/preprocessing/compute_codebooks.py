@@ -136,6 +136,12 @@ def compute_codebook_dp(values: np.ndarray, max_bits: int = 6,
     return costs, codebooks
 
 
+def read_ivecs(path: str) -> np.ndarray:
+    a = np.fromfile(path, dtype="int32")
+    d = a[0]
+    return a.reshape(-1, d + 1)[:, 1:].astype(np.int32)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Precompute optimal codebooks for SAQ"
@@ -144,37 +150,51 @@ def main():
     parser.add_argument("--max-bits", type=int, default=6)
     parser.add_argument("--dp-samples", type=int, default=5000)
     parser.add_argument("--num-bins", type=int, default=500)
+    parser.add_argument("-K", type=int, default=4096,
+                        help="Number of clusters (must match preprocessing)")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
     max_bits = args.max_bits
     t0 = time.time()
 
+    # Load data
     print("Loading vectors_pca.fvecs...")
     vectors = read_fvecs(str(data_dir / "vectors_pca.fvecs"))
     N, D = vectors.shape
     print(f"  {N} vectors, {D} dimensions")
 
+    k_str = str(args.K)
+    print(f"Loading centroids_{k_str}_pca.fvecs...")
+    centroids = read_fvecs(str(data_dir / f"centroids_{k_str}_pca.fvecs"))
+    print(f"  {centroids.shape[0]} centroids")
+
+    print(f"Loading cluster_ids_{k_str}.ivecs...")
+    cluster_ids = read_ivecs(str(data_dir / f"cluster_ids_{k_str}.ivecs"))
+    cluster_ids = cluster_ids.flatten()
+    print(f"  {cluster_ids.shape[0]} assignments")
+
+    # Compute residuals: vectors[i] - centroids[cluster_ids[i]]
+    print("Computing residuals...")
+    residuals = vectors - centroids[cluster_ids]
+    print(f"  Residual range: [{residuals.min():.6f}, {residuals.max():.6f}]")
+    print(f"  Residual std (dim 0): {residuals[:, 0].std():.6f}")
+    print(f"  Global std (dim 0):   {vectors[:, 0].std():.6f}")
+
     dp_samples = min(args.dp_samples, N)
     rng = np.random.default_rng(42)
 
-    # Normalize each dimension to zero mean for codebook computation
-    # (SAQ centers on cluster centroid, so residuals are ~zero mean)
-    dim_means = vectors.mean(axis=0)
-    dim_stds = vectors.std(axis=0)
-
     costs_mat = np.zeros((D, max_bits + 1), dtype=np.float32)
-    # Codebook layout: D rows, each row has (max_bits+1) * 256 entries
-    # For bits b, codebook entries are at [b*256 : b*256 + 2^b]
     cb_cols = (max_bits + 1) * 256
     codebook_mat = np.zeros((D, cb_cols), dtype=np.float32)
 
-    print(f"Computing codebooks for {D} dimensions "
+    print(f"\nComputing codebooks on RESIDUALS for {D} dimensions "
           f"(max_bits={max_bits}, dp_samples={dp_samples})...")
 
     for d in range(D):
-        col = vectors[:, d].astype(np.float64)
-        if dim_stds[d] < 1e-12:
+        col = residuals[:, d].astype(np.float64)
+        col_std = np.std(col)
+        if col_std < 1e-12:
             continue
 
         if len(col) > dp_samples:
@@ -210,12 +230,13 @@ def main():
 
     print(f"Total time: {time.time() - t0:.1f}s")
 
-    # Sanity: print first dim's codebook at 2 bits
+    # Sanity check
     d = 0
     b = 2
     cb = codebook_mat[d, b*256 : b*256 + (1 << b)]
     print(f"\nDim 0, 2 bits: centroids = {cb}")
-    print(f"  (uniform would be evenly spaced in [{vectors[:,0].min():.4f}, {vectors[:,0].max():.4f}])")
+    print(f"  Residual range dim 0: [{residuals[:,0].min():.6f}, {residuals[:,0].max():.6f}]")
+    print(f"  Residual std dim 0:   {residuals[:,0].std():.6f}")
 
 
 if __name__ == "__main__":

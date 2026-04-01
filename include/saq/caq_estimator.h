@@ -200,11 +200,21 @@ class CaqCluEstimator {
         }
 
         const int32_t *raw = curr_cluster_->raw_codes(vec_idx);
-        const ExFactor &ex_fac = curr_cluster_->long_factor(vec_idx);
 
-        // Compute <codebook_residual, query> via direct codebook lookup.
+        // For L2 distance, the LUT uses (query - centroid), not raw query.
+        // We must compute <cb_residual, query - centroid> to match.
+        const FloatVec &centroid = curr_cluster_->centroid();
+        const float *q;
+        FloatVec q_minus_cent;
+        if (isIpDist()) {
+            q = query_data_.data();
+        } else {
+            q_minus_cent = query_data_ - centroid;
+            q = q_minus_cent.data();
+        }
+
+        // Compute <codebook_residual, q_effective> via direct codebook lookup.
         double ip_oa_q = 0.0;
-        const float *q = query_data_.data();
         const auto &cbs = *codebooks_;
         for (size_t d = 0; d < num_dim_padded_; d++) {
             int32_t code_val = raw[d];
@@ -214,16 +224,16 @@ class CaqCluEstimator {
             }
         }
 
-        // Apply rescale: ip_o_q = rescale * <o_a, q> + <centroid, q>
-        // For codebook encoder, rescale = |o|^2 / <o, o_a> (raw, no v_mx scaling)
-        float ip_o_q = ex_fac.rescale * static_cast<float>(ip_oa_q) + ip_q_c_;
+        float ip_oa_q_f = static_cast<float>(ip_oa_q);
 
         runtime_statics_.acc_bitsum += num_dim_padded_ * num_bits_;
 
         if (isIpDist()) {
-            return ip_o_q;
+            // For IP: <o, q> ≈ <cb_res, q> + <cent, q>
+            return ip_oa_q_f + ip_q_c_;
         } else {
-            return o_l2sqr + q_l2sqr_ - 2 * ip_o_q;
+            // For L2: dist = |res|^2 + |q-cent|^2 - 2*<cb_res, q-cent>
+            return o_l2sqr + q_l2sqr_ - 2 * ip_oa_q_f;
         }
     }
 };
