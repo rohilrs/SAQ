@@ -52,6 +52,8 @@ class IVF {
     std::unique_ptr<SaqData> saq_data_;
     std::unique_ptr<SaqDataMaker> saq_data_maker_;
     FloatRowMat raw_codebooks_;  ///< D × cb_cols raw codebook centroids (optional)
+    FloatRowMat gaussian_codebook_;  ///< (max_bits+1) × max_entries base Gaussian codebook
+    FloatVec residual_stds_;         ///< per-dimension residual std for Gaussian scaling
 
     void allocate_clusters(const std::vector<size_t> &cluster_sizes);
 
@@ -118,7 +120,14 @@ class IVF {
     }
 
     bool has_codebooks() const {
-        return raw_codebooks_.rows() > 0;
+        return raw_codebooks_.rows() > 0 || gaussian_codebook_.rows() > 0;
+    }
+
+    /// @brief Set Gaussian base codebook + per-dimension residual stds.
+    ///        Codebooks constructed at runtime as base_codebook[bits] * std[d].
+    void set_gaussian_codebooks(FloatRowMat base_codebook, FloatVec stds) {
+        gaussian_codebook_ = std::move(base_codebook);
+        residual_stds_ = std::move(stds);
     }
 
     void printQPlan(const SaqData *data) {

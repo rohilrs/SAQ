@@ -78,7 +78,7 @@ static BenchResult RunBenchmark(
     const FloatRowMat& data, const FloatRowMat& queries, const FloatRowMat& centroids,
     const UintRowMat& cluster_ids, const UintRowMat& gt,
     const FloatVec& variances, float bpd, size_t K, size_t nprobe, int threads,
-    const char* label, const FloatRowMat* codebooks)
+    const char* label, const FloatRowMat* gauss_cb, const FloatVec* res_stds)
 {
     QuantizeConfig cfg;
     cfg.avg_bits = bpd;
@@ -86,7 +86,7 @@ static BenchResult RunBenchmark(
     // Enable rotation for both — Gaussian codebooks handle rotated dimensions
     cfg.single.random_rotation = true;
     cfg.single.use_fastscan = true;
-    cfg.single.caq_adj_rd_lmt = (codebooks == nullptr) ? 6 : 0;
+    cfg.single.caq_adj_rd_lmt = (gauss_cb == nullptr) ? 6 : 0;
     // For codebook runs, set very loose variance bound to disable stage 1+2 pruning.
     // This lets all vectors reach stage 3 (codebook distance) without false pruning.
     // Slower but gives true codebook recall measurement.
@@ -99,7 +99,9 @@ static BenchResult RunBenchmark(
 
     IVF ivf(nv, nd, K, cfg);
     ivf.set_variance(FloatVec(variances));
-    if (codebooks) ivf.set_codebooks(FloatRowMat(*codebooks));
+    if (gauss_cb && res_stds) {
+        ivf.set_gaussian_codebooks(FloatRowMat(*gauss_cb), FloatVec(*res_stds));
+    }
 
     StopW build_timer;
     ivf.construct(data, centroids, cluster_ids.data(), threads);
@@ -117,7 +119,7 @@ static BenchResult RunBenchmark(
 
     SearcherConfig scfg;
     scfg.dist_type = DistType::L2Sqr;
-    if (codebooks) {
+    if (gauss_cb) {
         // Disable variance pruning for codebook runs so all vectors reach stage 3
         scfg.searcher_vars_bound_m = 1e10f;
     }
@@ -178,16 +180,25 @@ int main(int argc, char* argv[]) {
     load_something<float, FloatRowMat>((data_dir + "/variances_pca.fvecs").c_str(), var_mat);
     FloatVec variances = var_mat.row(0);
 
-    // Load codebooks
-    std::string cb_file = data_dir + "/optimal_codebooks_gaussian.fvecs";
-    FloatRowMat codebooks;
-    if (file_exists(cb_file.c_str())) {
-        load_something<float, FloatRowMat>(cb_file.c_str(), codebooks);
-        std::cout << "Codebooks: " << codebooks.rows() << " x " << codebooks.cols() << "\n\n";
-    } else {
-        std::cerr << "ERROR: " << cb_file << " not found.\n"
-                  << "Run: python -m preprocessing.compute_codebooks --data-dir " << data_dir << "\n";
-        return 1;
+    // Load Gaussian base codebook + residual stds
+    FloatRowMat gauss_cb;
+    FloatRowMat stds_mat;
+    FloatVec res_stds;
+    {
+        std::string gcb_file = data_dir + "/gaussian_codebook.fvecs";
+        std::string std_file = data_dir + "/residual_stds.fvecs";
+        if (file_exists(gcb_file.c_str()) && file_exists(std_file.c_str())) {
+            load_something<float, FloatRowMat>(gcb_file.c_str(), gauss_cb);
+            load_something<float, FloatRowMat>(std_file.c_str(), stds_mat);
+            res_stds = stds_mat.row(0);
+            std::cout << "Gaussian codebook: " << gauss_cb.rows() << " x " << gauss_cb.cols()
+                      << " (max " << (gauss_cb.rows()-1) << " bits)\n";
+            std::cout << "Residual stds: " << res_stds.cols() << " dims\n\n";
+        } else {
+            std::cerr << "ERROR: gaussian_codebook.fvecs or residual_stds.fvecs not found in "
+                      << data_dir << "\n";
+            return 1;
+        }
     }
 
     std::cout << "Data: " << data.rows() << "x" << data.cols()
@@ -202,7 +213,8 @@ int main(int argc, char* argv[]) {
 
         std::cout << "  [A] Baseline (uniform)...\n";
         auto ra = RunBenchmark(data, queries, centroids, cluster_ids, gt,
-                                variances, bpd_f, K, nprobe, threads, "uniform", nullptr);
+                                variances, bpd_f, K, nprobe, threads, "uniform",
+                                nullptr, nullptr);
         results_a.push_back(ra);
         std::cout << "    Build: " << std::fixed << std::setprecision(2) << ra.build_time_s << "s"
                   << "  Search: " << std::setprecision(1) << ra.search_time_ms << "ms"
@@ -210,7 +222,8 @@ int main(int argc, char* argv[]) {
 
         std::cout << "  [B] Codebook...\n";
         auto rb = RunBenchmark(data, queries, centroids, cluster_ids, gt,
-                                variances, bpd_f, K, nprobe, threads, "codebook", &codebooks);
+                                variances, bpd_f, K, nprobe, threads, "codebook",
+                                &gauss_cb, &res_stds);
         results_b.push_back(rb);
         std::cout << "    Build: " << std::fixed << std::setprecision(2) << rb.build_time_s << "s"
                   << "  Search: " << std::setprecision(1) << rb.search_time_ms << "ms"

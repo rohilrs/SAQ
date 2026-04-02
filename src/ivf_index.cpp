@@ -35,26 +35,48 @@ void IVF::construct(const FloatRowMat &data, const FloatRowMat &centroids, const
         saq_data_ = saq_data_maker_->return_data();
         printQPlan(saq_data_.get());
 
-        // Convert raw codebooks to per-segment DimensionCodebook vectors
+        // Convert codebooks to per-segment DimensionCodebook vectors
         if (has_codebooks()) {
             saq_data_->segment_codebooks.clear();
             size_t dim_offset = 0;
+
+            const bool use_gaussian = gaussian_codebook_.rows() > 0;
+            const size_t gauss_max_bits = use_gaussian
+                ? static_cast<size_t>(gaussian_codebook_.rows()) - 1 : 0;
+            const size_t gauss_max_entries = use_gaussian
+                ? static_cast<size_t>(gaussian_codebook_.cols()) : 0;
+
             for (const auto &[seg_dims, seg_bits] : saq_data_->quant_plan) {
                 std::vector<DimensionCodebook> seg_cbs;
                 if (seg_bits > 0) {
                     size_t k = 1u << seg_bits;
-                    size_t max_b = static_cast<size_t>(raw_codebooks_.cols()) / 256;
-                    size_t b_idx = std::min(seg_bits, max_b > 0 ? max_b - 1 : 0);
+
                     for (size_t d = 0; d < seg_dims; d++) {
                         DimensionCodebook cb;
                         size_t global_dim = dim_offset + d;
-                        if (global_dim < static_cast<size_t>(raw_codebooks_.rows())) {
+
+                        if (use_gaussian && global_dim < static_cast<size_t>(residual_stds_.cols())) {
+                            // Gaussian path: base_codebook[bits] * std[dim]
+                            size_t b_use = std::min(seg_bits, gauss_max_bits);
+                            size_t k_use = std::min(k, gauss_max_entries);
+                            k_use = std::min(k_use, static_cast<size_t>(1u << b_use));
+                            float sigma = residual_stds_[global_dim];
+                            cb.num_entries = k_use;
+                            cb.centroids.resize(k_use);
+                            for (size_t c = 0; c < k_use; c++) {
+                                cb.centroids[c] = gaussian_codebook_(b_use, c) * sigma;
+                            }
+                            std::sort(cb.centroids.begin(), cb.centroids.end());
+                        } else if (raw_codebooks_.rows() > 0 &&
+                                   global_dim < static_cast<size_t>(raw_codebooks_.rows())) {
+                            // Raw codebook path (legacy)
+                            size_t max_b = static_cast<size_t>(raw_codebooks_.cols()) / 256;
+                            size_t b_idx = std::min(seg_bits, max_b > 0 ? max_b - 1 : 0);
                             cb.num_entries = std::min(k, static_cast<size_t>(256));
                             cb.centroids.resize(cb.num_entries);
                             for (size_t c = 0; c < cb.num_entries; c++) {
                                 cb.centroids[c] = raw_codebooks_(global_dim, b_idx * 256 + c);
                             }
-                            // Sort centroids for binary search in nearest()
                             std::sort(cb.centroids.begin(), cb.centroids.end());
                         }
                         seg_cbs.push_back(std::move(cb));
@@ -63,7 +85,8 @@ void IVF::construct(const FloatRowMat &data, const FloatRowMat &centroids, const
                 saq_data_->segment_codebooks.push_back(std::move(seg_cbs));
                 dim_offset += seg_dims;
             }
-            LOG(INFO) << "Codebooks prepared for " << saq_data_->segment_codebooks.size() << " segments";
+            LOG(INFO) << "Codebooks prepared for " << saq_data_->segment_codebooks.size()
+                      << " segments (gaussian=" << use_gaussian << ")";
         }
     }
 
