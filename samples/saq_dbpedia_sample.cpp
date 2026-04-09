@@ -237,6 +237,12 @@ int main(int argc, char* argv[]) {
         std::cout << "  IP error: avg=" << std::fixed << std::setprecision(6)
                   << ip_metrics.avg() << "  max=" << ip_metrics.max() << "\n";
     }
+    auto& mse_metrics = ivf.quant_metrics_.recon_mse_per_dim;
+    if (mse_metrics.cnt_ > 0) {
+        std::cout << "  Recon MSE/dim: avg=" << std::scientific << std::setprecision(5)
+                  << mse_metrics.avg() << "  max=" << mse_metrics.max()
+                  << "  (n=" << mse_metrics.cnt_ << " segment-vectors)\n";
+    }
     std::cout << "\n";
 
     // -----------------------------------------------------------------------
@@ -358,6 +364,12 @@ int main(int argc, char* argv[]) {
                 << ip_metrics.avg() << "\n";
             out << "  IP error max:  " << std::fixed << std::setprecision(6)
                 << ip_metrics.max() << "\n";
+        }
+        if (mse_metrics.cnt_ > 0) {
+            out << "  Recon MSE/dim avg: " << std::scientific << std::setprecision(5)
+                << mse_metrics.avg() << "\n";
+            out << "  Recon MSE/dim max: " << std::scientific << std::setprecision(5)
+                << mse_metrics.max() << "\n";
         }
         out << "\n";
 

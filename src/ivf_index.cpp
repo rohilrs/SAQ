@@ -57,6 +57,8 @@ void IVF::construct(const FloatRowMat &data, const FloatRowMat &centroids, const
         }
         SAQuantizer saq_quantizer_(saq_data_.get());
         LOG(INFO) << "Starting quantization of " << num_cen_ << " clusters...";
+        // Per-cluster metrics to avoid race conditions in OMP parallel loop
+        std::vector<QuantMetrics> per_cluster_metrics(num_cen_);
         StopW stopw;
 #ifdef SAQ_USE_OPENMP
         #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
@@ -70,10 +72,15 @@ void IVF::construct(const FloatRowMat &data, const FloatRowMat &centroids, const
             }
             const FloatVec &cur_centroid = use_1_centroid ? tot_avg_centroid : FloatVec(centroids.row(i));
             auto &clu = parallel_clusters_[i];
-            saq_quantizer_.quantize_cluster(data, cur_centroid, id_lists[i], clu);
+            saq_quantizer_.quantize_cluster(data, cur_centroid, id_lists[i], clu, &per_cluster_metrics[i]);
         }
         auto tm_ms = stopw.getElapsedTimeMicro() / 1000.0;
         LOG(INFO) << "Quantization done. tm: " << tm_ms / 1e3 << " S";
+
+        // Aggregate metrics across clusters
+        for (size_t i = 0; i < num_cen_; ++i) {
+            quant_metrics_.recon_mse_per_dim.merge(per_cluster_metrics[i].recon_mse_per_dim);
+        }
     }
 }
 

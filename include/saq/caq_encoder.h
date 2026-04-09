@@ -52,6 +52,7 @@ class QuantBaseCode {
     float fac_rescale;      // rescale factor for estimation
     float fac_error = 0;    // error factor for estimation
     float norm_ip_o_oa = 0; // <o, o_a> / |o| / |o_a|. Only used for quant metrics
+    float recon_mse = 0;    // ||o - o_a||^2 / dim. Reconstruction MSE per dimension
 };
 
 class CAQEncoder {
@@ -227,6 +228,21 @@ class CAQEncoder {
         caq.fac_error = caq.o_l2sqr * kConstEpsilon *
                         std::sqrt((((caq.o_l2sqr * caq.oa_l2sqr) / (caq.ip_o_oa * caq.ip_o_oa)) - 1) /
                                   (num_dim_pad_ - 1));
+
+        // Compute reconstruction MSE before rescaling destroys the codebook values
+        // For 0-bit segments, reconstruction is zero so MSE = ||residual||^2 / dim
+        if (num_bits_ > 0) {
+            Eigen::VectorXf oa = caq.get_oa();
+            // Use scalar loop to avoid Eigen expression type mismatch
+            float diff_sqnorm = 0.0f;
+            for (Eigen::Index j = 0; j < static_cast<Eigen::Index>(num_dim_pad_); ++j) {
+                float d = curr_vec[j] - oa[j];
+                diff_sqnorm += d * d;
+            }
+            base_code.recon_mse = diff_sqnorm / static_cast<float>(num_dim_pad_);
+        } else {
+            base_code.recon_mse = curr_vec.squaredNorm() / static_cast<float>(num_dim_pad_);
+        }
 
         caq.rescale_vmx_to1();
 

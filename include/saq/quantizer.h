@@ -28,6 +28,7 @@ namespace saq {
 
 struct QuantMetrics {
     AvgMaxRecorder norm_ip_o_oa;
+    AvgMaxRecorder recon_mse_per_dim;  // ||o - o_a||^2 / dim, per vector
 };
 
 class QuantizerCluster {
@@ -45,7 +46,8 @@ class QuantizerCluster {
 
     virtual ~QuantizerCluster() {}
 
-    virtual void quantize(const FloatRowMat &or_vecs, const FloatVec &centroid, CAQClusterData &clus) const {
+    virtual void quantize(const FloatRowMat &or_vecs, const FloatVec &centroid, CAQClusterData &clus,
+                          QuantMetrics *out_metrics = nullptr) const {
         CHECK_EQ(or_vecs.cols(), static_cast<Eigen::Index>(num_dim_pad_))
             << "Input vector dimension does not match quantizer dimension";
         CHECK_EQ(centroid.cols(), static_cast<Eigen::Index>(num_dim_pad_))
@@ -71,6 +73,9 @@ class QuantizerCluster {
             encoder.encode_and_fac(curr_vec, base_code, &centroid);
             packer.store_and_pack(i, base_code);
             metrics_.norm_ip_o_oa.insert(base_code.norm_ip_o_oa);
+            if (out_metrics) {
+                out_metrics->recon_mse_per_dim.insert(base_code.recon_mse);
+            }
         }
         packer.finalize_and_store();
     }

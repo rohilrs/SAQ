@@ -42,7 +42,7 @@ class SAQuantizer {
     }
 
     void quantize_cluster(const FloatRowMat &data, const FloatVec &centroid, const std::vector<PID> &IDs,
-                          SaqCluData &saq_clus) {
+                          SaqCluData &saq_clus, QuantMetrics *out_metrics = nullptr) {
         CHECK_EQ(saq_clus.num_segments_, data_quans_.size());
         std::copy(IDs.begin(), IDs.end(), saq_clus.ids());
 
@@ -64,7 +64,7 @@ class SAQuantizer {
             cen.head(static_cast<Eigen::Index>(copy_size)) =
                 centroid.segment(static_cast<Eigen::Index>(offset), static_cast<Eigen::Index>(copy_size));
 
-            data_quans_[ci]->quantize(vecs, cen, clus);
+            data_quans_[ci]->quantize(vecs, cen, clus, out_metrics);
             offset += clus.num_dim_padded_;
         }
     }
