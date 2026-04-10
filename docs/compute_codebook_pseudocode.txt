@@ -1,0 +1,91 @@
+ComputeCodebook — Pseudocode
+=============================
+
+Input:  A — all values for one dimension (1D array, length N)
+Output: costs[0..max_bits] — MSE at each bit rate
+        codebooks[0..max_bits] — optimal centroid arrays
+
+For each bit rate b, finds the optimal 2^b contiguous clusters
+on sorted data via dynamic programming.
+
+
+def ComputeCodebook(A, max_bits=8):
+
+    A = sort(A)
+    N = len(A)
+
+    # --- Histogram approximation for speed ---
+    # Instead of DP on all N points, bin into B weighted histogram bins.
+    # This reduces O(N^2 * 2^b) to O(B^2 * 2^b) per dimension.
+    B = min(500, N)
+    bin_edges = linspace(A[0], A[-1], B+1)
+
+    # Per-bin sufficient statistics
+    for each bin i:
+        count[i] = number of values in bin i
+        sum[i]   = sum of values in bin i
+        sumsq[i] = sum of squared values in bin i
+
+    Remove empty bins (count = 0)
+    B = number of remaining non-empty bins
+
+    # Prefix sums for O(1) range-SSE queries
+    prefix_count[0..B] = cumulative_sum(count)
+    prefix_sum[0..B]   = cumulative_sum(sum)
+    prefix_sumsq[0..B] = cumulative_sum(sumsq)
+
+    # SSE of bins[a..b] when represented by their weighted mean:
+    def SSE(a, b):
+        c  = prefix_count[b+1] - prefix_count[a]
+        s  = prefix_sum[b+1]   - prefix_sum[a]
+        sq = prefix_sumsq[b+1] - prefix_sumsq[a]
+        return sq - s*s/c
+
+    # --- 0 bits: one cluster = global mean ---
+    costs[0] = SSE(0, B-1) / N
+    codebooks[0] = [weighted_mean(all bins)]
+
+    # --- b bits: optimal 2^b contiguous clusters via DP ---
+    for bits in 1..max_bits:
+        k = 2^bits
+
+        if k >= B:  # more clusters than bins
+            costs[bits] = (total_sumsq - sum of per-bin variances) / N
+            codebooks[bits] = [mean of each bin]
+            continue
+
+        # DP: dp[j][i] = minimum SSE for bins[0..i] using j clusters
+        #
+        # Base case (j=1):
+        dp[1][i] = SSE(0, i)  for all i in 0..B-1
+
+        # Transition:
+        for j = 2 to k:
+            for i = j-1 to B-1:
+                dp[j][i] = min over m in [j-1, i] of:
+                    dp[j-1][m-1] + SSE(m, i)
+                # (dp[j-1][-1] is defined as 0)
+
+        costs[bits] = dp[k][B-1] / N
+
+        # Backtrack to recover codebook:
+        # Each cluster's centroid = weighted mean of its assigned bins.
+        codebooks[bits] = backtrack(dp, split_points)
+
+    return costs, codebooks
+
+
+Complexity:
+    O(B^2 * 2^bits) per dimension
+    With B=500, bits<=6: ~16M ops per dim (seconds)
+    With B=500, bits=8:  ~64M ops per dim (seconds)
+
+Key insight: In 1D, k-means always produces contiguous clusters.
+So DP on sorted data gives the EXACT optimal solution, not an
+approximation. The histogram binning is the only approximation,
+and it's negligible when B >> 2^bits.
+
+For Gaussian-distributed dimensions (after PCA), the optimal
+codebook places entries densely near the mean and sparsely in
+tails — matching the distribution shape rather than uniformly
+spanning [-v_max, v_max].
