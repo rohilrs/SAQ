@@ -19,6 +19,8 @@ from ._saq_core import (
     load_ivecs,
 )
 
+from .benchmark import compute_ground_truth, recall_at_k
+
 __all__ = [
     "BaseQuantType",
     "DistType",
@@ -26,6 +28,8 @@ __all__ = [
     "QuantizeConfig",
     "QuantSingleConfig",
     "SearcherConfig",
+    "compute_ground_truth",
     "load_fvecs",
     "load_ivecs",
+    "recall_at_k",
 ]
