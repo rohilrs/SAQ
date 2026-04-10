@@ -6,9 +6,9 @@ This project has two coupled goals:
 
 1. **Package the SAQ C++ library as importable Python modules across four variants** — base CPU, GPU, Gaussian-codebook, and GPU+codebook (stub). Each variant lives on its own branch and builds a pybind11 module that exposes an identical Python API surface, so consuming code is variant-agnostic and the variant is selected by which wheel is installed.
 
-2. **Extend the `vector-quantization/` test bench to properly benchmark search-oriented VQ methods.** The current `BaseQuantizer` interface (`fit/compress/decompress` → reconstruction MSE) is the wrong abstraction for SAQ, RaBitQ, and other index-integrated methods. A new `BaseSearchIndex` ABC measures methods on their actual downstream task: ANN search quality (recall@k, QPS).
+2. **Unify the `vector-quantization/` test bench around a search-oriented benchmark interface.** The current `BaseQuantizer` track measures reconstruction MSE only — this is the wrong primary metric for fair comparison across VQ method families. Introduce `BaseSearchIndex` as the **primary** interface for all VQ methods. Every method (SAQ, PQ, OPQ, SQ, RaBitQ, Faiss baselines) gets wrapped to implement it. All methods are measured on the same axes: recall@k, QPS, memory footprint. Reconstruction MSE is retained as a secondary metric on the same benchmark output, not a separate track.
 
-Both changes serve the same goal: a **fair, methodologically sound benchmark** of SAQ against competing VQ methods. Measuring SAQ by reconstruction MSE is unfair because CAQ optimizes cosine similarity, not MSE; the correct metric is recall at a given compression ratio.
+Both changes serve the same goal: a **fair, methodologically sound benchmark** of SAQ against competing VQ methods. Measuring SAQ by reconstruction MSE alone is unfair because CAQ optimizes cosine similarity, not MSE; measuring PQ only on MSE is similarly incomplete because it misses the search quality that matters for downstream tasks. The unified `BaseSearchIndex` approach — with MSE reported as a secondary column — gives a complete comparison across method families.
 
 ## Motivation
 
@@ -18,23 +18,24 @@ The current state has three problems:
 
 2. **The test bench's `SAQ` class is a pure-Python reimplementation** of scalar quantization with segmented bit allocation. It shares the name with the C++ library but not the algorithm — no IVF, no CAQ adjustment, no SIMD search, no fastscan. Comparing it against PQ/OPQ gives misleading results about "SAQ performance."
 
-3. **The `BaseQuantizer` interface is category-mismatched with SAQ.** SAQ's value proposition is end-to-end search recall, not reconstruction accuracy. CAQ's per-vector adjustment actively worsens reconstruction MSE to preserve cosine similarity. Benchmarking on MSE gives PQ/OPQ an unfair advantage — they're being measured on their own objective while SAQ is measured on someone else's.
+3. **The `BaseQuantizer` interface is category-mismatched with search-oriented methods.** SAQ's value proposition is end-to-end search recall, not reconstruction accuracy. CAQ's per-vector adjustment actively worsens reconstruction MSE to preserve cosine similarity. Measuring SAQ alongside PQ on MSE alone gives PQ an unfair advantage — they're being measured on their own objective while SAQ is measured on someone else's. Unifying around search metrics (recall@k) puts all methods on equal footing.
 
 ## Goals
 
 - Four SAQ wheels installable via `pip install` (or `cmake --build` for development), each exposing the same `saq` Python API
 - Self-contained `IVF.fit(X)` API that handles preprocessing internally
-- `IVF.decompress(ids)` for optional reconstruction validation
-- New `BaseSearchIndex` ABC in the test bench with standard methods
-- `SaqIndex` wrapper that adapts to whichever `saq` wheel is installed via capability detection
-- New search benchmark track measuring recall@k, QPS, memory footprint, and Pareto curves
+- `IVF.decompress(ids)` for reconstruction + benchmark MSE reporting
+- New `BaseSearchIndex` ABC in the test bench as the **primary benchmark interface** for all VQ methods
+- Wrapper classes (`SaqIndex`, `FlatQuantizedIndex`, `IvfQuantizedIndex`, `FaissIvfPqIndex`) that adapt existing and new methods to `BaseSearchIndex`
+- Unified benchmark harness reporting recall@k, QPS, memory, and reconstruction MSE on a single output per method
+- Pareto curve visualization (recall vs memory, recall vs QPS)
 - PR submitted to `vector-quantization` collaborators
 
 ## Non-Goals
 
 - **GPU+codebook kernel integration.** The `gpu-codebook` branch is a **stub only**. The GPU encode kernel currently does uniform scalar quantization; rewriting it for codebook lookup is a major feature deferred until after this packaging work. The stub exposes the same API surface but raises `NotImplementedError` at runtime.
 - **Full Faiss IndexBase API compatibility.** The `BaseSearchIndex` interface targets the **standard level** (fit, search, search_with_scores, memory_footprint, save, load). Incremental add/remove, range search, and parameter tuning are not in scope.
-- **Replacing `BaseQuantizer`.** Existing `BaseQuantizer` methods (scalar, product, optimized product, RaBitQ) stay unchanged. `BaseSearchIndex` is a parallel hierarchy, not a replacement.
+- **Removing `BaseQuantizer`.** Existing `BaseQuantizer` classes (scalar, product, optimized product, RaBitQ) stay as-is. They are no longer the primary benchmark interface, but they remain the implementation detail that `FlatQuantizedIndex` and `IvfQuantizedIndex` wrap internally. No existing quantizer code gets rewritten — only a thin wrapper layer is added on top.
 - **Production-grade Eigen K-means.** The Windows Eigen fallback is a development convenience capped at ~200K vectors, not a production benchmark surface. All reported numbers come from Linux Faiss builds.
 
 ## Architecture
@@ -78,18 +79,25 @@ The current state has three problems:
 ┌────────────────────── vector-quantization/ (test bench) ─────────────────────┐
 │                                                                               │
 │   src/haag_vq/methods/                                                        │
-│     ├─ base_quantizer.py           (existing, unchanged)                      │
-│     ├─ base_search_index.py        ← NEW ABC                                  │
+│     ├─ base_quantizer.py           (existing, unchanged — now a utility)      │
+│     ├─ base_search_index.py        ← NEW ABC (primary benchmark interface)    │
 │     ├─ saq.py                      ← DELETE (pure Python placeholder)         │
 │     └─ search/                     ← NEW subpackage                           │
 │         ├─ __init__.py                                                        │
-│         └─ saq_index.py            (SaqIndex wraps saq.IVF / saq.GpuIVF)      │
+│         ├─ saq_index.py            (SaqIndex wraps saq.IVF / saq.GpuIVF)      │
+│         ├─ flat_quantized_index.py (wraps any BaseQuantizer w/ brute-force)   │
+│         ├─ ivf_quantized_index.py  (wraps any BaseQuantizer w/ IVF shell)     │
+│         └─ faiss_ivfpq_index.py    (wraps faiss.IndexIVFPQ as baseline)       │
 │                                                                               │
 │   src/haag_vq/benchmarks/                                                     │
-│     ├─ run_benchmarks.py           ← MODIFY (add saq_index dispatch)          │
-│     └─ search_bench.py             ← NEW (recall@k, QPS, memory, Pareto)      │
+│     ├─ run_benchmarks.py           ← REWRITE (dispatch all methods via        │
+│     │                                        BaseSearchIndex)                 │
+│     └─ search_bench.py             ← NEW (recall@k, QPS, memory, MSE, Pareto) │
 │                                                                               │
-│   tests/test_saq.py                ← REWRITE (test SaqIndex contract)         │
+│   tests/                                                                      │
+│     ├─ test_saq.py                 ← REWRITE (test SaqIndex contract)         │
+│     ├─ test_flat_quantized.py      ← NEW (contract test for wrapper)          │
+│     └─ test_ivf_quantized.py       ← NEW (contract test for wrapper)          │
 │                                                                               │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -337,18 +345,24 @@ GPU bindings in `saq_gpu_bindings.cpp` mirror the same `fit` and `decompress` si
 
 #### 1. `base_search_index.py`
 
+The **primary benchmark interface** for all VQ methods. Every concrete class wraps either a native search index (SAQ, Faiss) or a `BaseQuantizer` with a search harness.
+
 ```python
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Literal, Tuple
+from typing import Literal, Optional, Tuple
 import numpy as np
 
 class BaseSearchIndex(ABC):
-    """ABC for search-oriented VQ methods.
+    """Primary benchmark interface for VQ methods.
 
-    Distinct from BaseQuantizer: this interface measures ANN search quality
-    (recall@k, QPS) rather than reconstruction fidelity (MSE). Use this for
-    index-integrated methods like SAQ, RaBitQ, and IVF-PQ.
+    All VQ methods (SAQ, PQ, OPQ, SQ, RaBitQ, Faiss baselines) implement
+    this interface — either natively (SAQ, Faiss) or via wrapper classes
+    that adapt BaseQuantizer implementations (FlatQuantizedIndex,
+    IvfQuantizedIndex).
+
+    Primary metrics: recall@k, QPS, memory_footprint.
+    Secondary metric: reconstruction MSE (optional, via reconstruction_mse()).
     """
 
     @abstractmethod
@@ -365,7 +379,7 @@ class BaseSearchIndex(ABC):
 
     @abstractmethod
     def memory_footprint(self) -> int:
-        """Estimated index memory in bytes."""
+        """Estimated index memory in bytes (for compression ratio computation)."""
 
     @abstractmethod
     def save(self, path: str | Path) -> None:
@@ -374,6 +388,24 @@ class BaseSearchIndex(ABC):
     @abstractmethod
     def load(self, path: str | Path) -> None:
         """Restore index from disk."""
+
+    def reconstruction_mse(
+        self,
+        X: np.ndarray,
+        sample_ids: Optional[np.ndarray] = None,
+    ) -> Optional[float]:
+        """Return mean reconstruction MSE over a sample (optional metric).
+
+        Default: returns None (method does not support reconstruction).
+        Concrete classes override when their underlying quantizer/index
+        supports decompress. Used as a secondary benchmark column.
+
+        Args:
+            X: Original vectors (N, D) used as ground truth.
+            sample_ids: If provided, compute MSE over this subset.
+                        If None, use all vectors.
+        """
+        return None
 ```
 
 #### 2. `search/saq_index.py`
@@ -429,11 +461,172 @@ class SaqIndex(BaseSearchIndex):
     def load(self, path):
         self._index = self._saq.IVF()
         self._index.load(str(path))
+
+    def reconstruction_mse(self, X, sample_ids=None):
+        if sample_ids is None:
+            sample_ids = np.arange(len(X), dtype=np.uint32)
+        X_hat = self._index.decompress(sample_ids.astype(np.uint32))
+        return float(np.mean((X[sample_ids] - X_hat) ** 2))
 ```
 
-**Key decision (override from solution-architect recommendation):** `SaqIndex` inherits **only** from `BaseSearchIndex`, not from both `BaseSearchIndex` and `BaseQuantizer`. Reason: `BaseQuantizer` requires batch `compress(X) -> codes` and `decompress(codes) -> X`. For SAQ, codes are opaque cluster data, and reconstruction requires the full IVF lookup path (vector id → cluster → unpack → decompress). This leaks IVF internals through a generic interface. Instead, expose `decompress_by_ids(ids)` as a bonus method on `SaqIndex` for the distortion benchmark use case.
+**Key decision:** `SaqIndex` inherits **only** from `BaseSearchIndex`. `BaseQuantizer` is no longer a benchmark interface. Reconstruction MSE is supported via the optional `reconstruction_mse()` method, which calls `IVF.decompress()` internally.
 
-#### 3. `benchmarks/search_bench.py`
+#### 3. `search/flat_quantized_index.py` — wraps any BaseQuantizer with brute-force search
+
+```python
+class FlatQuantizedIndex(BaseSearchIndex):
+    """Wraps any BaseQuantizer with brute-force search.
+
+    Fit: compresses all training vectors and stores codes.
+    Search: decompresses stored codes, computes distance to query, top-k.
+
+    Fair but slow — O(N) per query. Use for small/medium datasets or as
+    a baseline that factors out IVF overhead.
+    """
+
+    def __init__(self, quantizer: BaseQuantizer):
+        self._quantizer = quantizer
+        self._codes: Optional[np.ndarray] = None
+        self._X_ref: Optional[np.ndarray] = None  # kept for memory footprint
+
+    def fit(self, X, metric='l2'):
+        self._metric = metric
+        self._quantizer.fit(X)
+        self._codes = self._quantizer.compress(X)
+        self._N, self._D = X.shape
+
+    def search(self, Q, k):
+        ids, _ = self.search_with_scores(Q, k)
+        return ids
+
+    def search_with_scores(self, Q, k):
+        # Decompress full database, compute distances, top-k per query
+        X_hat = self._quantizer.decompress(self._codes)
+        if self._metric == 'l2':
+            dists = cdist(Q, X_hat, metric='sqeuclidean')
+            top_k = np.argpartition(dists, k, axis=1)[:, :k]
+        else:  # 'ip'
+            sims = Q @ X_hat.T
+            top_k = np.argpartition(-sims, k, axis=1)[:, :k]
+            dists = sims
+        return top_k.astype(np.uint32), np.take_along_axis(dists, top_k, axis=1)
+
+    def memory_footprint(self):
+        return self._codes.nbytes
+
+    def reconstruction_mse(self, X, sample_ids=None):
+        if sample_ids is None:
+            sample_ids = np.arange(len(X))
+        X_hat = self._quantizer.decompress(self._codes[sample_ids])
+        return float(np.mean((X[sample_ids] - X_hat) ** 2))
+
+    def save(self, path): ...  # pickle quantizer + codes
+    def load(self, path): ...
+```
+
+#### 4. `search/ivf_quantized_index.py` — wraps any BaseQuantizer with an IVF shell
+
+```python
+class IvfQuantizedIndex(BaseSearchIndex):
+    """Wraps any BaseQuantizer inside a k-means IVF shell.
+
+    Fit: runs k-means (K clusters), compresses residuals per cluster.
+    Search: finds nearest nprobe centroids, searches within those clusters.
+
+    Fair comparison with SAQ — both use IVF + per-cluster quantization.
+    Uses faiss.Kmeans for clustering (already a dependency).
+    """
+
+    def __init__(
+        self,
+        quantizer_factory: Callable[[], BaseQuantizer],
+        K: int = 4096,
+        nprobe: int = 200,
+    ):
+        self._quantizer_factory = quantizer_factory
+        self._K = K
+        self._nprobe = nprobe
+        self._centroids: Optional[np.ndarray] = None
+        self._cluster_quantizers: list[BaseQuantizer] = []
+        self._cluster_codes: list[np.ndarray] = []
+        self._cluster_ids: list[np.ndarray] = []  # original vector IDs per cluster
+
+    def fit(self, X, metric='l2'):
+        import faiss
+        self._metric = metric
+        self._N, self._D = X.shape
+        kmeans = faiss.Kmeans(self._D, self._K, seed=0)
+        kmeans.train(X)
+        self._centroids = kmeans.centroids
+        assignments = kmeans.index.search(X, 1)[1].ravel()
+        for c in range(self._K):
+            mask = assignments == c
+            if not mask.any():
+                self._cluster_quantizers.append(None)
+                self._cluster_codes.append(np.array([]))
+                self._cluster_ids.append(np.array([], dtype=np.uint32))
+                continue
+            residuals = X[mask] - self._centroids[c]
+            q = self._quantizer_factory()
+            q.fit(residuals)
+            self._cluster_quantizers.append(q)
+            self._cluster_codes.append(q.compress(residuals))
+            self._cluster_ids.append(np.where(mask)[0].astype(np.uint32))
+
+    def search(self, Q, k): ...  # standard IVF probe + decompress + top-k
+    def search_with_scores(self, Q, k): ...
+    def memory_footprint(self): ...  # centroids + all cluster codes
+    def reconstruction_mse(self, X, sample_ids=None): ...  # per-cluster decompress
+    def save(self, path): ...
+    def load(self, path): ...
+```
+
+#### 5. `search/faiss_ivfpq_index.py` — Faiss IVF-PQ baseline
+
+```python
+class FaissIvfPqIndex(BaseSearchIndex):
+    """External baseline: faiss.IndexIVFPQ.
+
+    Used as a reference point — if SAQ doesn't beat IVFPQ on recall@k
+    at the same bpd, the algorithm isn't pulling its weight.
+    """
+
+    def __init__(self, K=4096, m=16, nbits=8, nprobe=200):
+        import faiss
+        self._faiss = faiss
+        self._K, self._m, self._nbits, self._nprobe = K, m, nbits, nprobe
+        self._index = None
+
+    def fit(self, X, metric='l2'):
+        quantizer = self._faiss.IndexFlatL2(X.shape[1])
+        self._index = self._faiss.IndexIVFPQ(
+            quantizer, X.shape[1], self._K, self._m, self._nbits
+        )
+        self._index.train(X)
+        self._index.add(X)
+        self._index.nprobe = self._nprobe
+
+    def search(self, Q, k):
+        _, ids = self._index.search(Q, k)
+        return ids.astype(np.uint32)
+
+    def search_with_scores(self, Q, k):
+        dists, ids = self._index.search(Q, k)
+        return ids.astype(np.uint32), dists
+
+    def memory_footprint(self):
+        # Approximation: K * D * 4 (centroids) + N * m bytes (PQ codes)
+        ...
+
+    def reconstruction_mse(self, X, sample_ids=None):
+        # Faiss doesn't expose reconstruct() cheaply for IndexIVFPQ — skip
+        return None
+
+    def save(self, path): self._faiss.write_index(self._index, str(path))
+    def load(self, path): self._index = self._faiss.read_index(str(path))
+```
+
+#### 6. `benchmarks/search_bench.py` — unified benchmark harness
 
 ```python
 def benchmark_index(
@@ -442,9 +635,39 @@ def benchmark_index(
     Q: np.ndarray,
     ground_truth: np.ndarray,
     ks: tuple[int, ...] = (1, 10, 100),
+    mse_sample: int = 1000,
     repeats: int = 3,
 ) -> dict:
-    """Returns dict with recall@k, qps, build_time_s, memory_bytes."""
+    """Benchmark a BaseSearchIndex implementation on recall, QPS, memory, MSE.
+
+    Returns dict with:
+        build_time_s: index construction time (already called before this fn)
+        qps: queries per second, averaged over `repeats`
+        memory_bytes: index memory footprint
+        recall@1, recall@10, recall@100: recall metrics vs ground truth
+        recon_mse: reconstruction MSE over a sample of `mse_sample` vectors
+                   (None if index doesn't support reconstruction)
+        method: class name of the index
+        params: all __init__ kwargs of the index
+    """
+    results = {'method': type(index).__name__}
+    # Search timing
+    ...
+    for k in ks:
+        results[f'recall@{k}'] = compute_recall(ids, ground_truth, k)
+    results['qps'] = ...
+    results['memory_bytes'] = index.memory_footprint()
+
+    # Secondary metric: reconstruction MSE (optional)
+    if len(X) > mse_sample:
+        sample_ids = np.random.default_rng(0).choice(len(X), mse_sample, replace=False)
+    else:
+        sample_ids = np.arange(len(X))
+    mse = index.reconstruction_mse(X, sample_ids=sample_ids)
+    results['recon_mse'] = mse  # may be None
+
+    return results
+
 
 def sweep_bpd(
     IndexClass: type,
@@ -454,9 +677,30 @@ def sweep_bpd(
 ) -> list[dict]:
     """Sweep bits-per-dim, return list for Pareto plotting."""
 
+
+def compare_methods(
+    indices: list[BaseSearchIndex],
+    X: np.ndarray, Q: np.ndarray, ground_truth: np.ndarray,
+) -> pd.DataFrame:
+    """Run all methods, return a DataFrame comparing recall@k, QPS, memory, MSE."""
+
+
 def pareto_plot(results: list[dict], x='memory_bytes', y='recall@10') -> None:
-    """Plot recall vs memory Pareto curve."""
+    """Plot Pareto curve. Supports x='memory_bytes'|'qps', y='recall@k'|'recon_mse'."""
 ```
+
+Example comparison output:
+
+| method | bpd | recall@10 | recall@100 | qps | memory_mb | recon_mse |
+|---|---|---|---|---|---|---|
+| FlatQuantizedIndex (PQ) | 2.0 | 78.3% | 68.2% | 120 | 24 | 0.0021 |
+| IvfQuantizedIndex (PQ) | 2.0 | 89.5% | 84.8% | 3200 | 26 | 0.0021 |
+| IvfQuantizedIndex (OPQ) | 2.0 | 91.8% | 87.3% | 3100 | 26 | 0.0015 |
+| IvfQuantizedIndex (RaBitQ) | 2.0 | 93.1% | 90.5% | 2800 | 25 | 0.0018 |
+| SaqIndex | 2.0 | 92.6% | 89.9% | 28 | 24 | 0.00008 |
+| FaissIvfPqIndex | 2.0 | 90.4% | 85.6% | 3400 | 27 | — |
+
+All methods reported on the same axes. SAQ's significantly lower MSE (consistent with CAQ's cosine-similarity optimization) is visible alongside its competitive recall. The slow QPS of SAQ (3-stage SIMD search has higher per-query overhead than IVFPQ's LUT lookup) is visible as a trade-off worth investigating.
 
 ### Data Flow
 
@@ -494,9 +738,13 @@ benchmark_index(idx, X, Q, gt)
 
 2. **Test bench imports `saq` unconditionally.** Variant selection happens at wheel install time, not in Python. This keeps the test bench agnostic — users install the wheel that matches their hardware and experiment.
 
-3. **Two benchmark tracks run side-by-side in `run_benchmarks.py`:**
-   - Existing `BaseQuantizer` track for PQ, OPQ, SQ, RaBitQ — reconstruction MSE, distortion metrics
-   - New `BaseSearchIndex` track for SAQ (and future IVF-PQ baseline) — recall@k, QPS, memory
+3. **Single unified benchmark track via `BaseSearchIndex`:**
+   - `SaqIndex` wraps the C++ SAQ library
+   - `FlatQuantizedIndex` wraps existing PQ/OPQ/SQ/RaBitQ with brute-force search
+   - `IvfQuantizedIndex` wraps existing PQ/OPQ/SQ/RaBitQ with a k-means IVF shell (fair comparison with SAQ)
+   - `FaissIvfPqIndex` is the external baseline
+   - All methods report recall@k, QPS, memory, and (optionally) reconstruction MSE on the same output rows
+   - `BaseQuantizer` classes are no longer called directly by the benchmark — they live inside the wrapper classes
 
 4. **Ground truth computation** uses `faiss.IndexFlatL2` / `IndexFlatIP` on the original (un-quantized) data. Already present in test bench's preprocessing utilities.
 
@@ -541,17 +789,31 @@ The `feat/ivf-fit-api` branch is the **primary work branch** for the SAQ changes
 
 ## Implementation Order
 
+**Phase 1: SAQ C++ library changes**
 1. **SAQ: preprocessing module + `fit()` + `decompress()` + `SAQ_USE_FAISS` CMake** (on `feat/ivf-fit-api` branch from `main`)
 2. **SAQ: pybind11 binding updates** (same branch)
-3. **Verify on Linux with Faiss**, Windows with Eigen fallback
+3. **Verify on Linux with Faiss, Windows with Eigen fallback**
 4. **Merge `feat/ivf-fit-api` → `main`**
 5. **Propagate to `gpu`, `feat/optimal-codebook`** via merge
 6. **Create `gpu-codebook` branch** from `gpu`, cherry-pick codebook bindings with stub implementations
-7. **Build all 4 wheels, verify API identical**
-8. **Test bench: `BaseSearchIndex` ABC** (on new branch in `vector-quantization/`)
-9. **Test bench: `SaqIndex` wrapper**
-10. **Test bench: `search_bench.py` + `run_benchmarks.py` updates**
-11. **Test bench: Delete `saq.py`, rewrite `test_saq.py`**
-12. **Submit test bench PR** to collaborators
+7. **Build all 4 wheels, verify API identical across branches**
 
-Steps 1-7 are one SAQ PR per branch (4 PRs total in SAQ). Steps 8-12 are one PR in `vector-quantization`.
+**Phase 2: Test bench core (BaseSearchIndex + SaqIndex)**
+8. **Test bench: `BaseSearchIndex` ABC** (on new branch in `vector-quantization/`)
+9. **Test bench: `SaqIndex` wrapper** (including `reconstruction_mse` override)
+10. **Test bench: Contract tests for `SaqIndex`**
+
+**Phase 3: Test bench wrappers for existing quantizers**
+11. **Test bench: `FlatQuantizedIndex`** (generic wrapper over any `BaseQuantizer`)
+12. **Test bench: `IvfQuantizedIndex`** (k-means IVF shell + per-cluster quantization)
+13. **Test bench: `FaissIvfPqIndex`** (external baseline)
+14. **Test bench: Contract tests for all wrappers**
+
+**Phase 4: Benchmark harness + cleanup**
+15. **Test bench: `search_bench.py`** (`benchmark_index`, `sweep_bpd`, `compare_methods`, `pareto_plot`)
+16. **Test bench: Rewrite `run_benchmarks.py`** to dispatch all methods through `BaseSearchIndex`
+17. **Test bench: Delete `saq.py`, update `methods/__init__.py`, remove SAQ import from `performance.py`**
+18. **Test bench: Rewrite `tests/test_saq.py` against `BaseSearchIndex` contract**
+19. **Submit test bench PR** to collaborators
+
+Phase 1 is 4 SAQ PRs (one per branch, feat branch merged first). Phase 2-4 is one large PR to `vector-quantization` (can be split into 2-3 commits for reviewability: ABC+SaqIndex, then wrappers, then harness+cleanup).
