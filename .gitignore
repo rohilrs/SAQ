@@ -45,8 +45,9 @@ bin/
 .vscode/
 .clang-format
 
-# Tests (old, need updating)
-tests/
+# Legacy C++ tests (old, need updating); Python tests live under tests/python/
+tests/*
+!tests/python/
 
 # GitHub
 .github/
