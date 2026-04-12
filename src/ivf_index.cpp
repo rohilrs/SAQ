@@ -41,6 +41,65 @@ void IVF::construct(const FloatRowMat &data, const FloatRowMat &centroids,
         printQPlan(saq_data_.get());
     }
 
+    // Build segment codebooks if codebook mode is active
+    if (has_codebooks_) {
+        saq_data_->segment_codebooks.clear();
+        size_t dim_offset = 0;
+        size_t seg_idx = 0;
+        for (const auto& [seg_dims, seg_bits] : saq_data_->quant_plan) {
+            std::vector<DimensionCodebook> seg_cbs;
+            if (seg_bits > 0) {
+                // Check if we have codebook data for this bit width
+                bool have_cb_for_bits = false;
+                if (!codebooks_.empty()) {
+                    have_cb_for_bits = (seg_idx < codebooks_.size());
+                } else {
+                    have_cb_for_bits = (seg_bits < gaussian_codebook_centroids_.size()
+                                        && !gaussian_codebook_centroids_[seg_bits].empty());
+                }
+
+                if (have_cb_for_bits) {
+                    size_t k = 1u << seg_bits;
+                    // Verify base codebook has enough entries
+                    if (!codebooks_.empty()) {
+                        CHECK(codebooks_[seg_idx].size() >= seg_dims)
+                            << "Explicit codebook for segment " << seg_idx
+                            << " has " << codebooks_[seg_idx].size()
+                            << " dims, need " << seg_dims;
+                    } else {
+                        CHECK(gaussian_codebook_centroids_[seg_bits].size() >= k)
+                            << "Gaussian codebook for " << seg_bits << " bits has "
+                            << gaussian_codebook_centroids_[seg_bits].size()
+                            << " entries, need " << k;
+                    }
+                    for (size_t d = 0; d < seg_dims; d++) {
+                        DimensionCodebook cb;
+                        if (!codebooks_.empty()) {
+                            cb = codebooks_[seg_idx][d];
+                        } else {
+                            size_t global_dim = dim_offset + d;
+                            float sigma = residual_stds_[global_dim];
+                            cb.num_entries = k;
+                            cb.centroids.resize(k);
+                            const auto& base = gaussian_codebook_centroids_[seg_bits];
+                            for (size_t c = 0; c < k; c++) {
+                                cb.centroids[c] = base[c] * sigma;
+                            }
+                            std::sort(cb.centroids.begin(), cb.centroids.end());
+                        }
+                        seg_cbs.push_back(std::move(cb));
+                    }
+                }
+                // If no codebook for this bit width, seg_cbs stays empty
+                // → this segment falls back to uniform encode
+            }
+            saq_data_->segment_codebooks.push_back(std::move(seg_cbs));
+            dim_offset += seg_dims;
+            seg_idx++;
+        }
+        LOG(INFO) << "Built codebooks for " << seg_idx << " segments";
+    }
+
     // 3. prepare clusters
     std::vector<std::vector<PID>> id_lists(num_cen_);
     {

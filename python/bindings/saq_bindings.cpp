@@ -10,6 +10,7 @@
 #include <pybind11/stl.h>
 
 #include "index/ivf_index.h"
+#include "saq/codebook_encoder.h"
 #include "saq/config.h"
 #include "saq/defines.h"
 #include "saq/io_utils.h"
@@ -182,31 +183,62 @@ PYBIND11_MODULE(_saq_core, m) {
              py::arg("ids"),
              "Approximate reconstruction of vectors by global ID. Returns float32 (n, dim).")
         .def("set_codebooks",
-             [](IVF & /*self*/, py::object /*codebooks*/) {
-#ifdef SAQ_ENABLE_CODEBOOK
-                 throw std::runtime_error(
-                     "set_codebooks: not yet wired on this branch");
-#else
-                 throw std::runtime_error(
-                     "This SAQ build does not support set_codebooks. "
-                     "Install the saq-codebook wheel.");
-#endif
+             [](IVF &self, py::list codebooks_list) {
+                 // codebooks_list: list of list of numpy arrays
+                 // codebooks_list[seg][dim] = 1D float array of sorted centroids
+                 std::vector<std::vector<DimensionCodebook>> cbs;
+                 for (auto seg_obj : codebooks_list) {
+                     py::list seg_list = seg_obj.cast<py::list>();
+                     std::vector<DimensionCodebook> seg_cbs;
+                     for (auto dim_obj : seg_list) {
+                         auto arr = dim_obj.cast<py::array_t<float, py::array::c_style>>();
+                         auto buf = arr.request();
+                         DimensionCodebook cb;
+                         cb.num_entries = buf.shape[0];
+                         cb.centroids.assign(
+                             static_cast<float*>(buf.ptr),
+                             static_cast<float*>(buf.ptr) + cb.num_entries);
+                         seg_cbs.push_back(std::move(cb));
+                     }
+                     cbs.push_back(std::move(seg_cbs));
+                 }
+                 self.set_codebooks(std::move(cbs));
              },
              py::arg("codebooks"),
-             "Set codebooks. Available on codebook branches only.")
+             "Set per-segment, per-dimension codebooks. Each segment is a list of 1D float arrays (sorted centroids).")
         .def("set_gaussian_codebooks",
-             [](IVF & /*self*/, py::object /*codebooks*/, py::object /*variances*/) {
-#ifdef SAQ_ENABLE_CODEBOOK
-                 throw std::runtime_error(
-                     "set_gaussian_codebooks: not yet wired on this branch");
-#else
-                 throw std::runtime_error(
-                     "This SAQ build does not support set_gaussian_codebooks. "
-                     "Install the saq-codebook wheel.");
-#endif
+             [](IVF &self, py::dict codebooks_dict, py::array_t<float> variances) {
+                 // codebooks_dict: {bits: numpy 1D array of base centroids}
+                 // variances: 1D float array of per-dimension variance
+                 std::vector<std::vector<float>> base_centroids;
+                 size_t max_bits = 0;
+                 for (auto item : codebooks_dict) {
+                     size_t b = item.first.cast<size_t>();
+                     if (b > max_bits) max_bits = b;
+                 }
+                 base_centroids.resize(max_bits + 1);
+                 for (auto item : codebooks_dict) {
+                     size_t b = item.first.cast<size_t>();
+                     auto arr = item.second.cast<py::array_t<float, py::array::c_style>>();
+                     auto buf = arr.request();
+                     base_centroids[b].assign(
+                         static_cast<float*>(buf.ptr),
+                         static_cast<float*>(buf.ptr) + buf.shape[0]);
+                 }
+
+                 auto var_buf = variances.request();
+                 size_t ndim = var_buf.shape[0];
+                 std::vector<float> stds(ndim);
+                 float* var_ptr = static_cast<float*>(var_buf.ptr);
+                 for (size_t i = 0; i < ndim; ++i)
+                     stds[i] = std::sqrt(var_ptr[i]);
+
+                 self.set_gaussian_codebooks(std::move(base_centroids), std::move(stds));
              },
              py::arg("codebooks"), py::arg("variances"),
-             "Set Gaussian codebooks. Codebook branches only.");
+             "Set Gaussian base codebooks + per-dimension variances. "
+             "codebooks: dict {bits: 1D float array}, variances: 1D float array.")
+        .def_property_readonly("has_codebooks", &IVF::has_codebooks);
 
     // ---- Utility functions ----
     m.def("load_fvecs",

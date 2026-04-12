@@ -8,6 +8,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
+#include "saq/codebook_encoder.h"
 #include "saq/gpu/gpu_ivf.h"
 #include "saq/config.h"
 #include "saq/defines.h"
@@ -72,7 +73,60 @@ PYBIND11_MODULE(_saq_gpu, m) {
              "GPU batch search. Returns uint32 array of shape (nq, topk).")
         .def_property_readonly("num_data", &gpu::GpuIVF::num_data)
         .def_property_readonly("num_dim", &gpu::GpuIVF::num_dim)
-        .def_property_readonly("k", &gpu::GpuIVF::k);
+        .def_property_readonly("k", &gpu::GpuIVF::k)
+        .def("set_gaussian_codebooks",
+             [](gpu::GpuIVF &self, py::dict codebooks_dict,
+                py::array_t<float, py::array::c_style> variances) {
+                 std::vector<std::vector<float>> base_centroids;
+                 size_t max_bits = 0;
+                 for (auto item : codebooks_dict) {
+                     size_t b = item.first.cast<size_t>();
+                     if (b > max_bits) max_bits = b;
+                 }
+                 base_centroids.resize(max_bits + 1);
+                 for (auto item : codebooks_dict) {
+                     size_t b = item.first.cast<size_t>();
+                     auto arr = item.second.cast<py::array_t<float, py::array::c_style>>();
+                     auto buf = arr.request();
+                     base_centroids[b].assign(
+                         static_cast<float*>(buf.ptr),
+                         static_cast<float*>(buf.ptr) + buf.shape[0]);
+                 }
+                 auto var_buf = variances.request();
+                 size_t ndim = var_buf.shape[0];
+                 std::vector<float> stds(ndim);
+                 float* var_ptr = static_cast<float*>(var_buf.ptr);
+                 for (size_t i = 0; i < ndim; ++i)
+                     stds[i] = std::sqrt(var_ptr[i]);
+
+                 self.set_gaussian_codebooks(std::move(base_centroids), std::move(stds));
+             },
+             py::arg("codebooks"), py::arg("variances"),
+             "Set Gaussian base codebooks for GPU index. "
+             "codebooks: dict {bits: 1D float array}, variances: 1D float array.")
+        .def("set_codebooks",
+             [](gpu::GpuIVF &self, py::list codebooks_list) {
+                 std::vector<std::vector<DimensionCodebook>> cbs;
+                 for (auto seg_obj : codebooks_list) {
+                     py::list seg_list = seg_obj.cast<py::list>();
+                     std::vector<DimensionCodebook> seg_cbs;
+                     for (auto dim_obj : seg_list) {
+                         auto arr = dim_obj.cast<py::array_t<float, py::array::c_style>>();
+                         auto buf = arr.request();
+                         DimensionCodebook cb;
+                         cb.num_entries = buf.shape[0];
+                         cb.centroids.assign(
+                             static_cast<float*>(buf.ptr),
+                             static_cast<float*>(buf.ptr) + cb.num_entries);
+                         seg_cbs.push_back(std::move(cb));
+                     }
+                     cbs.push_back(std::move(seg_cbs));
+                 }
+                 self.set_codebooks(std::move(cbs));
+             },
+             py::arg("codebooks"),
+             "Set per-segment, per-dimension codebooks for GPU index.")
+        .def_property_readonly("has_codebooks", &gpu::GpuIVF::has_codebooks);
 }
 
 #endif // SAQ_USE_CUDA

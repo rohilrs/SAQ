@@ -5,6 +5,7 @@
 #include <memory>
 #include <vector>
 
+#include "saq/codebook_encoder.h"
 #include "saq/defines.h"
 #include "saq/config.h"
 #include "saq/quantization_plan.h"
@@ -31,6 +32,12 @@ class GpuIVF {
     std::vector<GpuSaqCluData> gpu_clusters_;
     DevicePtr<float> d_centroids_raw_;  // [K × D] raw centroids for GPU centroid search
 
+    // Codebook support
+    bool has_codebooks_ = false;
+    std::vector<std::vector<DimensionCodebook>> codebooks_explicit_;
+    std::vector<std::vector<float>> gaussian_codebook_centroids_;
+    std::vector<float> residual_stds_;
+
 public:
     GpuIVF() = default;
     GpuIVF(size_t n, size_t num_dim, size_t k, QuantizeConfig cfg);
@@ -43,6 +50,21 @@ public:
     size_t num_dim() const { return num_dim_; }
     size_t k() const { return num_cen_; }
     const SaqData* get_saq_data() const { return saq_data_.get(); }
+
+    bool has_codebooks() const { return has_codebooks_; }
+
+    void set_gaussian_codebooks(
+        std::vector<std::vector<float>> base_centroids,
+        std::vector<float> residual_stds) {
+        gaussian_codebook_centroids_ = std::move(base_centroids);
+        residual_stds_ = std::move(residual_stds);
+        has_codebooks_ = true;
+    }
+
+    void set_codebooks(std::vector<std::vector<DimensionCodebook>> cbs) {
+        codebooks_explicit_ = std::move(cbs);
+        has_codebooks_ = true;
+    }
 
     void set_variance(FloatVec vars);
 

@@ -39,4 +39,24 @@ void launch_fused_caq_encode_no_rotation(
     int caq_adj_rd_lmt, float caq_adj_eps, int caq_ori_qB,
     cudaStream_t stream = 0);
 
+/// Codebook-aware encode: binary search quantization with per-dimension codebooks.
+/// codebook_centroids: [D_seg * entries_per_dim], dim-major layout.
+/// Output codes go into d_short_raw/d_long_raw as packed indices (same layout as uniform).
+void launch_fused_codebook_encode(
+    const float* d_vectors_rotated,
+    const float* d_rotated_centroids,
+    const uint32_t* d_cluster_ids,
+    const float* d_codebook_centroids,   // [D_seg * entries_per_dim], dim-major
+    size_t entries_per_dim,              // 1 << seg_bits
+    float* d_o_l2norm,
+    float* d_fac_rescale,
+    float* d_fac_error,
+    float* d_ip_cent_oa,
+    uint8_t* d_short_raw,
+    uint8_t* d_long_raw,
+    size_t D_seg, size_t N, size_t K,
+    size_t num_bits, uint16_t code_max,
+    int caq_adj_rd_lmt, float caq_adj_eps,
+    cudaStream_t stream = 0);
+
 } // namespace saq::gpu

@@ -26,6 +26,7 @@
 #include <glog/logging.h>
 #include <fmt/core.h>
 
+#include "saq/codebook_encoder.h"
 #include "saq/defines.h"
 #include "saq/config.h"
 #include "saq/io_utils.h"
@@ -98,6 +99,10 @@ struct SaqData {
     FloatVec data_variance;                    ///< Per-dimension variance (1 x num_dim_padded)
     std::vector<BaseQuantizerData> base_datas; ///< Per-segment quantizer data
     QuantPlanT quant_plan;                     ///< Quantization plan: (dim_length, bits) per segment
+
+    /// Per-segment, per-dimension codebooks (empty = uniform mode).
+    /// segment_codebooks[seg_idx][dim_within_seg].
+    std::vector<std::vector<DimensionCodebook>> segment_codebooks;
 
     /// @brief Serialize the entire SaqData to a binary stream.
     void save(std::ofstream &output) const;

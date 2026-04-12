@@ -581,4 +581,284 @@ void launch_fused_caq_encode_no_rotation(
     SAQ_CUDA_CHECK(cudaGetLastError());
 }
 
+// ============================================================================
+// Codebook Encode: binary search into sorted per-dimension centroids
+// ============================================================================
+
+/// Binary search in sorted codebook centroids for one dimension.
+__device__ __forceinline__
+int codebook_nearest(const float* codebook_dim, int num_entries, float value) {
+    int lo = 0, hi = num_entries - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        float boundary = (__ldg(&codebook_dim[mid]) + __ldg(&codebook_dim[mid + 1])) * 0.5f;
+        if (value <= boundary) hi = mid;
+        else lo = mid + 1;
+    }
+    return lo;
+}
+
+__global__ void kernel_fused_codebook_encode(
+    const float* __restrict__ d_vectors_rotated,
+    const float* __restrict__ d_rotated_centroids,
+    const uint32_t* __restrict__ d_cluster_ids,
+    const float* __restrict__ d_codebook_centroids,  // [D_seg * entries_per_dim]
+    size_t entries_per_dim,
+    float* __restrict__ d_o_l2norm,
+    float* __restrict__ d_fac_rescale,
+    float* __restrict__ d_fac_error,
+    float* __restrict__ d_ip_cent_oa,
+    uint8_t* __restrict__ d_short_raw,
+    uint8_t* __restrict__ d_long_raw,
+    size_t D_seg, size_t N, size_t K,
+    size_t num_bits, uint16_t code_max,
+    int caq_adj_rd_lmt, float caq_adj_eps)
+{
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane_id = threadIdx.x % 32;
+
+    if ((size_t)warp_id >= N) return;
+
+    uint32_t cid = d_cluster_ids[warp_id];
+
+    size_t chunk = (D_seg + 31) / 32;
+    size_t start = lane_id * chunk;
+    size_t end = min(start + chunk, D_seg);
+    size_t my_dims = (end > start) ? end - start : 0;
+
+    const float* vec_rot = d_vectors_rotated + (size_t)warp_id * D_seg;
+    const float* cent_rot = d_rotated_centroids + (size_t)cid * D_seg;
+
+    float local_vec[kMaxDimsPerLane];
+    int local_codes[kMaxDimsPerLane];
+
+    // Compute residual
+    for (size_t i = 0; i < my_dims; ++i) {
+        local_vec[i] = vec_rot[start + i] - cent_rot[start + i];
+    }
+
+    if (num_bits == 0) {
+        double partial_l2 = 0.0;
+        for (size_t i = 0; i < my_dims; ++i)
+            partial_l2 += (double)local_vec[i] * local_vec[i];
+        double total_l2 = warp_reduce_sum_double(partial_l2);
+        if (lane_id == 0) {
+            d_o_l2norm[warp_id] = sqrtf((float)total_l2);
+            d_fac_rescale[warp_id] = 0.0f;
+            d_fac_error[warp_id] = 0.0f;
+            d_ip_cent_oa[warp_id] = 0.0f;
+        }
+        return;
+    }
+
+    int nent = (int)entries_per_dim;
+
+    // ---- Step 1: Binary search initial quantization ----
+    double partial_o_l2sqr = 0.0;
+    double partial_ip_o_oa = 0.0;
+    double partial_oa_l2sqr = 0.0;
+
+    for (size_t i = 0; i < my_dims; ++i) {
+        float o = local_vec[i];
+        partial_o_l2sqr += (double)o * o;
+
+        size_t global_dim = start + i;
+        const float* cb_dim = d_codebook_centroids + global_dim * entries_per_dim;
+        int c = codebook_nearest(cb_dim, nent, o);
+        local_codes[i] = c;
+
+        float oa = __ldg(&cb_dim[c]);
+        partial_ip_o_oa += (double)o * oa;
+        partial_oa_l2sqr += (double)oa * oa;
+    }
+
+    double o_l2sqr = warp_reduce_sum_double(partial_o_l2sqr);
+    double ip_o_oa = warp_reduce_sum_double(partial_ip_o_oa);
+    double oa_l2sqr = warp_reduce_sum_double(partial_oa_l2sqr);
+    o_l2sqr = warp_broadcast_double(o_l2sqr);
+    ip_o_oa = warp_broadcast_double(ip_o_oa);
+    oa_l2sqr = warp_broadcast_double(oa_l2sqr);
+
+    // ---- Step 2: Codebook-aware code adjustment ----
+    if (caq_adj_rd_lmt && oa_l2sqr > 0.0) {
+        double re_eps = (double)caq_adj_eps * oa_l2sqr;
+
+        for (int round = 1; round <= caq_adj_rd_lmt || caq_adj_rd_lmt == 0; ++round) {
+            int local_adj_cnt = 0;
+
+            for (size_t i = 0; i < my_dims; ++i) {
+                float o = local_vec[i];
+                int c = local_codes[i];
+                size_t global_dim = start + i;
+                const float* cb_dim = d_codebook_centroids + global_dim * entries_per_dim;
+                float oa = __ldg(&cb_dim[c]);
+                double oa_l2sqr_tmp = oa_l2sqr - (double)oa * oa;
+
+                // Try increment
+                while (c + 1 < nent) {
+                    float new_oa = __ldg(&cb_dim[c + 1]);
+                    double new_length = oa_l2sqr_tmp + (double)new_oa * new_oa;
+                    double new_ip = ip_o_oa + (double)o * (new_oa - oa);
+                    if ((ip_o_oa * ip_o_oa + re_eps) * new_length >= new_ip * new_ip * oa_l2sqr)
+                        break;
+                    c++;
+                    ip_o_oa = new_ip;
+                    oa = new_oa;
+                    oa_l2sqr = oa_l2sqr_tmp + (double)oa * oa;
+                    local_adj_cnt++;
+                }
+                // Try decrement
+                while (c > 0) {
+                    float new_oa = __ldg(&cb_dim[c - 1]);
+                    double new_length = oa_l2sqr_tmp + (double)new_oa * new_oa;
+                    double new_ip = ip_o_oa + (double)o * (new_oa - oa);
+                    if ((ip_o_oa * ip_o_oa + re_eps) * new_length >= new_ip * new_ip * oa_l2sqr)
+                        break;
+                    c--;
+                    ip_o_oa = new_ip;
+                    oa = new_oa;
+                    oa_l2sqr = oa_l2sqr_tmp + (double)oa * oa;
+                    local_adj_cnt++;
+                }
+                local_codes[i] = c;
+            }
+
+            int total_adj = warp_reduce_sum_int(local_adj_cnt);
+            total_adj = warp_broadcast_int(total_adj);
+            if (total_adj == 0) break;
+
+            // Recompute global sums after adjustment round
+            double corr_oa_l2 = 0.0, corr_ip = 0.0;
+            for (size_t i = 0; i < my_dims; ++i) {
+                float o = local_vec[i];
+                size_t global_dim = start + i;
+                float oa = __ldg(&d_codebook_centroids[global_dim * entries_per_dim + local_codes[i]]);
+                corr_ip += (double)oa * o;
+                corr_oa_l2 += (double)oa * oa;
+            }
+            oa_l2sqr = warp_reduce_sum_double(corr_oa_l2);
+            ip_o_oa = warp_reduce_sum_double(corr_ip);
+            oa_l2sqr = warp_broadcast_double(oa_l2sqr);
+            ip_o_oa = warp_broadcast_double(ip_o_oa);
+            re_eps = (double)caq_adj_eps * oa_l2sqr;
+        }
+    }
+
+    // ---- Step 3: Compute factors (codebook mode) ----
+    // Codebook rescale: o_l2sqr / ip_o_oa  (no v_mx factor)
+    float fac_rescale = (ip_o_oa != 0.0) ? (float)(o_l2sqr / ip_o_oa) : 0.0f;
+    float o_l2norm = sqrtf((float)o_l2sqr);
+
+    constexpr float kConstEpsilon = 1.9f;
+    float fac_error = 0.0f;
+    if (ip_o_oa > 0.0 && D_seg > 1) {
+        fac_error = (float)(o_l2sqr * kConstEpsilon *
+            sqrt(((o_l2sqr * oa_l2sqr) / (ip_o_oa * ip_o_oa) - 1.0) / (D_seg - 1)));
+    }
+
+    // ---- Step 4: ip_cent_oa (centroid dot quantized) ----
+    float ip_c_oa = 0.0f;
+    {
+        double partial_ip = 0.0;
+        for (size_t i = 0; i < my_dims; ++i) {
+            size_t global_dim = start + i;
+            float oa = __ldg(&d_codebook_centroids[global_dim * entries_per_dim + local_codes[i]]);
+            partial_ip += (double)cent_rot[start + i] * oa;
+        }
+        double total_ip = warp_reduce_sum_double(partial_ip);
+        ip_c_oa = (float)warp_broadcast_double(total_ip);
+    }
+
+    // ---- Write scalar outputs (lane 0) ----
+    if (lane_id == 0) {
+        d_o_l2norm[warp_id] = o_l2norm;
+        d_fac_rescale[warp_id] = fac_rescale;
+        d_fac_error[warp_id] = fac_error;
+        d_ip_cent_oa[warp_id] = ip_c_oa;
+    }
+
+    // ---- Step 5: Pack codes into short_raw and long_raw ----
+    // Codebook mode: codes are full indices [0, entries_per_dim).
+    // We pack them identically to the uniform path: 1-bit MSB into short_codes
+    // (for fastscan compatibility), remaining bits into long_codes.
+
+    // -- Short codes (1-bit MSB, descending bit order: dim 0 → bit 7) --
+    if (num_bits > 0 && d_short_raw) {
+        size_t short_bytes_per_vec = D_seg / 8;
+        for (size_t byte_idx = start / 8; byte_idx < (end + 7) / 8 && byte_idx < short_bytes_per_vec; ++byte_idx) {
+            uint8_t byte_val = 0;
+            for (int b = 0; b < 8; ++b) {
+                size_t d = byte_idx * 8 + b;
+                if (d >= start && d < end && d < D_seg) {
+                    int c = local_codes[d - start];
+                    byte_val |= ((c >> ((int)num_bits - 1)) & 1) << (7 - b);
+                }
+            }
+            size_t byte_start_dim = byte_idx * 8;
+            size_t byte_end_dim = byte_start_dim + 8;
+            if (byte_start_dim >= start && byte_end_dim <= end) {
+                d_short_raw[(size_t)warp_id * short_bytes_per_vec + byte_idx] = byte_val;
+            } else {
+                if (byte_start_dim == start || start == 0)
+                    d_short_raw[(size_t)warp_id * short_bytes_per_vec + byte_idx] = 0;
+                __syncwarp();
+                if (byte_val != 0)
+                    atomicOr((unsigned int*)(d_short_raw + (size_t)warp_id * short_bytes_per_vec + (byte_idx & ~3u)),
+                             (unsigned int)byte_val << (8 * (byte_idx & 3u)));
+            }
+        }
+    }
+
+    // -- Long codes (remaining bits, bit-compacted) --
+    if (num_bits > 1 && d_long_raw) {
+        size_t ex_bits = num_bits - 1;
+        size_t long_bytes_per_vec = D_seg * ex_bits / 8;
+        uint8_t* my_long = d_long_raw + (size_t)warp_id * long_bytes_per_vec;
+
+        for (size_t i = 0; i < my_dims; ++i) {
+            size_t d = start + i;
+            int code_low = local_codes[i] & ((1 << ex_bits) - 1);
+            size_t bit_offset = d * ex_bits;
+            for (size_t b = 0; b < ex_bits; ++b) {
+                if ((code_low >> b) & 1) {
+                    size_t gbit = bit_offset + b;
+                    size_t byte_pos = gbit / 8;
+                    size_t bit_pos = gbit % 8;
+                    atomicOr((unsigned int*)(my_long + (byte_pos & ~3u)),
+                             1u << (8 * (byte_pos & 3u) + bit_pos));
+                }
+            }
+        }
+    }
+}
+
+void launch_fused_codebook_encode(
+    const float* d_vectors_rotated,
+    const float* d_rotated_centroids,
+    const uint32_t* d_cluster_ids,
+    const float* d_codebook_centroids,
+    size_t entries_per_dim,
+    float* d_o_l2norm, float* d_fac_rescale,
+    float* d_fac_error, float* d_ip_cent_oa,
+    uint8_t* d_short_raw, uint8_t* d_long_raw,
+    size_t D_seg, size_t N, size_t K,
+    size_t num_bits, uint16_t code_max,
+    int caq_adj_rd_lmt, float caq_adj_eps,
+    cudaStream_t stream)
+{
+    if (N == 0) return;
+    constexpr int kWarpsPerBlock = 4;
+    constexpr int kBlockSize = 32 * kWarpsPerBlock;
+    int grid = ((int)N + kWarpsPerBlock - 1) / kWarpsPerBlock;
+
+    kernel_fused_codebook_encode<<<grid, kBlockSize, 0, stream>>>(
+        d_vectors_rotated, d_rotated_centroids, d_cluster_ids,
+        d_codebook_centroids, entries_per_dim,
+        d_o_l2norm, d_fac_rescale, d_fac_error, d_ip_cent_oa,
+        d_short_raw, d_long_raw,
+        D_seg, N, K, num_bits, code_max,
+        caq_adj_rd_lmt, caq_adj_eps);
+    SAQ_CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace saq::gpu

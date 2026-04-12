@@ -24,6 +24,8 @@ struct GpuSegmentDescriptor {
     size_t D_seg;
     size_t num_bits;
     size_t long_bytes_per_vec;     // D_seg * (bits-1) / 8, or 0 for bits <= 1
+    float* codebook_centroids;     // nullptr = uniform mode; else [D_seg * entries_per_dim]
+    size_t codebook_entries_per_dim; // 1 << num_bits, or 0
 };
 
 /// Device-side per-cluster descriptor for search kernel.

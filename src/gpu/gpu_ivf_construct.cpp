@@ -58,6 +58,60 @@ void GpuIVF::construct(const FloatRowMat& data,
 
     LOG(INFO) << "Quantization plan: " << num_segments << " segments";
 
+    // Build segment codebooks if codebook mode is active
+    if (has_codebooks_) {
+        saq_data_->segment_codebooks.clear();
+        size_t cb_dim_offset = 0;
+        for (size_t s = 0; s < num_segments; ++s) {
+            auto [seg_dims, seg_bits] = quant_plan[s];
+            std::vector<DimensionCodebook> seg_cbs;
+            if (seg_bits > 0) {
+                bool have_cb_for_bits = false;
+                if (!codebooks_explicit_.empty()) {
+                    have_cb_for_bits = (s < codebooks_explicit_.size());
+                } else {
+                    have_cb_for_bits = (seg_bits < gaussian_codebook_centroids_.size()
+                                        && !gaussian_codebook_centroids_[seg_bits].empty());
+                }
+
+                if (have_cb_for_bits) {
+                    size_t k = 1u << seg_bits;
+                    if (!codebooks_explicit_.empty()) {
+                        CHECK(codebooks_explicit_[s].size() >= seg_dims)
+                            << "Explicit codebook for segment " << s
+                            << " has " << codebooks_explicit_[s].size()
+                            << " dims, need " << seg_dims;
+                    } else {
+                        CHECK(gaussian_codebook_centroids_[seg_bits].size() >= k)
+                            << "Gaussian codebook for " << seg_bits << " bits has "
+                            << gaussian_codebook_centroids_[seg_bits].size()
+                            << " entries, need " << k;
+                    }
+                    for (size_t d = 0; d < seg_dims; d++) {
+                        DimensionCodebook cb;
+                        if (!codebooks_explicit_.empty()) {
+                            cb = codebooks_explicit_[s][d];
+                        } else {
+                            size_t global_dim = cb_dim_offset + d;
+                            float sigma = residual_stds_[global_dim];
+                            cb.num_entries = k;
+                            cb.centroids.resize(k);
+                            const auto& base = gaussian_codebook_centroids_[seg_bits];
+                            for (size_t c = 0; c < k; c++) {
+                                cb.centroids[c] = base[c] * sigma;
+                            }
+                            std::sort(cb.centroids.begin(), cb.centroids.end());
+                        }
+                        seg_cbs.push_back(std::move(cb));
+                    }
+                }
+            }
+            saq_data_->segment_codebooks.push_back(std::move(seg_cbs));
+            cb_dim_offset += seg_dims;
+        }
+        LOG(INFO) << "Built codebooks for " << num_segments << " segments";
+    }
+
     // 2. Compute cluster sizes and offsets (CPU-side)
     std::vector<size_t> cluster_sizes(K, 0);
     for (size_t i = 0; i < N; ++i) {
@@ -113,6 +167,17 @@ void GpuIVF::construct(const FloatRowMat& data,
     // Upload original IDs into pool
     upload(pool_.ids.get(), h_sorted_original_ids.data(), N);
 
+    // Upload codebooks to GPU
+    if (has_codebooks_ && !saq_data_->segment_codebooks.empty()) {
+        for (size_t s = 0; s < num_segments; ++s) {
+            const auto& seg_cbs = saq_data_->segment_codebooks[s];
+            if (!seg_cbs.empty()) {
+                pool_.upload_segment_codebooks(s, seg_cbs);
+            }
+        }
+        LOG(INFO) << "Uploaded codebooks to GPU";
+    }
+
     SAQ_CUDA_CHECK(cudaDeviceSynchronize());
     auto alloc_ms = phase_timer.getElapsedTimeMicro() / 1000.0;
     LOG(INFO) << "[TIMING] GPU pool alloc + ID upload: " << alloc_ms << " ms";
@@ -135,8 +200,13 @@ void GpuIVF::construct(const FloatRowMat& data,
         // Allocate outputs
         size_t short_code_bytes = D_seg / 8;
         size_t long_code_bytes = (num_bits > 1) ? D_seg * (num_bits - 1) / 8 : 0;
-        auto d_short_raw = device_alloc<uint8_t>(N * (short_code_bytes > 0 ? short_code_bytes : 1));
-        auto d_long_raw = device_alloc<uint8_t>(N * (long_code_bytes > 0 ? long_code_bytes : 1));
+        size_t short_alloc = N * (short_code_bytes > 0 ? short_code_bytes : 1);
+        size_t long_alloc = N * (long_code_bytes > 0 ? long_code_bytes : 1);
+        auto d_short_raw = device_alloc<uint8_t>(short_alloc);
+        auto d_long_raw = device_alloc<uint8_t>(long_alloc);
+        // Zero buffers — encode kernels use atomicOr to set bits
+        SAQ_CUDA_CHECK(cudaMemset(d_short_raw.get(), 0, short_alloc));
+        SAQ_CUDA_CHECK(cudaMemset(d_long_raw.get(), 0, long_alloc));
         auto d_o_l2norm = device_alloc<float>(N);
         auto d_fac_rescale = device_alloc<float>(N);
         auto d_fac_error = device_alloc<float>(N);
@@ -180,21 +250,61 @@ void GpuIVF::construct(const FloatRowMat& data,
             FloatRowMat cent_rotated = cent_seg * bdata.rotator->get_P();
             upload(d_rotated_centroids.get(), cent_rotated.data(), K * D_seg);
 
-            launch_fused_caq_encode(
-                d_rotated.get(), d_rotated_centroids.get(), d_cluster_ids.get(),
-                d_o_l2norm.get(), d_fac_rescale.get(), d_fac_error.get(), d_ip_cent_oa.get(),
-                d_short_raw.get(), d_long_raw.get(),
-                D_seg, N, K, num_bits, code_max,
-                bdata.cfg.caq_adj_rd_lmt, bdata.cfg.caq_adj_eps, bdata.cfg.caq_ori_qB);
+            if (has_codebooks_ && pool_.segments[seg].codebook_entries_per_dim > 0) {
+                launch_fused_codebook_encode(
+                    d_rotated.get(), d_rotated_centroids.get(), d_cluster_ids.get(),
+                    pool_.segments[seg].codebook_centroids.get(),
+                    pool_.segments[seg].codebook_entries_per_dim,
+                    d_o_l2norm.get(), d_fac_rescale.get(), d_fac_error.get(), d_ip_cent_oa.get(),
+                    d_short_raw.get(), d_long_raw.get(),
+                    D_seg, N, K, num_bits, code_max,
+                    bdata.cfg.caq_adj_rd_lmt, bdata.cfg.caq_adj_eps);
+            } else {
+                launch_fused_caq_encode(
+                    d_rotated.get(), d_rotated_centroids.get(), d_cluster_ids.get(),
+                    d_o_l2norm.get(), d_fac_rescale.get(), d_fac_error.get(), d_ip_cent_oa.get(),
+                    d_short_raw.get(), d_long_raw.get(),
+                    D_seg, N, K, num_bits, code_max,
+                    bdata.cfg.caq_adj_rd_lmt, bdata.cfg.caq_adj_eps, bdata.cfg.caq_ori_qB);
+            }
         } else {
             // No rotation: fused encode subtracts centroid inline from raw vectors
-            launch_fused_caq_encode_no_rotation(
-                d_vectors.get(), d_centroids_raw_.get(), d_cluster_ids.get(),
-                dim_offset, D_seg, D,
-                d_o_l2norm.get(), d_fac_rescale.get(), d_fac_error.get(), d_ip_cent_oa.get(),
-                d_short_raw.get(), d_long_raw.get(),
-                N, K, num_bits, code_max,
-                bdata.cfg.caq_adj_rd_lmt, bdata.cfg.caq_adj_eps, bdata.cfg.caq_ori_qB);
+            if (has_codebooks_ && pool_.segments[seg].codebook_entries_per_dim > 0) {
+                // For no-rotation codebook path, extract segment and use the rotation variant
+                // with identity (the vectors are already in the right space)
+                auto d_vec_seg = device_alloc<float>(N * D_seg);
+                {
+                    float alpha = 1.0f, beta = 0.0f;
+                    SAQ_CUBLAS_CHECK(cublasSgeam(cublas.get(),
+                        CUBLAS_OP_N, CUBLAS_OP_N,
+                        (int)D_seg, (int)N,
+                        &alpha, d_vectors.get() + dim_offset, (int)D,
+                        &beta,  d_vec_seg.get(), (int)D_seg,
+                        d_vec_seg.get(), (int)D_seg));
+                }
+                auto d_cent_seg = device_alloc<float>(K * D_seg);
+                FloatRowMat cent_seg(K, D_seg);
+                for (size_t c = 0; c < K; ++c)
+                    cent_seg.row(c) = centroids.row(c).segment(dim_offset, D_seg);
+                upload(d_cent_seg.get(), cent_seg.data(), K * D_seg);
+
+                launch_fused_codebook_encode(
+                    d_vec_seg.get(), d_cent_seg.get(), d_cluster_ids.get(),
+                    pool_.segments[seg].codebook_centroids.get(),
+                    pool_.segments[seg].codebook_entries_per_dim,
+                    d_o_l2norm.get(), d_fac_rescale.get(), d_fac_error.get(), d_ip_cent_oa.get(),
+                    d_short_raw.get(), d_long_raw.get(),
+                    D_seg, N, K, num_bits, code_max,
+                    bdata.cfg.caq_adj_rd_lmt, bdata.cfg.caq_adj_eps);
+            } else {
+                launch_fused_caq_encode_no_rotation(
+                    d_vectors.get(), d_centroids_raw_.get(), d_cluster_ids.get(),
+                    dim_offset, D_seg, D,
+                    d_o_l2norm.get(), d_fac_rescale.get(), d_fac_error.get(), d_ip_cent_oa.get(),
+                    d_short_raw.get(), d_long_raw.get(),
+                    N, K, num_bits, code_max,
+                    bdata.cfg.caq_adj_rd_lmt, bdata.cfg.caq_adj_eps, bdata.cfg.caq_ori_qB);
+            }
         }
 
         // Compute rotated centroids for scatter (needed for pool centroid storage)

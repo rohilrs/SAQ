@@ -27,6 +27,49 @@ __device__ void build_codebook_lut(const float* query4, float* lut16) {
     }
 }
 
+/// Compute inner product between codebook-quantized vector and query segment.
+/// Each dimension's code indexes into the codebook to get the centroid value,
+/// then we compute dot product with the residual query.
+///
+/// Short codes are in fastscan layout: num_codebooks nibbles per vector.
+/// Each nibble packs 4 dims: dim0→bit3, dim1→bit2, dim2→bit1, dim3→bit0.
+/// Long codes are bit-compacted: (num_bits-1) bits per dim.
+__device__ float gpu_codebook_ip(
+    const float* __restrict__ resid_query,    // [D_seg]
+    const float* __restrict__ codebook,       // [D_seg * entries_per_dim]
+    const uint8_t* __restrict__ short_code,   // fastscan nibbles [num_codebooks]
+    const uint8_t* __restrict__ long_code,    // bit-packed lower bits
+    size_t D_seg, size_t num_bits,
+    size_t entries_per_dim)
+{
+    size_t ex_bits = (num_bits > 1) ? num_bits - 1 : 0;
+    size_t num_codebooks = D_seg / 4;
+    float ip = 0.0f;
+
+    for (size_t d = 0; d < D_seg; ++d) {
+        // Extract MSB from fastscan nibble layout
+        size_t cb_idx = d / 4;          // which codebook (nibble)
+        int sub = (int)(d % 4);         // position within the 4-dim group
+        int bit_in_nibble = 3 - sub;    // dim0→bit3, dim1→bit2, etc.
+        int msb = (short_code[cb_idx] >> bit_in_nibble) & 1;
+
+        int code_low = 0;
+        if (ex_bits > 0 && long_code) {
+            size_t bit_offset = d * ex_bits;
+            for (size_t b = 0; b < ex_bits; ++b) {
+                size_t gbit = bit_offset + b;
+                if ((long_code[gbit / 8] >> (gbit % 8)) & 1)
+                    code_low |= (1 << b);
+            }
+        }
+        int full_code = (msb << ex_bits) | code_low;
+
+        float centroid_val = __ldg(&codebook[d * entries_per_dim + full_code]);
+        ip += centroid_val * resid_query[d];
+    }
+    return ip;
+}
+
 /// Unpack and compute IP between query and variable-bit long code.
 /// Long codes store (num_bits-1) bits per dim, bit-compacted.
 __device__ float gpu_long_code_ip(
@@ -211,43 +254,59 @@ __global__ void kernel_search(
                     continue;
                 }
 
-                float sum_q_s = smem_consts_f[s * kConstsPerSeg + 2];
-                float sq_delta_s = smem_consts_f[s * kConstsPerSeg + 6];
-
-                // LUT sum: approximate IP from 1-bit (short) codes
-                float lut_sum = 0.0f;
-                {
-                    const uint8_t* short_base = seg.short_codes
-                        + (size_t)global_block * 32 * seg.num_codebooks;
-                    const uint8_t* my_codes = short_base + lane * seg.num_codebooks;
-                    for (size_t cb = 0; cb < seg.num_codebooks; ++cb) {
-                        lut_sum += smem_lut_f[(seg_cb_offsets[s] + cb) * 16 + my_codes[cb]];
-                    }
-                }
-
                 float rescale = seg.factor_rescale[vec_offset];
-                float full_ip;
+                float ip_o_q;
 
-                if (seg.num_bits > 1 && seg.long_bytes_per_vec > 0) {
-                    // Full IP using long codes
+                if (seg.codebook_centroids != nullptr) {
+                    // ---- Codebook distance path ----
                     const float* resid_seg = smem_resid_query + seg_dim_offsets[s];
-                    const uint8_t* long_code = seg.long_codes
-                        + vec_offset * seg.long_bytes_per_vec;
-                    float ext_ip = gpu_long_code_ip(resid_seg, long_code,
-                                                     seg.D_seg, seg.num_bits);
-                    full_ip = lut_sum + ext_ip * sq_delta_s
-                            + (-1.0f + sq_delta_s / 2.0f) * sum_q_s;
+                    // Short codes in fastscan layout: num_codebooks nibbles per vector
+                    const uint8_t* short_code = seg.short_codes
+                        + (size_t)global_block * 32 * seg.num_codebooks
+                        + lane * seg.num_codebooks;
+                    const uint8_t* long_code = (seg.long_bytes_per_vec > 0)
+                        ? seg.long_codes + vec_offset * seg.long_bytes_per_vec
+                        : nullptr;
+
+                    float cb_ip = gpu_codebook_ip(
+                        resid_seg, seg.codebook_centroids,
+                        short_code, long_code,
+                        seg.D_seg, seg.num_bits,
+                        seg.codebook_entries_per_dim);
+
+                    ip_o_q = rescale * cb_ip;
                 } else {
-                    // 1-bit or no long codes: still apply the bias term
-                    // ext_ip = 0, so full_ip = lut_sum + 0 + (vl + sq_delta/2) * sum_q
-                    full_ip = lut_sum + (-1.0f + sq_delta_s / 2.0f) * sum_q_s;
+                    // ---- Uniform distance path (existing) ----
+                    float sum_q_s = smem_consts_f[s * kConstsPerSeg + 2];
+                    float sq_delta_s = smem_consts_f[s * kConstsPerSeg + 6];
+
+                    float lut_sum = 0.0f;
+                    {
+                        const uint8_t* short_base = seg.short_codes
+                            + (size_t)global_block * 32 * seg.num_codebooks;
+                        const uint8_t* my_codes = short_base + lane * seg.num_codebooks;
+                        for (size_t cb = 0; cb < seg.num_codebooks; ++cb) {
+                            lut_sum += smem_lut_f[(seg_cb_offsets[s] + cb) * 16 + my_codes[cb]];
+                        }
+                    }
+
+                    float full_ip;
+                    if (seg.num_bits > 1 && seg.long_bytes_per_vec > 0) {
+                        const float* resid_seg = smem_resid_query + seg_dim_offsets[s];
+                        const uint8_t* long_code = seg.long_codes
+                            + vec_offset * seg.long_bytes_per_vec;
+                        float ext_ip = gpu_long_code_ip(resid_seg, long_code,
+                                                         seg.D_seg, seg.num_bits);
+                        full_ip = lut_sum + ext_ip * sq_delta_s
+                                + (-1.0f + sq_delta_s / 2.0f) * sum_q_s;
+                    } else {
+                        full_ip = lut_sum + (-1.0f + sq_delta_s / 2.0f) * sum_q_s;
+                    }
+                    ip_o_q = rescale * full_ip;
                 }
 
-                float ip_o_q = rescale * full_ip;
                 float seg_dist = o_l2sqr + q_l2sqr_s - 2.0f * ip_o_q;
                 acc_dist += seg_dist;
-
-                // Debug output removed for commit
             }
         }
 

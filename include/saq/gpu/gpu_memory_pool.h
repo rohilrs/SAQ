@@ -8,6 +8,7 @@
 #include <numeric>
 #include <vector>
 
+#include "saq/codebook_encoder.h"
 #include "saq/defines.h"
 #include "saq/gpu/gpu_utils.cuh"
 #include "saq/gpu/gpu_cluster_data.cuh"
@@ -23,6 +24,8 @@ struct GpuMemoryPool {
         DevicePtr<uint8_t> long_codes;
         DevicePtr<float>   factor_rescale;
         DevicePtr<float>   factor_error;
+        DevicePtr<float>   codebook_centroids;      // [D_seg * codebook_entries_per_dim], dim-major
+        size_t             codebook_entries_per_dim = 0;  // 1 << seg_bits, or 0 if no codebook
     };
 
     size_t K_ = 0;
@@ -145,6 +148,29 @@ struct GpuMemoryPool {
             seg.d_long_factor_rescale = sp.factor_rescale.get() + vec_off;
             seg.d_long_factor_error   = sp.factor_error.get() + vec_off;
         }
+    }
+
+    /// Upload codebooks for a segment. Called from construct after SaqData codebooks are built.
+    void upload_segment_codebooks(size_t seg_idx,
+                                  const std::vector<DimensionCodebook>& dim_cbs) {
+        auto& sp = segments[seg_idx];
+        size_t D_seg = quant_plan_[seg_idx].first;
+        if (dim_cbs.empty() || dim_cbs[0].num_entries == 0) {
+            sp.codebook_entries_per_dim = 0;
+            return;
+        }
+        size_t nent = dim_cbs[0].num_entries;
+        sp.codebook_entries_per_dim = nent;
+
+        // Flatten to dim-major: codebook_centroids[d * nent + entry]
+        std::vector<float> flat(D_seg * nent);
+        for (size_t d = 0; d < D_seg; ++d) {
+            for (size_t e = 0; e < nent; ++e) {
+                flat[d * nent + e] = dim_cbs[d].centroids[e];
+            }
+        }
+        sp.codebook_centroids = device_alloc<float>(D_seg * nent);
+        upload(sp.codebook_centroids.get(), flat.data(), D_seg * nent);
     }
 };
 

@@ -145,6 +145,10 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
         sd.num_bits = quant_plan[s].second;
         sd.long_bytes_per_vec = (quant_plan[s].second > 1)
             ? quant_plan[s].first * (quant_plan[s].second - 1) / 8 : 0;
+
+        // Codebook pointers (nullptr if no codebook for this segment)
+        sd.codebook_centroids = sp.codebook_centroids.get();
+        sd.codebook_entries_per_dim = sp.codebook_entries_per_dim;
     }
 
     std::vector<GpuClusterDescriptor> h_clu_descs(K);

@@ -21,6 +21,7 @@
 #include <glog/logging.h>
 #include <fmt/core.h>
 
+#include "saq/codebook_encoder.h"
 #include "saq/cluster_data.h"
 #include "saq/config.h"
 #include "saq/defines.h"
@@ -79,6 +80,12 @@ class IVF {
     // cluster for that segment. Only populated when fit() was called; empty
     // when construct() was called directly (enterprise path, no decompress).
     std::vector<std::vector<RawCodeMat>> raw_codes_;
+
+    // Codebook support
+    bool has_codebooks_ = false;
+    std::vector<std::vector<DimensionCodebook>> codebooks_;       // from set_codebooks()
+    std::vector<std::vector<float>> gaussian_codebook_centroids_; // base[bits][entry]
+    std::vector<float> residual_stds_;                            // per-dim std for gaussian path
 
     void allocate_clusters(const std::vector<size_t> &cluster_sizes);
 
@@ -165,6 +172,24 @@ class IVF {
                   std::vector<float> *vars_dist_list = nullptr, QueryRuntimeMetrics *runtime_metrics = nullptr);
 
     size_t k() const { return num_cen_; }
+
+    bool has_codebooks() const { return has_codebooks_; }
+
+    /// Set explicit per-segment, per-dimension codebooks.
+    void set_codebooks(std::vector<std::vector<DimensionCodebook>> cbs) {
+        codebooks_ = std::move(cbs);
+        has_codebooks_ = true;
+    }
+
+    /// Set Gaussian base codebooks + per-dimension variances.
+    /// At construct time, each dim's codebook = base_codebook[bits] * std[dim].
+    void set_gaussian_codebooks(
+        std::vector<std::vector<float>> base_centroids,
+        std::vector<float> residual_stds) {
+        gaussian_codebook_centroids_ = std::move(base_centroids);
+        residual_stds_ = std::move(residual_stds);
+        has_codebooks_ = true;
+    }
 
     void set_variance(FloatVec vars) {
         saq_data_maker_->set_variance(std::move(vars));
