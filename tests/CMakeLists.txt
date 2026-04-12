@@ -10,6 +10,15 @@
 add_executable(test_fit_decompress test_fit_decompress.cpp)
 target_link_libraries(test_fit_decompress PRIVATE saq)
 
+# Faiss from conda needs a newer libstdc++ than spack GCC 12 ships.
+# Put conda's lib dir BEFORE the linker's default search so both link-time
+# and run-time resolution find the newer libstdc++. Also switch to RUNPATH
+# so LD_LIBRARY_PATH can override if needed.
+if(DEFINED ENV{CONDA_PREFIX})
+  target_link_directories(test_fit_decompress BEFORE PRIVATE $ENV{CONDA_PREFIX}/lib)
+  target_link_options(test_fit_decompress PRIVATE "LINKER:--enable-new-dtags")
+endif()
+
 # The saq static library applies AVX-512 flags PRIVATE-ly, but consumers
 # that transitively include fast_scan.h (via index/ivf_index.h) must also
 # compile with AVX-512 enabled, otherwise the static_assert in

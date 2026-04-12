@@ -72,6 +72,7 @@ if(SAQ_BUILD_PYTHON)
 endif()
 
 add_library(saq STATIC)
+set_target_properties(saq PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(saq
   PUBLIC
     ${PROJECT_SOURCE_DIR}/include

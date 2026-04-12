@@ -152,7 +152,51 @@ PYBIND11_MODULE(_saq_core, m) {
              py::arg("filename"), "Load index from file.")
         .def_property_readonly("num_data", &IVF::num_data)
         .def_property_readonly("num_dim", &IVF::num_dim)
-        .def_property_readonly("k", &IVF::k);
+        .def_property_readonly("k", &IVF::k)
+        .def("fit",
+             [](IVF &self, Eigen::Ref<const FloatRowMat> X,
+                bool apply_pca, int K, int seed, int num_threads) {
+                 py::gil_scoped_release release;
+                 self.fit(X, apply_pca, K, seed, num_threads);
+             },
+             py::arg("X"), py::arg("apply_pca") = true,
+             py::arg("K") = 4096, py::arg("seed") = 0,
+             py::arg("num_threads") = 8,
+             "Run preprocessing + construction from raw (N, D) vectors.")
+        .def("decompress",
+             [](IVF &self, py::array_t<uint32_t, py::array::c_style> ids) {
+                 py::buffer_info buf = ids.request();
+                 if (buf.ndim != 1) {
+                     throw std::runtime_error("ids must be a 1D array");
+                 }
+                 const PID *ptr = static_cast<const PID *>(buf.ptr);
+                 size_t n = static_cast<size_t>(buf.shape[0]);
+                 std::vector<PID> id_vec(ptr, ptr + n);
+                 FloatRowMat result;
+                 {
+                     py::gil_scoped_release release;
+                     result = self.decompress(id_vec);
+                 }
+                 return result;
+             },
+             py::arg("ids"),
+             "Approximate reconstruction of vectors by global ID. Returns float32 (n, dim).")
+        .def("set_codebooks",
+             [](IVF & /*self*/, py::object /*codebooks*/) {
+                 throw std::runtime_error(
+                     "This SAQ build does not support set_codebooks. "
+                     "Install the saq-codebook wheel.");
+             },
+             py::arg("codebooks"),
+             "Set codebooks (requires saq-codebook wheel).")
+        .def("set_gaussian_codebooks",
+             [](IVF & /*self*/, py::object /*codebooks*/, py::object /*variances*/) {
+                 throw std::runtime_error(
+                     "This SAQ build does not support set_gaussian_codebooks. "
+                     "Install the saq-codebook wheel.");
+             },
+             py::arg("codebooks"), py::arg("variances"),
+             "Set Gaussian codebooks (requires saq-codebook wheel).");
 
     // ---- Utility functions ----
     m.def("load_fvecs",
