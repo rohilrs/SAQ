@@ -49,7 +49,15 @@ class QuantizerCluster {
 
     virtual ~QuantizerCluster() {}
 
-    virtual void quantize(const FloatRowMat &or_vecs, const FloatVec &centroid, CAQClusterData &clus) const {
+    /// @brief Batch-quantize vectors in a cluster for one segment.
+    /// @param raw_codes_out If non-null, filled with an
+    ///   (num_points, num_dim_pad_) uint16 row-major matrix of the raw
+    ///   integer codes produced by the encoder, captured BEFORE the
+    ///   SIMD-scrambled bit-pack. Used by IVF::fit() to cache codes for
+    ///   decompress(). Default nullptr -> zero overhead enterprise path.
+    virtual void quantize(
+        const FloatRowMat &or_vecs, const FloatVec &centroid, CAQClusterData &clus,
+        Eigen::Matrix<uint16_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> *raw_codes_out = nullptr) const {
         CHECK_EQ(or_vecs.cols(), static_cast<Eigen::Index>(num_dim_pad_))
             << "Input vector dimension does not match quantizer dimension";
         CHECK_EQ(centroid.cols(), static_cast<Eigen::Index>(num_dim_pad_))
@@ -72,14 +80,23 @@ class QuantizerCluster {
             clus.allocate_raw_codes();  // For codebook distance lookup
         }
         ClusterPacker packer(num_dim_pad_, num_bits_, clus, data_->cfg.use_fastscan);
-        QuantBaseCode base_code;
 
+        if (raw_codes_out && num_bits_ > 0) {
+            raw_codes_out->resize(static_cast<Eigen::Index>(num_points),
+                                  static_cast<Eigen::Index>(num_dim_pad_));
+        }
+
+        QuantBaseCode base_code;
         if (codebooks_ && !codebooks_->empty()) {
             CodebookEncoder cb_encoder(num_dim_pad_, num_bits_, data_->cfg);
             cb_encoder.set_codebooks(codebooks_);
             for (size_t i = 0; i < num_points; ++i) {
                 const auto &curr_vec = o_vecs.row(i);
                 cb_encoder.encode_and_fac(curr_vec, base_code, &centroid);
+                if (raw_codes_out && num_bits_ > 0 && base_code.code.size() > 0) {
+                    raw_codes_out->row(static_cast<Eigen::Index>(i)) =
+                        base_code.code.cast<uint16_t>().transpose();
+                }
                 packer.store_and_pack(i, base_code);
                 metrics_.norm_ip_o_oa.insert(base_code.norm_ip_o_oa);
             }
@@ -88,6 +105,10 @@ class QuantizerCluster {
             for (size_t i = 0; i < num_points; ++i) {
                 const auto &curr_vec = o_vecs.row(i);
                 encoder.encode_and_fac(curr_vec, base_code, &centroid);
+                if (raw_codes_out && num_bits_ > 0 && base_code.code.size() > 0) {
+                    raw_codes_out->row(static_cast<Eigen::Index>(i)) =
+                        base_code.code.cast<uint16_t>().transpose();
+                }
                 packer.store_and_pack(i, base_code);
                 metrics_.norm_ip_o_oa.insert(base_code.norm_ip_o_oa);
             }
