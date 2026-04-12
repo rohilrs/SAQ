@@ -62,7 +62,8 @@ class IVF {
     std::unique_ptr<SaqDataMaker> saq_data_maker_;
 
     // Maps global vector ID -> {cluster_idx, local_idx_within_cluster}.
-    // Populated at the end of construct_impl(). Used by decompress() to
+    // Populated by construct() only when raw_codes_out is non-null (the
+    // fit() path). Used by decompress() to
     // locate a vector's slot inside parallel_clusters_.
     std::unordered_map<PID, std::pair<size_t, size_t>> id_to_location_;
 
@@ -113,11 +114,18 @@ class IVF {
     const SaqData *get_saq_data() const { return saq_data_.get(); }
     auto &get_pclusters() const { return parallel_clusters_; }
 
-    void construct(const FloatRowMat &data, const FloatRowMat &centroids, const PID *cluster_ids,
-                   int num_threads = 64, bool use_1_centroid = false);
+    /// Build the IVF index from caller-supplied data, centroids, and
+    /// per-vector cluster assignments. When @p raw_codes_out is non-null,
+    /// this additionally fills it with per-cluster, per-segment raw uint16
+    /// codes and populates id_to_location_ for decompress(). When null
+    /// (default), neither side-effect happens -- the zero-overhead path.
+    void construct(const FloatRowMat &data, const FloatRowMat &centroids,
+                   const PID *cluster_ids, int num_threads = 64,
+                   bool use_1_centroid = false,
+                   std::vector<std::vector<RawCodeMat>> *raw_codes_out = nullptr);
 
     /// Self-contained preprocessing + construction from raw (N, D) vectors.
-    /// Runs PCA (optional), k-means, and construct_impl() internally. Also
+    /// Runs PCA (optional), k-means, and construct() internally. Also
     /// caches raw quantization codes so decompress() can reconstruct the
     /// vectors later.
     void fit(const FloatRowMat &X,
@@ -126,25 +134,24 @@ class IVF {
              int  seed        = 0,
              int  num_threads = 8);
 
-    /// Reconstruct approximate vectors from cached raw codes.
+    /// Approximate reconstruction from cached raw codes.
     /// @param ids global vector IDs (as returned by search()).
     /// @return (ids.size(), num_dim_) matrix in original (pre-PCA) space.
-    /// REQUIRES fit() to have been called (not construct() alone). Throws
-    /// (via CHECK) if raw_codes_ is empty.
+    ///
+    /// The reconstructed vector's L2 norm is forced to equal the original
+    /// vector's norm (via the cached per-vector o_l2norm factor); the
+    /// direction is the CAQ-quantized direction. This differs from the
+    /// internally-stored o_a reconstruction used at search time, but gives
+    /// a usable pre-PCA-space approximation for downstream consumers.
+    ///
+    /// Requires fit() to have been called (not construct() alone); throws
+    /// via CHECK if raw_codes_ is empty. Note that raw codes and PCA state
+    /// are in-memory only -- a saved and re-loaded index does not support
+    /// decompress() until fit() is re-run.
     FloatRowMat decompress(const std::vector<PID> &ids) const;
 
     void save(const char *filename) const;
     void load(const char *filename);
-
-  private:
-    // Shared implementation of construct(). When raw_codes_out is non-null,
-    // populates it with per-cluster, per-segment raw uint16 codes. Always
-    // populates id_to_location_ at the end.
-    void construct_impl(const FloatRowMat &data, const FloatRowMat &centroids,
-                        const PID *cluster_ids, int num_threads, bool use_1_centroid,
-                        std::vector<std::vector<RawCodeMat>> *raw_codes_out);
-
-  public:
 
     template <DistType kDistType = DistType::Any>
     void search(const Eigen::RowVectorXf &ori_query,

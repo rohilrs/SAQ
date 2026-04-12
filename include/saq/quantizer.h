@@ -73,10 +73,11 @@ class QuantizerCluster {
         CAQEncoder encoder(num_dim_pad_, num_bits_, data_->cfg);
         ClusterPacker packer(num_dim_pad_, num_bits_, clus, data_->cfg.use_fastscan);
 
-        if (raw_codes_out) {
+        if (raw_codes_out && num_bits_ > 0) {
             raw_codes_out->resize(static_cast<Eigen::Index>(num_points),
                                   static_cast<Eigen::Index>(num_dim_pad_));
-            raw_codes_out->setZero();
+            // No setZero(): the loop below writes every element via a
+            // single row assignment, so the allocation contents are dead.
         }
 
         QuantBaseCode base_code;
@@ -84,11 +85,11 @@ class QuantizerCluster {
             const auto &curr_vec = o_vecs.row(i);
             encoder.encode_and_fac(curr_vec, base_code, &centroid);
             // Cache raw integer code BEFORE store_and_pack (which may move it).
+            // base_code.code is an Eigen::VectorXi (column vector), so
+            // transpose to fit the (num_points, num_dim_pad_) row-major output.
             if (raw_codes_out && num_bits_ > 0 && base_code.code.size() > 0) {
-                for (Eigen::Index d = 0; d < static_cast<Eigen::Index>(num_dim_pad_); ++d) {
-                    (*raw_codes_out)(static_cast<Eigen::Index>(i), d) =
-                        static_cast<uint16_t>(base_code.code[d]);
-                }
+                raw_codes_out->row(static_cast<Eigen::Index>(i)) =
+                    base_code.code.cast<uint16_t>().transpose();
             }
             packer.store_and_pack(i, base_code);
             metrics_.norm_ip_o_oa.insert(base_code.norm_ip_o_oa);

@@ -24,14 +24,9 @@ void IVF::allocate_clusters(const std::vector<size_t> &cluster_sizes) {
     LOG(INFO) << "Initializing done... num_points: " << num_data_;
 }
 
-void IVF::construct(const FloatRowMat &data, const FloatRowMat &centroids, const PID *cluster_ids,
-                    int num_threads, bool use_1_centroid) {
-    construct_impl(data, centroids, cluster_ids, num_threads, use_1_centroid, nullptr);
-}
-
-void IVF::construct_impl(const FloatRowMat &data, const FloatRowMat &centroids,
-                         const PID *cluster_ids, int num_threads, bool use_1_centroid,
-                         std::vector<std::vector<RawCodeMat>> *raw_codes_out) {
+void IVF::construct(const FloatRowMat &data, const FloatRowMat &centroids,
+                    const PID *cluster_ids, int num_threads, bool use_1_centroid,
+                    std::vector<std::vector<RawCodeMat>> *raw_codes_out) {
     LOG(INFO) << "Start IVF construction...\n";
 
     // 1. prepare initializer
@@ -93,20 +88,28 @@ void IVF::construct_impl(const FloatRowMat &data, const FloatRowMat &centroids,
         LOG(INFO) << "Quantization done. tm: " << tm_ms / 1e3 << " S";
     }
 
-    // 5. Build id -> {cluster_idx, local_idx} map for decompress() and
-    //    other lookup-based operations. Cheap and always useful.
-    id_to_location_.clear();
-    id_to_location_.reserve(num_data_);
-    for (size_t cid = 0; cid < parallel_clusters_.size(); ++cid) {
-        const PID *cluster_ids_ptr = parallel_clusters_[cid].ids();
-        const size_t nv = parallel_clusters_[cid].num_vec_;
-        for (size_t local = 0; local < nv; ++local) {
-            id_to_location_[cluster_ids_ptr[local]] = {cid, local};
+    // 5. Build id -> {cluster_idx, local_idx} map only when the caller
+    //    requested raw codes (i.e. the fit() path). The default
+    //    construct() path stays zero-overhead: ~24 MB per 1M vectors saved.
+    if (raw_codes_out) {
+        id_to_location_.clear();
+        id_to_location_.reserve(num_data_);
+        for (size_t cid = 0; cid < parallel_clusters_.size(); ++cid) {
+            const PID *cluster_ids_ptr = parallel_clusters_[cid].ids();
+            const size_t nv = parallel_clusters_[cid].num_vec_;
+            for (size_t local = 0; local < nv; ++local) {
+                id_to_location_[cluster_ids_ptr[local]] = {cid, local};
+            }
         }
     }
 }
 
 void IVF::fit(const FloatRowMat &X, bool apply_pca, int K, int seed, int num_threads) {
+    // Note: PCA state (pca_mean_, pca_rotation_) and raw_codes_ are held
+    // in-memory only -- they are NOT persisted by save()/load(). A saved
+    // and re-loaded index therefore does not support decompress() until
+    // fit() is re-run. This is intentional: the research bench is a
+    // single-process fit -> search/decompress flow.
     num_data_ = static_cast<size_t>(X.rows());
     num_dim_  = static_cast<size_t>(X.cols());
     num_cen_  = static_cast<size_t>(K);
@@ -136,9 +139,9 @@ void IVF::fit(const FloatRowMat &X, bool apply_pca, int K, int seed, int num_thr
     const FloatRowMat &centroids_proc = pp.kmeans.centroids;
 
     // 4. Single-pass construction with raw-code caching.
-    raw_codes_.clear();  // construct_impl will resize to num_cen_
-    construct_impl(X_proc, centroids_proc, pp.kmeans.assignments.data(),
-                   num_threads, /*use_1_centroid=*/false, &raw_codes_);
+    raw_codes_.clear();  // construct() will resize to num_cen_
+    construct(X_proc, centroids_proc, pp.kmeans.assignments.data(),
+              num_threads, /*use_1_centroid=*/false, &raw_codes_);
 }
 
 FloatRowMat IVF::decompress(const std::vector<PID> &ids) const {
@@ -199,10 +202,14 @@ FloatRowMat IVF::decompress(const std::vector<PID> &ids) const {
 
                 // After rescale_vmx_to1() the stored quantizer is in the
                 // normalized scale: v_mx=1, v_mi=-1, delta = 2/2^num_bits.
-                // Matches CaqCode::get_oa(): oa[d] = code[d]*delta + v_mi
-                // (no +0.5 half-step -- get_oa is what encode_and_fac uses
-                // to compute ip_cent_oa, so the same formula is canonical
-                // for reconstruction).
+                // Canonical half-step reconstruction (matches
+                // CAQEncoder::encode(), code_adjustment(), downUpSample(),
+                // and CaqCluEstimator):
+                //     oa[d] = (code[d] + 0.5) * delta + v_mi
+                // CaqCode::get_oa() uses the non-half-step form, but it's
+                // only consumed by ip_cent_oa as a scaling factor, not as
+                // a reconstruction -- so we deliberately use the canonical
+                // half-step form here.
                 const float v_mi  = -1.0f;
                 const float delta = 2.0f / static_cast<float>(1u << num_bits);
 
@@ -212,7 +219,7 @@ FloatRowMat IVF::decompress(const std::vector<PID> &ids) const {
                         seg_codes(static_cast<Eigen::Index>(local_idx),
                                   static_cast<Eigen::Index>(d)));
                     oa_norm[static_cast<Eigen::Index>(d)] =
-                        static_cast<float>(code_d) * delta + v_mi;
+                        (static_cast<float>(code_d) + 0.5f) * delta + v_mi;
                 }
 
                 // CAQ preserves the residual's L2 norm via o_l2norm. The
@@ -225,6 +232,15 @@ FloatRowMat IVF::decompress(const std::vector<PID> &ids) const {
                 const float norm_oa = oa_norm.norm();
                 if (norm_oa > 1e-9f) {
                     oa_norm *= (o_l2norm / norm_oa);
+                } else {
+                    // Pathological: every code in this segment quantized to
+                    // the mid-bucket, producing a zero direction. We can't
+                    // recover direction here -- leave the segment at zero
+                    // and warn so it doesn't go silently wrong.
+                    LOG(WARNING) << "decompress(): zero-norm oa for vid=" << vid
+                                 << " cid=" << cid << " seg=" << seg
+                                 << " (num_bits=" << num_bits << "); segment "
+                                 << "reconstruction collapses to centroid";
                 }
 
                 // Un-rotate per-segment rotator: (row_vec * P)^-1 = row_vec * P^T.
@@ -279,38 +295,8 @@ void IVF::save(const char *filename) const {
     for (const auto &pclu : parallel_clusters_) {
         pclu.save(output);
     }
-
-    // PCA state (populated by fit(); defaults are fine when only construct() was called).
-    output.write(reinterpret_cast<const char *>(&pca_applied_), sizeof(bool));
-    if (pca_applied_) {
-        const size_t D = static_cast<size_t>(pca_mean_.cols());  // FloatVec is (1, D)
-        output.write(reinterpret_cast<const char *>(&D), sizeof(size_t));
-        output.write(reinterpret_cast<const char *>(pca_mean_.data()), D * sizeof(float));
-        output.write(reinterpret_cast<const char *>(pca_rotation_.data()), D * D * sizeof(float));
-    }
-
-    // Raw codes (optional; only present if fit() was called).
-    const bool has_raw_codes = !raw_codes_.empty();
-    output.write(reinterpret_cast<const char *>(&has_raw_codes), sizeof(bool));
-    if (has_raw_codes) {
-        const size_t nc = raw_codes_.size();
-        output.write(reinterpret_cast<const char *>(&nc), sizeof(size_t));
-        for (const auto &cluster_segs : raw_codes_) {
-            const size_t ns = cluster_segs.size();
-            output.write(reinterpret_cast<const char *>(&ns), sizeof(size_t));
-            for (const auto &m : cluster_segs) {
-                const size_t rows = static_cast<size_t>(m.rows());
-                const size_t cols = static_cast<size_t>(m.cols());
-                output.write(reinterpret_cast<const char *>(&rows), sizeof(size_t));
-                output.write(reinterpret_cast<const char *>(&cols), sizeof(size_t));
-                if (rows > 0 && cols > 0) {
-                    output.write(reinterpret_cast<const char *>(m.data()),
-                                 rows * cols * sizeof(uint16_t));
-                }
-            }
-        }
-    }
-
+    // Note: PCA state and raw_codes_ are intentionally NOT persisted. They
+    // are transient fit()-time artifacts; see fit() for the rationale.
     output.close();
 }
 
@@ -333,55 +319,9 @@ void IVF::load(const char *filename) {
     for (size_t i = 0; i < num_cen_; ++i) {
         parallel_clusters_[i].load(input);
     }
-
-    // PCA state
-    input.read(reinterpret_cast<char *>(&pca_applied_), sizeof(bool));
-    if (pca_applied_) {
-        size_t D = 0;
-        input.read(reinterpret_cast<char *>(&D), sizeof(size_t));
-        pca_mean_.resize(1, static_cast<Eigen::Index>(D));
-        input.read(reinterpret_cast<char *>(pca_mean_.data()), D * sizeof(float));
-        pca_rotation_.resize(static_cast<Eigen::Index>(D), static_cast<Eigen::Index>(D));
-        input.read(reinterpret_cast<char *>(pca_rotation_.data()), D * D * sizeof(float));
-    }
-
-    // Raw codes
-    bool has_raw_codes = false;
-    input.read(reinterpret_cast<char *>(&has_raw_codes), sizeof(bool));
-    raw_codes_.clear();
-    if (has_raw_codes) {
-        size_t nc = 0;
-        input.read(reinterpret_cast<char *>(&nc), sizeof(size_t));
-        raw_codes_.resize(nc);
-        for (size_t c = 0; c < nc; ++c) {
-            size_t ns = 0;
-            input.read(reinterpret_cast<char *>(&ns), sizeof(size_t));
-            raw_codes_[c].resize(ns);
-            for (size_t s = 0; s < ns; ++s) {
-                size_t rows = 0, cols = 0;
-                input.read(reinterpret_cast<char *>(&rows), sizeof(size_t));
-                input.read(reinterpret_cast<char *>(&cols), sizeof(size_t));
-                raw_codes_[c][s].resize(static_cast<Eigen::Index>(rows),
-                                        static_cast<Eigen::Index>(cols));
-                if (rows > 0 && cols > 0) {
-                    input.read(reinterpret_cast<char *>(raw_codes_[c][s].data()),
-                               rows * cols * sizeof(uint16_t));
-                }
-            }
-        }
-    }
-
-    // Rebuild id_to_location_ from loaded cluster data.
-    id_to_location_.clear();
-    id_to_location_.reserve(num_data_);
-    for (size_t cid = 0; cid < parallel_clusters_.size(); ++cid) {
-        const PID *cluster_ids = parallel_clusters_[cid].ids();
-        const size_t nv = parallel_clusters_[cid].num_vec_;
-        for (size_t local = 0; local < nv; ++local) {
-            id_to_location_[cluster_ids[local]] = {cid, local};
-        }
-    }
-
+    // PCA state, raw_codes_, and id_to_location_ are NOT restored. They
+    // are transient; call fit() again if decompress() is needed after a
+    // load().
     input.close();
     LOG(INFO) << "Index loaded\n";
 }
