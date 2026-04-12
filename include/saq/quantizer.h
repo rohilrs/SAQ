@@ -46,8 +46,17 @@ class QuantizerCluster {
 
     virtual ~QuantizerCluster() {}
 
-    virtual void quantize(const FloatRowMat &or_vecs, const FloatVec &centroid, CAQClusterData &clus,
-                          QuantMetrics *out_metrics = nullptr) const {
+    /// @brief Batch-quantize vectors in a cluster for one segment.
+    /// @param raw_codes_out If non-null, filled with an
+    ///   (num_points, num_dim_pad_) uint16 row-major matrix of the raw
+    ///   integer codes produced by the encoder, captured BEFORE the
+    ///   SIMD-scrambled bit-pack. Used by IVF::fit() to cache codes for
+    ///   decompress(). Default nullptr -> zero overhead enterprise path.
+    /// @param out_metrics If non-null, per-vector reconstruction MSE is recorded.
+    virtual void quantize(
+        const FloatRowMat &or_vecs, const FloatVec &centroid, CAQClusterData &clus,
+        Eigen::Matrix<uint16_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> *raw_codes_out = nullptr,
+        QuantMetrics *out_metrics = nullptr) const {
         CHECK_EQ(or_vecs.cols(), static_cast<Eigen::Index>(num_dim_pad_))
             << "Input vector dimension does not match quantizer dimension";
         CHECK_EQ(centroid.cols(), static_cast<Eigen::Index>(num_dim_pad_))
@@ -67,10 +76,24 @@ class QuantizerCluster {
         CAQEncoder encoder(num_dim_pad_, num_bits_, data_->cfg);
         ClusterPacker packer(num_dim_pad_, num_bits_, clus, data_->cfg.use_fastscan);
 
+        if (raw_codes_out && num_bits_ > 0) {
+            raw_codes_out->resize(static_cast<Eigen::Index>(num_points),
+                                  static_cast<Eigen::Index>(num_dim_pad_));
+            // No setZero(): the loop below writes every element via a
+            // single row assignment, so the allocation contents are dead.
+        }
+
         QuantBaseCode base_code;
         for (size_t i = 0; i < num_points; ++i) {
             const auto &curr_vec = o_vecs.row(i);
             encoder.encode_and_fac(curr_vec, base_code, &centroid);
+            // Cache raw integer code BEFORE store_and_pack (which may move it).
+            // base_code.code is an Eigen::VectorXi (column vector), so
+            // transpose to fit the (num_points, num_dim_pad_) row-major output.
+            if (raw_codes_out && num_bits_ > 0 && base_code.code.size() > 0) {
+                raw_codes_out->row(static_cast<Eigen::Index>(i)) =
+                    base_code.code.cast<uint16_t>().transpose();
+            }
             packer.store_and_pack(i, base_code);
             metrics_.norm_ip_o_oa.insert(base_code.norm_ip_o_oa);
             if (out_metrics) {

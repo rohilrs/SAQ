@@ -9,7 +9,7 @@ if(SAQ_REQUIRE_AVX512)
   if(MSVC)
     target_compile_options(_saq_core PRIVATE /arch:AVX512)
   else()
-    target_compile_options(_saq_core PRIVATE -mavx512f -mavx512bw -mavx512dq -mavx512vl)
+    target_compile_options(_saq_core PRIVATE -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma)
   endif()
 endif()
 

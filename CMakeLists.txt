@@ -31,6 +31,7 @@ set(GFLAGS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(GFLAGS_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(GFLAGS_BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
 set(GFLAGS_BUILD_gflags_LIB ON CACHE BOOL "" FORCE)
+set(GFLAGS_BUILD_gflags_nothreads_LIB OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
   gflags
   GIT_REPOSITORY https://github.com/gflags/gflags.git
@@ -39,7 +40,7 @@ FetchContent_Declare(
 )
 
 # glog
-set(WITH_GFLAGS ON CACHE BOOL "" FORCE)
+set(WITH_GFLAGS OFF CACHE BOOL "" FORCE)
 set(WITH_GTEST OFF CACHE BOOL "" FORCE)
 set(WITH_UNWIND OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
@@ -72,6 +73,7 @@ if(SAQ_BUILD_PYTHON)
 endif()
 
 add_library(saq STATIC)
+set_target_properties(saq PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(saq
   PUBLIC
     ${PROJECT_SOURCE_DIR}/include
@@ -88,7 +90,8 @@ if(SAQ_REQUIRE_AVX512)
   if(MSVC)
     target_compile_options(saq PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX512>)
   else()
-    target_compile_options(saq PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mavx512f -mavx512bw -mavx512dq -mavx512vl>)
+    # GCC/Clang need -mfma alongside -mavx512f (Eigen requirement)
+    target_compile_options(saq PRIVATE -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma)
   endif()
   target_compile_definitions(saq PUBLIC SAQ_REQUIRE_AVX512=1)
 endif()
@@ -120,6 +123,24 @@ if(SAQ_BUILD_CUDA)
   target_link_libraries(saq PUBLIC CUDA::cublas CUDA::cudart)
   target_compile_definitions(saq PUBLIC SAQ_USE_CUDA=1)
   message(STATUS "CUDA enabled (architectures: ${CMAKE_CUDA_ARCHITECTURES})")
+endif()
+
+# ---- Faiss / Eigen preprocessing dispatch ----
+if(WIN32)
+    set(SAQ_USE_FAISS_DEFAULT OFF)
+else()
+    set(SAQ_USE_FAISS_DEFAULT ON)
+endif()
+option(SAQ_USE_FAISS "Use Faiss for PCA and k-means (Linux default ON, Windows default OFF)"
+       ${SAQ_USE_FAISS_DEFAULT})
+
+if(SAQ_USE_FAISS)
+    find_package(faiss REQUIRED)
+    target_link_libraries(saq PRIVATE faiss)
+    target_compile_definitions(saq PRIVATE SAQ_USE_FAISS)
+    message(STATUS "SAQ_USE_FAISS=ON: using Faiss for PCA and k-means")
+else()
+    message(STATUS "SAQ_USE_FAISS=OFF: using Eigen BDCSVD fallback for PCA and k-means")
 endif()
 
 if(SAQ_BUILD_TESTS)

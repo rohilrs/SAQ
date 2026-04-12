@@ -14,27 +14,37 @@ if _sys.platform == "win32" and hasattr(_os, "add_dll_directory"):
             if _os.path.isdir(_cuda_dir):
                 _os.add_dll_directory(_cuda_dir)
 
-from ._saq_core import (
-    BaseQuantType,
-    DistType,
-    IVF,
-    QuantizeConfig,
-    QuantSingleConfig,
-    SearcherConfig,
-    load_fvecs,
-    load_ivecs,
-)
+from .benchmark import compute_ground_truth, recall_at_k
 
 __all__ = [
-    "BaseQuantType",
-    "DistType",
-    "IVF",
-    "QuantizeConfig",
-    "QuantSingleConfig",
-    "SearcherConfig",
-    "load_fvecs",
-    "load_ivecs",
+    "compute_ground_truth",
+    "recall_at_k",
 ]
+
+try:
+    from ._saq_core import (
+        BaseQuantType,
+        DistType,
+        IVF,
+        QuantizeConfig,
+        QuantSingleConfig,
+        SearcherConfig,
+        load_fvecs,
+        load_ivecs,
+    )
+except ImportError:
+    pass
+else:
+    __all__ += [
+        "BaseQuantType",
+        "DistType",
+        "IVF",
+        "QuantizeConfig",
+        "QuantSingleConfig",
+        "SearcherConfig",
+        "load_fvecs",
+        "load_ivecs",
+    ]
 
 # GPU support (optional — requires CUDA build)
 try:

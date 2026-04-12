@@ -41,10 +41,23 @@ class SAQuantizer {
         }
     }
 
-    void quantize_cluster(const FloatRowMat &data, const FloatVec &centroid, const std::vector<PID> &IDs,
-                          SaqCluData &saq_clus, QuantMetrics *out_metrics = nullptr) {
+    /// @brief Quantize all vectors in a cluster across all segments.
+    /// @param raw_codes_per_segment If non-null, resized to num_segments_
+    ///   and each slot is filled with the per-segment raw uint16 codes for
+    ///   this cluster. Default nullptr -> zero overhead enterprise path.
+    /// @param out_metrics If non-null, per-vector reconstruction MSE is recorded.
+    void quantize_cluster(
+        const FloatRowMat &data, const FloatVec &centroid, const std::vector<PID> &IDs,
+        SaqCluData &saq_clus,
+        std::vector<Eigen::Matrix<uint16_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> *raw_codes_per_segment = nullptr,
+        QuantMetrics *out_metrics = nullptr) {
         CHECK_EQ(saq_clus.num_segments_, data_quans_.size());
         std::copy(IDs.begin(), IDs.end(), saq_clus.ids());
+
+        if (raw_codes_per_segment) {
+            raw_codes_per_segment->clear();
+            raw_codes_per_segment->resize(saq_clus.num_segments_);
+        }
 
         const size_t num_points = saq_clus.num_vec_;
         for (size_t ci = 0, offset = 0; ci < saq_clus.num_segments_; ++ci) {
@@ -64,7 +77,8 @@ class SAQuantizer {
             cen.head(static_cast<Eigen::Index>(copy_size)) =
                 centroid.segment(static_cast<Eigen::Index>(offset), static_cast<Eigen::Index>(copy_size));
 
-            data_quans_[ci]->quantize(vecs, cen, clus, out_metrics);
+            auto *seg_out = raw_codes_per_segment ? &(*raw_codes_per_segment)[ci] : nullptr;
+            data_quans_[ci]->quantize(vecs, cen, clus, seg_out, out_metrics);
             offset += clus.num_dim_padded_;
         }
     }

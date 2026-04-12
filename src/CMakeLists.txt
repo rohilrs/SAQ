@@ -38,3 +38,20 @@ if(SAQ_BUILD_CUDA)
   )
   target_include_directories(saq PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 endif()
+
+# Preprocessing module (shared across all variants)
+target_sources(saq PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/preprocessing/preprocessing.cpp
+)
+
+if(SAQ_USE_FAISS)
+    target_sources(saq PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/preprocessing/pca_faiss.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/preprocessing/kmeans_faiss.cpp
+    )
+else()
+    target_sources(saq PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/preprocessing/pca_eigen.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/preprocessing/kmeans_eigen.cpp
+    )
+endif()
