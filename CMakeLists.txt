@@ -143,6 +143,9 @@ else()
     message(STATUS "SAQ_USE_FAISS=OFF: using Eigen BDCSVD fallback for PCA and k-means")
 endif()
 
+# gpu-codebook branch: codebook API surface is present but not yet wired
+target_compile_definitions(saq PRIVATE SAQ_ENABLE_CODEBOOK)
+
 if(SAQ_BUILD_TESTS)
   add_subdirectory(tests)
 endif()

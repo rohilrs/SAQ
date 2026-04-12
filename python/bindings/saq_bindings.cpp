@@ -183,20 +183,30 @@ PYBIND11_MODULE(_saq_core, m) {
              "Approximate reconstruction of vectors by global ID. Returns float32 (n, dim).")
         .def("set_codebooks",
              [](IVF & /*self*/, py::object /*codebooks*/) {
+#ifdef SAQ_ENABLE_CODEBOOK
+                 throw std::runtime_error(
+                     "set_codebooks: not yet wired on this branch");
+#else
                  throw std::runtime_error(
                      "This SAQ build does not support set_codebooks. "
                      "Install the saq-codebook wheel.");
+#endif
              },
              py::arg("codebooks"),
-             "Set codebooks (requires saq-codebook wheel).")
+             "Set codebooks. Available on codebook branches only.")
         .def("set_gaussian_codebooks",
              [](IVF & /*self*/, py::object /*codebooks*/, py::object /*variances*/) {
+#ifdef SAQ_ENABLE_CODEBOOK
+                 throw std::runtime_error(
+                     "set_gaussian_codebooks: not yet wired on this branch");
+#else
                  throw std::runtime_error(
                      "This SAQ build does not support set_gaussian_codebooks. "
                      "Install the saq-codebook wheel.");
+#endif
              },
              py::arg("codebooks"), py::arg("variances"),
-             "Set Gaussian codebooks (requires saq-codebook wheel).");
+             "Set Gaussian codebooks. Codebook branches only.");
 
     // ---- Utility functions ----
     m.def("load_fvecs",
