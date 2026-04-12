@@ -1,0 +1,32 @@
+[build-system]
+requires = ["scikit-build-core>=0.9", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "saq"
+version = "0.1.0"
+description = "Scalar Additive Quantization for approximate nearest neighbor search"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.20"]
+
+[project.optional-dependencies]
+preprocessing = ["faiss-cpu>=1.7", "numpy>=1.20"]
+dev = ["pytest>=7.0", "numpy>=1.20", "scikit-learn>=1.1"]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["python/saq"]
+
+[tool.scikit-build.cmake.define]
+SAQ_BUILD_PYTHON = "ON"
+SAQ_USE_OPENMP = "ON"
+SAQ_BUILD_SAMPLES = "OFF"
+SAQ_BUILD_TESTS = "OFF"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+markers = [
+  "requires_bindings: test requires compiled _saq_core extension",
+  "requires_faiss: test requires faiss-cpu installation",
+  "slow: test takes >10 seconds",
+]
