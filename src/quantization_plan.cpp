@@ -33,8 +33,9 @@ void SaqData::load(std::ifstream &input) {
     input.read(reinterpret_cast<char *>(&cfg), sizeof(QuantizeConfig));
     input.read(reinterpret_cast<char *>(&num_dim), sizeof(size_t));
     load_floatvec(input, data_variance);
-    CHECK_EQ(data_variance.cols(), static_cast<Eigen::Index>(num_dim))
-        << "data_variance size mismatch with num_dim";
+    const auto num_dim_padded = rd_up_to_multiple_of(num_dim, kDimPaddingSize);
+    CHECK_EQ(data_variance.cols(), static_cast<Eigen::Index>(num_dim_padded))
+        << "data_variance size mismatch with padded num_dim";
 
     size_t size;
     input.read(reinterpret_cast<char *>(&size), sizeof(size_t));

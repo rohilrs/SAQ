@@ -221,6 +221,13 @@ PYBIND11_MODULE(_saq_core, m) {
                      size_t b = item.first.cast<size_t>();
                      auto arr = item.second.cast<py::array_t<float, py::array::c_style>>();
                      auto buf = arr.request();
+                     size_t expected = static_cast<size_t>(1) << b;
+                     if (static_cast<size_t>(buf.shape[0]) != expected) {
+                         throw std::invalid_argument(
+                             "codebook for bits=" + std::to_string(b) +
+                             " has " + std::to_string(buf.shape[0]) +
+                             " entries, expected " + std::to_string(expected));
+                     }
                      base_centroids[b].assign(
                          static_cast<float*>(buf.ptr),
                          static_cast<float*>(buf.ptr) + buf.shape[0]);
@@ -237,7 +244,7 @@ PYBIND11_MODULE(_saq_core, m) {
              },
              py::arg("codebooks"), py::arg("variances"),
              "Set Gaussian base codebooks + per-dimension variances. "
-             "codebooks: dict {bits: 1D float array}, variances: 1D float array.")
+             "codebooks: dict {bits: 1D float array with 2^bits entries}, variances: 1D float array.")
         .def_property_readonly("has_codebooks", &IVF::has_codebooks);
 
     // ---- Utility functions ----
