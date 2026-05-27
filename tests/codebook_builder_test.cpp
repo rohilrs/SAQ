@@ -123,6 +123,30 @@ void TestLloydRepairDuplicateHeavy() {
     std::printf("TestLloydRepairDuplicateHeavy: OK\n");
 }
 
+void TestLloydVsDp() {
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> v(1200);
+    for (auto& x : v) x = nd(rng);
+
+    saq::LloydOpts opts; opts.max_bits = 6;
+    saq::CodebookResult lloyd = saq::build_codebook_lloyd(v, opts);
+    // num_bins >= n makes the DP *exact* (each point its own bin -> arbitrary
+    // boundaries). Binned DP (num_bins < n) is only optimal among bin-edge
+    // partitions, so its cost can exceed the true optimum and `lloyd >= dp`
+    // would not be a valid invariant. Keep n modest so O(k*B^2) DP stays fast.
+    saq::CodebookResult dp = saq::build_codebook_dp(v, /*max_bits=*/6, /*num_bins=*/1200);
+
+    for (size_t bits = 1; bits <= 6; ++bits) {
+        // DP is the global optimum for contiguous 1-D clustering: Lloyd >= DP.
+        assert(lloyd.costs[bits] >= dp.costs[bits] - 1e-6f);
+        // ...and Lloyd should be close to optimal on smooth (Gaussian) data.
+        double ratio = (dp.costs[bits] > 1e-9f) ? lloyd.costs[bits] / dp.costs[bits] : 1.0;
+        assert(ratio <= 1.15);  // within 15% of optimal
+    }
+    std::printf("TestLloydVsDp: OK\n");
+}
+
 }  // namespace
 
 int main() {
@@ -133,6 +157,7 @@ int main() {
     TestLloydMonotonicAndDeterministic();
     TestLloydDegenerate();
     TestLloydRepairDuplicateHeavy();
+    TestLloydVsDp();
     std::printf("ALL TESTS PASSED\n");
     return 0;
 }
