@@ -12,7 +12,9 @@ namespace saq {
 
 /// Per-dimension result: MSE and codebook at each bit-rate 0..max_bits.
 struct CodebookResult {
-    std::vector<float>             costs;      // [0..max_bits] reconstruction MSE
+    // [0..max_bits] reconstruction MSE; values are histogram-approximate —
+    // SSE is computed over bin-discretized data, not over the raw float values.
+    std::vector<float>             costs;
     std::vector<DimensionCodebook> codebooks;  // [0..max_bits]
 };
 
@@ -28,6 +30,8 @@ struct LloydOpts {
 };
 
 /// DP-optimal contiguous 1-D clustering (the reference). Valid for max_bits <= 8.
+/// Reported costs are MSE over histogram-binned data (bin-discretized), not exact
+/// MSE over raw values; accuracy improves with larger num_bins.
 CodebookResult build_codebook_dp(std::span<const float> values,
                                  size_t max_bits, size_t num_bins = 500);
 

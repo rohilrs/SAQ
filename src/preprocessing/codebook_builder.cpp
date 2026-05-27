@@ -31,6 +31,8 @@ CodebookResult build_codebook_dp(std::span<const float> values,
                        static_cast<size_t>((v - lo) / width)) : 0;
         bc[bi] += 1; bs[bi] += v; bsq[bi] += v * v;
     }
+    // C = per-bin count, S = per-bin sum, Q = per-bin sum-of-squares;
+    // pc/ps/pq = their inclusive prefix sums (length B+1, index 0 is sentinel 0).
     std::vector<double> C, S, Q;
     for (size_t i = 0; i < num_bins; ++i)
         if (bc[i] > 0.5) { C.push_back(bc[i]); S.push_back(bs[i]); Q.push_back(bsq[i]); }
@@ -66,6 +68,8 @@ CodebookResult build_codebook_dp(std::span<const float> values,
             R.codebooks[bits].num_entries = cen.size();
             continue;
         }
+        // INF sentinel: summed double-precision SSE stays well below 1e30 for
+        // the bin counts (<=500) and value ranges used in practice.
         const double INF = 1e30;
         std::vector<double> prev(B), cur(B);
         std::vector<std::vector<int>> split(k, std::vector<int>(B, 0));
@@ -84,6 +88,8 @@ CodebookResult build_codebook_dp(std::span<const float> values,
             prev = cur;
         }
         R.costs[bits] = static_cast<float>(prev[B - 1] / n);
+        // Traceback: runs exactly k iterations (one per cluster j), bounded by j
+        // not by i; split[0] defaults to 0 so the leftmost cluster starts at bin 0.
         std::vector<float> cen; int i = static_cast<int>(B) - 1;
         for (int j = static_cast<int>(k) - 1; j >= 0; --j) {
             int m = split[j][i]; cen.push_back(static_cast<float>(rcen(m, i))); i = m - 1;
