@@ -1,0 +1,22 @@
+# Scavenger config. Primary exclusion is via .gitignore (scavenger's walker
+# honors git_ignore for both source AST and doc indexing). This file is
+# defense-in-depth for doc indexing + capsule/traversal tuning.
+
+[budget]
+default = 8000            # max tokens per capsule
+
+[traversal]
+degree_cap = 30           # skip high-degree utility nodes
+node_budget = 100         # max nodes per BFS traversal
+
+[docs]
+patterns = ["**/*.md", "**/*.markdown"]
+exclude = [
+  "**/node_modules/**",
+  "**/target/**",
+  "**/build/**",
+  "**/build_python/**",
+  "**/_deps/**",
+  "**/.git/**",
+]
+priority = ["CLAUDE.md", "README.md"]
