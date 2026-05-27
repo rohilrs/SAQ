@@ -29,6 +29,9 @@
 
 # Build
 build/
+build_python/
+build*/
+**/_deps/
 bin/
 
 # MSVC debug artifacts
@@ -75,4 +78,10 @@ reference/
 
 # Generated results
 results/
+
+# Scavenger tooling (local; .scavenger is a symlink to native-fs state)
+.scavenger
+.scavenger/
+.mcp.json
+.cursor/
 build_fresh/
