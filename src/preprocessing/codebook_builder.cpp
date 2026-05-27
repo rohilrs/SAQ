@@ -9,6 +9,107 @@
 
 namespace saq {
 
+namespace {
+
+struct Prefix {           // per-point prefix sums over a sorted column
+    std::vector<double> ps, psq;  // size n+1
+    size_t n = 0;
+    double count(size_t a, size_t b) const { return double(b - a + 1); }       // [a,b] inclusive
+    double sum(size_t a, size_t b)   const { return ps[b + 1] - ps[a]; }
+    double mean(size_t a, size_t b)  const { return sum(a, b) / count(a, b); }
+    double sse(size_t a, size_t b)   const {
+        double c = count(a, b), s = sum(a, b);
+        return (psq[b + 1] - psq[a]) - s * s / c;
+    }
+};
+
+Prefix make_prefix(const std::vector<float>& s) {
+    Prefix p; p.n = s.size();
+    p.ps.assign(p.n + 1, 0.0); p.psq.assign(p.n + 1, 0.0);
+    for (size_t i = 0; i < p.n; ++i) {
+        double v = s[i]; p.ps[i + 1] = p.ps[i] + v; p.psq[i + 1] = p.psq[i] + v * v;
+    }
+    return p;
+}
+
+size_t num_distinct(const std::vector<float>& s) {
+    if (s.empty()) return 0;
+    size_t d = 1; for (size_t i = 1; i < s.size(); ++i) if (s[i] != s[i - 1]) ++d;
+    return d;
+}
+
+// Equal-mass quantile init: k centroids = means of k equal-count cells.
+std::vector<double> init_equal_mass(const Prefix& pf, size_t n, size_t k) {
+    std::vector<double> c(k);
+    for (size_t i = 0; i < k; ++i) {
+        size_t a = (i * n) / k, b = ((i + 1) * n) / k;
+        if (b <= a) b = a + 1; if (b > n) b = n;
+        c[i] = pf.mean(a, b - 1);
+    }
+    for (size_t i = 1; i < k; ++i) if (c[i] <= c[i - 1]) c[i] = c[i - 1] + 1e-9;  // strict order
+    return c;
+}
+
+// One Lloyd run for fixed k. Mutates c (sorted asc), returns total SSE.
+double lloyd_k(const std::vector<float>& s, const Prefix& pf, size_t k,
+               std::vector<double>& c, size_t max_iters, float tol) {
+    const size_t n = s.size();
+    std::vector<size_t> bnd(k + 1);
+    auto assign = [&]() {
+        bnd[0] = 0; bnd[k] = n;
+        for (size_t i = 1; i < k; ++i) {
+            float mid = static_cast<float>(0.5 * (c[i - 1] + c[i]));
+            bnd[i] = static_cast<size_t>(
+                std::upper_bound(s.begin(), s.end(), mid) - s.begin());
+        }
+        for (size_t i = 1; i < k; ++i) if (bnd[i] < bnd[i - 1]) bnd[i] = bnd[i - 1];
+    };
+    for (size_t iter = 0; iter < max_iters; ++iter) {
+        assign();
+        double maxmove = 0.0;
+        for (size_t i = 0; i < k; ++i) {
+            size_t a = bnd[i], b = bnd[i + 1];
+            double nc = (b > a) ? pf.mean(a, b - 1) : c[i];
+            maxmove = std::max(maxmove, std::fabs(nc - c[i])); c[i] = nc;
+        }
+        // empty-cell repair: split the highest-SSE cell
+        bool repaired = false;
+        for (size_t i = 0; i < k; ++i) {
+            if (bnd[i + 1] <= bnd[i]) {
+                size_t best = 0; double bsse = -1.0;
+                for (size_t j = 0; j < k; ++j) {
+                    size_t a = bnd[j], b = bnd[j + 1];
+                    if (b > a + 1) { double e = pf.sse(a, b - 1); if (e > bsse) { bsse = e; best = j; } }
+                }
+                size_t a = bnd[best], b = bnd[best + 1];
+                if (b - a >= 2) {
+                    size_t m = a + (b - a) / 2;
+                    c[best] = pf.mean(a, m - 1); c[i] = pf.mean(m, b - 1); repaired = true;
+                }
+            }
+        }
+        if (repaired) {
+            std::sort(c.begin(), c.end());
+            for (size_t i = 1; i < k; ++i) if (c[i] <= c[i - 1]) c[i] = c[i - 1] + 1e-9;
+            continue;
+        }
+        if (maxmove < tol) break;
+    }
+    assign();
+    double sse = 0.0;
+    for (size_t i = 0; i < k; ++i) { size_t a = bnd[i], b = bnd[i + 1]; if (b > a) sse += pf.sse(a, b - 1); }
+    return sse;
+}
+
+// Init dispatch (Task 4 extends with Uniform/KMeans++).
+std::vector<double> init_centroids(const std::vector<float>& s, const Prefix& pf,
+                                   size_t k, const LloydOpts& opts, size_t /*restart*/) {
+    (void)s; (void)opts;
+    return init_equal_mass(pf, pf.n, k);
+}
+
+}  // namespace
+
 CodebookResult build_codebook_dp(std::span<const float> values,
                                  size_t max_bits, size_t num_bins) {
     CHECK_LE(max_bits, 8u) << "DP reference only valid for <= 8 bits";
@@ -100,8 +201,47 @@ CodebookResult build_codebook_dp(std::span<const float> values,
     }
     return R;
 }
-CodebookResult build_codebook_lloyd(std::span<const float>, const LloydOpts&) {
-    return {};  // Task 2
+CodebookResult build_codebook_lloyd(std::span<const float> values, const LloydOpts& opts) {
+    CodebookResult R;
+    R.costs.assign(opts.max_bits + 1, 0.f);
+    R.codebooks.assign(opts.max_bits + 1, {});
+    const size_t n = values.size();
+    if (n == 0) return R;
+
+    std::vector<float> s(values.begin(), values.end());
+    std::sort(s.begin(), s.end());
+    Prefix pf = make_prefix(s);
+    const size_t ndist = num_distinct(s);
+
+    R.costs[0] = static_cast<float>(pf.sse(0, n - 1) / n);
+    R.codebooks[0].centroids = { static_cast<float>(pf.mean(0, n - 1)) };
+    R.codebooks[0].num_entries = 1;
+
+    for (size_t bits = 1; bits <= opts.max_bits; ++bits) {
+        const size_t k = size_t(1) << bits;
+        if (k >= ndist) {  // degenerate: every distinct value is its own centroid
+            std::vector<float> cen;
+            for (size_t i = 0; i < n; ++i) if (i == 0 || s[i] != s[i - 1]) cen.push_back(s[i]);
+            R.codebooks[bits].centroids = cen;
+            R.codebooks[bits].num_entries = cen.size();
+            R.costs[bits] = 0.f;
+            continue;
+        }
+        double best_sse = std::numeric_limits<double>::infinity();
+        std::vector<double> best_c;
+        const size_t restarts = std::max<size_t>(1, opts.restarts);
+        for (size_t r = 0; r < restarts; ++r) {
+            std::vector<double> c = init_centroids(s, pf, k, opts, r);
+            double sse = lloyd_k(s, pf, k, c, opts.max_iters, opts.tol);
+            if (sse < best_sse) { best_sse = sse; best_c = c; }
+        }
+        std::vector<float> cen(best_c.begin(), best_c.end());
+        std::sort(cen.begin(), cen.end());
+        R.codebooks[bits].centroids = cen;
+        R.codebooks[bits].num_entries = cen.size();
+        R.costs[bits] = static_cast<float>(best_sse / n);
+    }
+    return R;
 }
 std::vector<CodebookResult> build_all_dims(const FloatRowMat&, const LloydOpts&) {
     return {};  // Task 5
