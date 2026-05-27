@@ -104,6 +104,25 @@ void TestLloydDegenerate() {
     std::printf("TestLloydDegenerate: OK\n");
 }
 
+// Duplicate-heavy input forces empty-cell repair: 990 zeros + 10 distinct
+// values means equal-mass init places several coincident centroids in the
+// zero mass, so cells go empty and must be repaired.
+void TestLloydRepairDuplicateHeavy() {
+    std::vector<float> v(990, 0.f);
+    for (int i = 1; i <= 10; ++i) v.push_back(static_cast<float>(i));  // 11 distinct values
+    saq::LloydOpts opts; opts.max_bits = 3;  // k up to 8 < 11 distinct -> Lloyd path
+    saq::CodebookResult r = saq::build_codebook_lloyd(v, opts);
+    for (size_t bits = 1; bits <= 3; ++bits) {
+        const auto& cb = r.codebooks[bits].centroids;
+        assert(r.codebooks[bits].num_entries == cb.size());           // honest count
+        assert(std::adjacent_find(cb.begin(), cb.end()) == cb.end()); // no duplicate centroids
+        for (size_t i = 1; i < cb.size(); ++i) assert(cb[i] > cb[i - 1]); // strictly increasing
+        assert(std::isfinite(r.costs[bits]));
+        assert(r.costs[bits] <= r.costs[bits - 1] + 1e-6f);           // monotone
+    }
+    std::printf("TestLloydRepairDuplicateHeavy: OK\n");
+}
+
 }  // namespace
 
 int main() {
@@ -113,6 +132,7 @@ int main() {
     TestDpMonotonicMultiBit();
     TestLloydMonotonicAndDeterministic();
     TestLloydDegenerate();
+    TestLloydRepairDuplicateHeavy();
     std::printf("ALL TESTS PASSED\n");
     return 0;
 }

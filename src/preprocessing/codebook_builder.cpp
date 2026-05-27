@@ -38,6 +38,15 @@ size_t num_distinct(const std::vector<float>& s) {
     return d;
 }
 
+// Make centroids strictly increasing using a magnitude-relative epsilon, so the
+// gap survives the later narrowing to float even at large value magnitudes
+// (float ULP ~ |x|*1.2e-7; |x|*1e-6 stays above it).
+void nudge_strictly_increasing(std::vector<double>& c) {
+    for (size_t i = 1; i < c.size(); ++i)
+        if (c[i] <= c[i - 1])
+            c[i] = c[i - 1] + std::max(1e-9, std::fabs(c[i - 1]) * 1e-6);
+}
+
 // Equal-mass quantile init: k centroids = means of k equal-count cells.
 std::vector<double> init_equal_mass(const Prefix& pf, size_t n, size_t k) {
     std::vector<double> c(k);
@@ -46,7 +55,7 @@ std::vector<double> init_equal_mass(const Prefix& pf, size_t n, size_t k) {
         if (b <= a) b = a + 1; if (b > n) b = n;
         c[i] = pf.mean(a, b - 1);
     }
-    for (size_t i = 1; i < k; ++i) if (c[i] <= c[i - 1]) c[i] = c[i - 1] + 1e-9;  // strict order
+    nudge_strictly_increasing(c);
     return c;
 }
 
@@ -64,6 +73,8 @@ double lloyd_k(const std::vector<float>& s, const Prefix& pf, size_t k,
         }
         for (size_t i = 1; i < k; ++i) if (bnd[i] < bnd[i - 1]) bnd[i] = bnd[i - 1];
     };
+    size_t repairs_done = 0;
+    const size_t repair_budget = 2 * k;  // cap so pathological oscillation can't starve convergence
     for (size_t iter = 0; iter < max_iters; ++iter) {
         assign();
         double maxmove = 0.0;
@@ -72,27 +83,34 @@ double lloyd_k(const std::vector<float>& s, const Prefix& pf, size_t k,
             double nc = (b > a) ? pf.mean(a, b - 1) : c[i];
             maxmove = std::max(maxmove, std::fabs(nc - c[i])); c[i] = nc;
         }
-        // empty-cell repair: split the highest-SSE cell
+        // Empty-cell repair: at most ONE split per iteration. Repairing every
+        // empty cell at once against the stale bnd[] lets two empties target the
+        // same donor and clobber each other; doing one split then reassigning
+        // next iteration avoids that. Bounded by repair_budget so a pathological
+        // oscillation cannot starve the convergence check.
         bool repaired = false;
-        for (size_t i = 0; i < k; ++i) {
-            if (bnd[i + 1] <= bnd[i]) {
-                size_t best = 0; double bsse = -1.0;
+        if (repairs_done < repair_budget) {
+            size_t empty_i = k;
+            for (size_t i = 0; i < k; ++i) if (bnd[i + 1] <= bnd[i]) { empty_i = i; break; }
+            if (empty_i < k) {
+                size_t best = k; double bsse = -1.0;
                 for (size_t j = 0; j < k; ++j) {
                     size_t a = bnd[j], b = bnd[j + 1];
                     if (b > a + 1) { double e = pf.sse(a, b - 1); if (e > bsse) { bsse = e; best = j; } }
                 }
-                size_t a = bnd[best], b = bnd[best + 1];
-                if (b - a >= 2) {
+                if (best < k) {  // a splittable donor exists (guaranteed when k < ndist)
+                    size_t a = bnd[best], b = bnd[best + 1];
                     size_t m = a + (b - a) / 2;
-                    c[best] = pf.mean(a, m - 1); c[i] = pf.mean(m, b - 1); repaired = true;
+                    c[best]    = pf.mean(a, m - 1);  // donor lower half
+                    c[empty_i] = pf.mean(m, b - 1);  // empty slot takes upper half
+                    std::sort(c.begin(), c.end());
+                    nudge_strictly_increasing(c);
+                    ++repairs_done;
+                    repaired = true;
                 }
             }
         }
-        if (repaired) {
-            std::sort(c.begin(), c.end());
-            for (size_t i = 1; i < k; ++i) if (c[i] <= c[i - 1]) c[i] = c[i - 1] + 1e-9;
-            continue;
-        }
+        if (repaired) continue;   // reassign with repaired centroids next iteration
         if (maxmove < tol) break;
     }
     assign();
@@ -237,6 +255,9 @@ CodebookResult build_codebook_lloyd(std::span<const float> values, const LloydOp
         }
         std::vector<float> cen(best_c.begin(), best_c.end());
         std::sort(cen.begin(), cen.end());
+        // Drop any centroids that coincide after narrowing to float so num_entries
+        // honestly reflects the distinct codebook size.
+        cen.erase(std::unique(cen.begin(), cen.end()), cen.end());
         R.codebooks[bits].centroids = cen;
         R.codebooks[bits].num_entries = cen.size();
         R.costs[bits] = static_cast<float>(best_sse / n);
