@@ -119,11 +119,126 @@ double lloyd_k(const std::vector<float>& s, const Prefix& pf, size_t k,
     return sse;
 }
 
-// Init dispatch (Task 4 extends with Uniform/KMeans++).
+// Uniform-spaced init: k centroids evenly spaced over [min, max].
+std::vector<double> init_uniform(const std::vector<float>& s, size_t k) {
+    std::vector<double> c(k);
+    const double lo = s.front(), hi = s.back();
+    if (hi <= lo) {                       // degenerate: all values equal
+        std::fill(c.begin(), c.end(), lo);
+    } else {
+        for (size_t i = 0; i < k; ++i)
+            c[i] = lo + (hi - lo) * (static_cast<double>(i) + 0.5) / static_cast<double>(k);
+    }
+    nudge_strictly_increasing(c);
+    return c;
+}
+
+// k-means++ (D^2-weighted) seeding over the sorted values.
+// D^2(x) = squared distance to nearest already-chosen center; next center
+// sampled with probability proportional to D^2.
+std::vector<double> init_kmeanspp(const std::vector<float>& s, size_t k, uint64_t seed) {
+    const size_t n = s.size();
+    std::mt19937_64 rng(seed);
+    std::vector<double> centers;
+    centers.reserve(k);
+    // First center: uniform random point.
+    centers.push_back(s[std::uniform_int_distribution<size_t>(0, n - 1)(rng)]);
+    // Nearest-center squared distance for every point.
+    std::vector<double> d2(n);
+    for (size_t i = 0; i < n; ++i) {
+        double diff = double(s[i]) - centers[0];
+        d2[i] = diff * diff;
+    }
+    while (centers.size() < k) {
+        double total = 0.0;
+        for (double v : d2) total += v;
+        size_t chosen;
+        if (total <= 0.0) {  // all remaining points coincide with centers
+            chosen = std::uniform_int_distribution<size_t>(0, n - 1)(rng);
+        } else {
+            double target = std::uniform_real_distribution<double>(0.0, total)(rng);
+            double acc = 0.0;
+            chosen = n - 1;
+            for (size_t i = 0; i < n; ++i) {
+                acc += d2[i];
+                if (acc >= target) { chosen = i; break; }
+            }
+        }
+        double cv = s[chosen];
+        centers.push_back(cv);
+        // Update nearest-center distances.
+        for (size_t i = 0; i < n; ++i) {
+            double diff = double(s[i]) - cv;
+            double dd = diff * diff;
+            if (dd < d2[i]) d2[i] = dd;
+        }
+    }
+    std::sort(centers.begin(), centers.end());
+    nudge_strictly_increasing(centers);
+    return centers;
+}
+
+// Cube-root-density (companding) init. Optimal scalar-quantizer point density
+// is proportional to f(x)^(1/3); we approximate f via a histogram and place
+// centroids at equal increments of the cube-root-density CDF.
+std::vector<double> init_cuberoot(const std::vector<float>& s, size_t k) {
+    std::vector<double> c(k);
+    const double lo = s.front(), hi = s.back();
+    if (hi <= lo) {                       // degenerate: all values equal
+        std::fill(c.begin(), c.end(), lo);
+        nudge_strictly_increasing(c);
+        return c;
+    }
+    const size_t B = 1000;
+    const double width = (hi - lo) / static_cast<double>(B);
+    std::vector<double> count(B, 0.0);
+    for (float x : s) {
+        size_t b = static_cast<size_t>((double(x) - lo) / width);
+        if (b >= B) b = B - 1;            // hi maps to last bin
+        count[b] += 1.0;
+    }
+    // g[b] = pow(count/width, 1/3) * width = pow(count,1/3) * pow(width,2/3)
+    // cumulative G[b].
+    std::vector<double> G(B);
+    double acc = 0.0;
+    for (size_t b = 0; b < B; ++b) {
+        double g = (count[b] > 0.0) ? std::cbrt(count[b]) * std::pow(width, 2.0 / 3.0) : 0.0;
+        acc += g;
+        G[b] = acc;
+    }
+    const double Gtot = G[B - 1];
+    for (size_t i = 0; i < k; ++i) {
+        double t = (static_cast<double>(i) + 0.5) / static_cast<double>(k) * Gtot;
+        // First bin whose cumulative G crosses t.
+        size_t b = static_cast<size_t>(
+            std::lower_bound(G.begin(), G.end(), t) - G.begin());
+        if (b >= B) b = B - 1;
+        // Interpolate within the bin using the fraction of this bin's mass
+        // needed to reach t.
+        double Gprev = (b > 0) ? G[b - 1] : 0.0;
+        double gbin = G[b] - Gprev;
+        double frac = (gbin > 0.0) ? (t - Gprev) / gbin : 0.5;
+        if (frac < 0.0) frac = 0.0; if (frac > 1.0) frac = 1.0;
+        c[i] = lo + (static_cast<double>(b) + frac) * width;
+    }
+    nudge_strictly_increasing(c);
+    return c;
+}
+
+// Init dispatch honoring opts.init and the restart index.
 std::vector<double> init_centroids(const std::vector<float>& s, const Prefix& pf,
-                                   size_t k, const LloydOpts& opts, size_t /*restart*/) {
-    (void)s; (void)opts;
-    return init_equal_mass(pf, pf.n, k);
+                                   size_t k, const LloydOpts& opts, size_t restart) {
+    switch (opts.init) {
+        case CodebookInit::UniformSpaced:
+            return init_uniform(s, k);
+        case CodebookInit::KMeansPlusPlus:
+            return init_kmeanspp(s, k, opts.seed + restart);
+        case CodebookInit::CubeRootDensity:
+            return init_cuberoot(s, k);
+        case CodebookInit::EqualMassQuantile:
+        default:
+            return init_equal_mass(pf, pf.n, k);
+    }
 }
 
 }  // namespace
@@ -226,20 +341,39 @@ CodebookResult build_codebook_lloyd(std::span<const float> values, const LloydOp
     const size_t n = values.size();
     if (n == 0) return R;
 
-    std::vector<float> s(values.begin(), values.end());
+    // Build the working set: full data, or a deterministic random sample.
+    std::vector<float> s;
+    if (opts.sample_size > 0 && opts.sample_size < n) {
+        const size_t m = opts.sample_size;
+        s.resize(m);
+        std::mt19937_64 rng(opts.seed);
+        // Sample m indices without replacement (partial Fisher-Yates over an
+        // index permutation would be O(n); reservoir sampling keeps it O(n)
+        // and deterministic given the seed).
+        std::vector<size_t> idx(n);
+        for (size_t i = 0; i < n; ++i) idx[i] = i;
+        for (size_t i = 0; i < m; ++i) {
+            size_t j = i + std::uniform_int_distribution<size_t>(0, n - 1 - i)(rng);
+            std::swap(idx[i], idx[j]);
+            s[i] = values[idx[i]];
+        }
+    } else {
+        s.assign(values.begin(), values.end());
+    }
+    const size_t ns = s.size();
     std::sort(s.begin(), s.end());
     Prefix pf = make_prefix(s);
     const size_t ndist = num_distinct(s);
 
-    R.costs[0] = static_cast<float>(pf.sse(0, n - 1) / n);
-    R.codebooks[0].centroids = { static_cast<float>(pf.mean(0, n - 1)) };
+    R.costs[0] = static_cast<float>(pf.sse(0, ns - 1) / ns);
+    R.codebooks[0].centroids = { static_cast<float>(pf.mean(0, ns - 1)) };
     R.codebooks[0].num_entries = 1;
 
     for (size_t bits = 1; bits <= opts.max_bits; ++bits) {
         const size_t k = size_t(1) << bits;
         if (k >= ndist) {  // degenerate: every distinct value is its own centroid
             std::vector<float> cen;
-            for (size_t i = 0; i < n; ++i) if (i == 0 || s[i] != s[i - 1]) cen.push_back(s[i]);
+            for (size_t i = 0; i < ns; ++i) if (i == 0 || s[i] != s[i - 1]) cen.push_back(s[i]);
             R.codebooks[bits].centroids = cen;
             R.codebooks[bits].num_entries = cen.size();
             R.costs[bits] = 0.f;
@@ -260,12 +394,24 @@ CodebookResult build_codebook_lloyd(std::span<const float> values, const LloydOp
         cen.erase(std::unique(cen.begin(), cen.end()), cen.end());
         R.codebooks[bits].centroids = cen;
         R.codebooks[bits].num_entries = cen.size();
-        R.costs[bits] = static_cast<float>(best_sse / n);
+        R.costs[bits] = static_cast<float>(best_sse / ns);
     }
     return R;
 }
 std::vector<CodebookResult> build_all_dims(const FloatRowMat&, const LloydOpts&) {
     return {};  // Task 5
+}
+
+float codebook_mse(std::span<const float> values, const DimensionCodebook& cb) {
+    const size_t n = values.size();
+    if (n == 0 || cb.num_entries == 0) return 0.f;
+    double sse = 0.0;
+    for (float v : values) {
+        int idx = cb.nearest(v);
+        double diff = double(v) - cb.centroid_value(idx);
+        sse += diff * diff;
+    }
+    return static_cast<float>(sse / static_cast<double>(n));
 }
 
 }  // namespace saq

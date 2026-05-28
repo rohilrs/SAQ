@@ -147,6 +147,36 @@ void TestLloydVsDp() {
     std::printf("TestLloydVsDp: OK\n");
 }
 
+// Run a non-default init on 3000 N(0,1) samples and validate the resulting
+// codebook: full size at the top bit-rate, strictly-increasing centroids, and
+// MSE that beats the 0-bit codebook and is finite.
+void TestInitVariant(saq::CodebookInit init, const char* name) {
+    std::mt19937 rng(2024);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> v(3000);
+    for (auto& x : v) x = nd(rng);
+
+    saq::LloydOpts opts;
+    opts.max_bits = 6;
+    opts.init = init;
+    saq::CodebookResult r = saq::build_codebook_lloyd(v, opts);
+
+    for (size_t bits = 1; bits <= opts.max_bits; ++bits) {
+        const auto& cb = r.codebooks[bits];
+        assert(cb.num_entries <= (size_t(1) << bits));        // <= 2^bits (dedup allowed)
+        assert(cb.num_entries == cb.centroids.size());        // honest count
+        for (size_t i = 1; i < cb.centroids.size(); ++i)
+            assert(cb.centroids[i] > cb.centroids[i - 1]);     // strictly increasing
+        float mse = saq::codebook_mse(v, cb);
+        assert(std::isfinite(mse));
+        assert(mse <= r.costs[0] + 1e-6f);                    // better than 0-bit
+    }
+    // At max_bits the full-resolution codebook should be exactly 2^bits here
+    // (3000 distinct Gaussian samples >> 64).
+    assert(r.codebooks[opts.max_bits].num_entries == (size_t(1) << opts.max_bits));
+    std::printf("TestInitVariant[%s]: OK\n", name);
+}
+
 }  // namespace
 
 int main() {
@@ -157,6 +187,9 @@ int main() {
     TestLloydMonotonicAndDeterministic();
     TestLloydDegenerate();
     TestLloydRepairDuplicateHeavy();
+    TestInitVariant(saq::CodebookInit::UniformSpaced, "UniformSpaced");
+    TestInitVariant(saq::CodebookInit::KMeansPlusPlus, "KMeansPlusPlus");
+    TestInitVariant(saq::CodebookInit::CubeRootDensity, "CubeRootDensity");
     TestLloydVsDp();
     std::printf("ALL TESTS PASSED\n");
     return 0;

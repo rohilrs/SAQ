@@ -18,15 +18,24 @@ struct CodebookResult {
     std::vector<DimensionCodebook> codebooks;  // [0..max_bits]
 };
 
-enum class CodebookInit { EqualMassQuantile, UniformSpaced, KMeansPlusPlus };
+enum class CodebookInit {
+    EqualMassQuantile,
+    UniformSpaced,
+    KMeansPlusPlus,
+    CubeRootDensity
+};
 
 struct LloydOpts {
-    size_t       max_bits  = 13;
-    CodebookInit init      = CodebookInit::EqualMassQuantile;
-    size_t       restarts  = 1;
-    size_t       max_iters = 50;
-    float        tol        = 1e-6f;  // centroid max-move convergence
-    uint64_t     seed       = 0;      // only used for KMeansPlusPlus
+    size_t       max_bits    = 13;
+    CodebookInit init        = CodebookInit::EqualMassQuantile;
+    size_t       restarts    = 1;
+    size_t       max_iters   = 50;
+    float        tol         = 1e-6f;  // centroid max-move convergence
+    uint64_t     seed        = 0;      // KMeansPlusPlus seeding + sampling
+    // 0 = use full data; >0 = build the codebook on a deterministic random
+    // sample of this many points (seeded by `seed`). The returned centroids
+    // are still the deliverable; reported costs are on the sample.
+    size_t       sample_size = 0;
 };
 
 /// DP-optimal contiguous 1-D clustering (the reference). Valid for max_bits <= 8.
@@ -42,5 +51,9 @@ CodebookResult build_codebook_lloyd(std::span<const float> values,
 /// Build per-dimension Lloyd codebooks for every column of `data` (parallel).
 std::vector<CodebookResult> build_all_dims(const FloatRowMat& data,
                                            const LloydOpts& opts);
+
+/// Mean squared reconstruction error of `values` under codebook `cb`
+/// (each value mapped to its nearest centroid). Brute-force via cb.nearest.
+float codebook_mse(std::span<const float> values, const DimensionCodebook& cb);
 
 }  // namespace saq
