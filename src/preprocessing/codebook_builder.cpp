@@ -389,9 +389,16 @@ CodebookResult build_codebook_lloyd(std::span<const float> values, const LloydOp
         }
         std::vector<float> cen(best_c.begin(), best_c.end());
         std::sort(cen.begin(), cen.end());
-        // Drop any centroids that coincide after narrowing to float so num_entries
-        // honestly reflects the distinct codebook size.
+        // Drop any centroids that coincide after narrowing to float.
         cen.erase(std::unique(cen.begin(), cen.end()), cen.end());
+        // Pad back up to 2^bits so per-dim codebooks in the same segment are
+        // uniform in size — required by the GPU codebook upload, which reads
+        // a single num_entries per segment. Padding with the last centroid is
+        // a no-op for nearest() (duplicates collapse in binary search). The
+        // resulting codebook is non-decreasing with strict increase among the
+        // unique prefix; trailing duplicates exist only when dedup removed entries.
+        const size_t k_target = size_t(1) << bits;
+        while (cen.size() < k_target) cen.push_back(cen.back());
         R.codebooks[bits].centroids = cen;
         R.codebooks[bits].num_entries = cen.size();
         R.costs[bits] = static_cast<float>(best_sse / ns);

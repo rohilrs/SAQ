@@ -116,8 +116,10 @@ void TestLloydRepairDuplicateHeavy() {
     for (size_t bits = 1; bits <= 3; ++bits) {
         const auto& cb = r.codebooks[bits].centroids;
         assert(r.codebooks[bits].num_entries == cb.size());           // honest count
-        assert(std::adjacent_find(cb.begin(), cb.end()) == cb.end()); // no duplicate centroids
-        for (size_t i = 1; i < cb.size(); ++i) assert(cb[i] > cb[i - 1]); // strictly increasing
+        assert(r.codebooks[bits].num_entries == (size_t(1) << bits)); // padded to 2^bits
+        // After dedup+pad, centroids are non-decreasing with strict increase among
+        // unique values; trailing duplicates are allowed when dedup removed entries.
+        for (size_t i = 1; i < cb.size(); ++i) assert(cb[i] >= cb[i - 1]);
         assert(std::isfinite(r.costs[bits]));
         assert(r.costs[bits] <= r.costs[bits - 1] + 1e-6f);           // monotone
     }
@@ -168,10 +170,12 @@ void TestInitVariant(saq::CodebookInit init, const char* name) {
 
     for (size_t bits = 1; bits <= opts.max_bits; ++bits) {
         const auto& cb = r.codebooks[bits];
-        assert(cb.num_entries <= (size_t(1) << bits));        // <= 2^bits (dedup allowed)
+        assert(cb.num_entries == (size_t(1) << bits));        // always 2^bits after dedup+pad
         assert(cb.num_entries == cb.centroids.size());        // honest count
+        // Non-decreasing; strictly increasing in the unique prefix (trailing
+        // duplicate entries are allowed when dedup removed collisions).
         for (size_t i = 1; i < cb.centroids.size(); ++i)
-            assert(cb.centroids[i] > cb.centroids[i - 1]);     // strictly increasing
+            assert(cb.centroids[i] >= cb.centroids[i - 1]);
         float mse = saq::codebook_mse(v, cb);
         assert(std::isfinite(mse));
         assert(mse <= r.costs[0] + 1e-6f);                    // better than 0-bit
@@ -219,12 +223,15 @@ void TestBuildAllDims() {
 }
 
 void TestNativeDerivationEndToEnd() {
-    // D must be a multiple of kDimPaddingSize (64) when calling construct()
-    // directly, since compute_variance() checks data.cols() == num_dim_padded_.
-    const int N = 1000, D = 64, K = 4;
+    // D must be a multiple of kDimPaddingSize (64). Use D=128 so the DP
+    // allocator has at least 2 blocks (max_num_segs >= 1 at avg_bits=4) and
+    // can produce non-zero-bit segments, which exercises the codebook
+    // selection logic in construct().
+    const int N = 1000, D = 128, K = 4;
     saq::FloatRowMat data(N, D);
     std::mt19937 rng(9);
-    std::normal_distribution<float> nd(0.f, 1.f);
+    // Scale by 10 so the DP sees meaningful variance differences across dims.
+    std::normal_distribution<float> nd(0.f, 10.f);
     for (int i = 0; i < N; ++i)
         for (int d = 0; d < D; ++d) data(i, d) = nd(rng);
 
@@ -240,9 +247,39 @@ void TestNativeDerivationEndToEnd() {
     ivf.set_derive_codebooks(opts);
     ivf.construct(data, centroids, cluster_ids.data());  // must not crash; derives natively
 
-    assert(ivf.get_saq_data()->segment_codebooks.size() ==
-           ivf.get_saq_data()->quant_plan.size());
-    assert(!ivf.get_saq_data()->codebook_costs.empty());
+    const auto& sd = *ivf.get_saq_data();
+
+    // Print the quant_plan so failures are diagnosable.
+    for (auto [dl, bb] : sd.quant_plan)
+        std::printf("  seg dim_len=%zu bits=%zu\n", dl, bb);
+
+    assert(sd.segment_codebooks.size() == sd.quant_plan.size());
+    assert(!sd.codebook_costs.empty());
+
+    // Per-dim costs vector populated for every dim.
+    assert(sd.codebook_costs.size() == static_cast<size_t>(D));
+    for (const auto& c : sd.codebook_costs) {
+        assert(c.size() == opts.max_bits + 1);
+        for (size_t b = 1; b < c.size(); ++b) assert(c[b] <= c[b - 1] + 1e-6f); // monotone
+    }
+
+    // For every non-zero-bit segment, codebooks_ entries match expected shape.
+    bool saw_nonzero_segment = false;
+    for (size_t s = 0; s < sd.quant_plan.size(); ++s) {
+        const size_t dim_len = sd.quant_plan[s].first;
+        const size_t bits    = sd.quant_plan[s].second;
+        if (bits == 0) continue;
+        saw_nonzero_segment = true;
+        assert(sd.segment_codebooks[s].size() == dim_len);
+        for (size_t j = 0; j < dim_len; ++j) {
+            assert(sd.segment_codebooks[s][j].num_entries == (size_t(1) << bits));
+            // sorted-ascending (non-decreasing) invariant
+            const auto& cv = sd.segment_codebooks[s][j].centroids;
+            for (size_t i = 1; i < cv.size(); ++i) assert(cv[i] >= cv[i - 1]);
+        }
+    }
+    assert(saw_nonzero_segment && "test config produced no non-zero-bit segments; bump avg_bits or D");
+
     std::printf("TestNativeDerivationEndToEnd: OK\n");
 }
 

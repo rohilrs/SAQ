@@ -181,6 +181,7 @@ class IVF {
 
     /// Set explicit per-segment, per-dimension codebooks.
     void set_codebooks(std::vector<std::vector<DimensionCodebook>> cbs) {
+        CHECK(!derive_codebooks_) << "set_codebooks: native derivation was already enabled via set_derive_codebooks(); these modes are mutually exclusive";
         codebooks_ = std::move(cbs);
         has_codebooks_ = true;
     }
@@ -191,6 +192,8 @@ class IVF {
     /// build per-dim Lloyd codebooks from the data matrix at the bit-counts
     /// allocated by quant_plan.
     void set_derive_codebooks(LloydOpts opts = {}) {
+        CHECK(codebooks_.empty()) << "set_derive_codebooks: explicit codebooks already set via set_codebooks(); these modes are mutually exclusive";
+        CHECK(gaussian_codebook_centroids_.empty()) << "set_derive_codebooks: gaussian codebooks already set; these modes are mutually exclusive";
         lloyd_opts_ = opts;
         derive_codebooks_ = true;
         has_codebooks_ = true;
@@ -201,6 +204,7 @@ class IVF {
     void set_gaussian_codebooks(
         std::vector<std::vector<float>> base_centroids,
         std::vector<float> residual_stds) {
+        CHECK(!derive_codebooks_) << "set_gaussian_codebooks: native derivation was already enabled via set_derive_codebooks(); these modes are mutually exclusive";
         gaussian_codebook_centroids_ = std::move(base_centroids);
         residual_stds_ = std::move(residual_stds);
         has_codebooks_ = true;
