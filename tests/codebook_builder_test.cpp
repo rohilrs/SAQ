@@ -177,6 +177,21 @@ void TestInitVariant(saq::CodebookInit init, const char* name) {
     std::printf("TestInitVariant[%s]: OK\n", name);
 }
 
+void TestRecommendedSampleSize() {
+    using saq::recommended_sample_size;
+    // Capped at n when 500*(1<<max_bits) > n.
+    assert(recommended_sample_size(1000, 12) == 1000);
+    // The 200k absolute floor binds for small k.
+    assert(recommended_sample_size(10'000'000, 4) == 200'000);   // 500*16 = 8k < 200k -> floor
+    assert(recommended_sample_size(10'000'000, 8) == 200'000);   // 500*256 = 128k < 200k -> floor
+    // The 500*k term binds for larger k.
+    assert(recommended_sample_size(10'000'000, 10) == 500 * (size_t{1} << 10));  // 512000
+    assert(recommended_sample_size(100'000'000, 12) == 500 * (size_t{1} << 12)); // 2_048_000
+    // Capped at n when 500*k > n.
+    assert(recommended_sample_size(1'000'000, 12) == 1'000'000); // 500*4096=2M > 1M -> n
+    std::printf("TestRecommendedSampleSize: OK\n");
+}
+
 }  // namespace
 
 int main() {
@@ -191,6 +206,7 @@ int main() {
     TestInitVariant(saq::CodebookInit::KMeansPlusPlus, "KMeansPlusPlus");
     TestInitVariant(saq::CodebookInit::CubeRootDensity, "CubeRootDensity");
     TestLloydVsDp();
+    TestRecommendedSampleSize();
     std::printf("ALL TESTS PASSED\n");
     return 0;
 }

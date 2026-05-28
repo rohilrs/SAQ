@@ -27,7 +27,7 @@ enum class CodebookInit {
 
 struct LloydOpts {
     size_t       max_bits    = 13;
-    CodebookInit init        = CodebookInit::EqualMassQuantile;
+    CodebookInit init        = CodebookInit::KMeansPlusPlus;  // empirically-chosen default (see research-hub/experiments/2026-05-27-codebook-init-sizing.md)
     size_t       restarts    = 1;
     size_t       max_iters   = 50;
     float        tol         = 1e-6f;  // centroid max-move convergence
@@ -55,5 +55,16 @@ std::vector<CodebookResult> build_all_dims(const FloatRowMat& data,
 /// Mean squared reconstruction error of `values` under codebook `cb`
 /// (each value mapped to its nearest centroid). Brute-force via cb.nearest.
 float codebook_mse(std::span<const float> values, const DimensionCodebook& cb);
+
+/// Returns the smallest sample size that empirically lands kpp-on-sample within
+/// ~10% of kpp(full) at the requested bit-rate (see init-sizing experiment).
+/// Use when n is much larger than this value to avoid full-data O(n*k) construction.
+/// Rule: min(n, max(200_000, 500 * (1<<max_bits))).
+constexpr size_t recommended_sample_size(size_t n, size_t max_bits) {
+    const size_t k_floor = static_cast<size_t>(500) * (size_t{1} << max_bits);
+    const size_t floor   = static_cast<size_t>(200000);
+    const size_t lower   = floor > k_floor ? floor : k_floor;
+    return n < lower ? n : lower;
+}
 
 }  // namespace saq
