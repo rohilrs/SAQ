@@ -38,3 +38,11 @@ if(DEFINED ENV{CONDA_PREFIX})
   target_link_directories(test_codebook_builder BEFORE PRIVATE $ENV{CONDA_PREFIX}/lib)
   target_link_options(test_codebook_builder PRIVATE "LINKER:--enable-new-dtags")
 endif()
+
+# Manual-run benchmark: codebook init strategy speed + quality comparison.
+add_executable(codebook_init_benchmark codebook_init_benchmark.cpp)
+target_link_libraries(codebook_init_benchmark PRIVATE saq)
+if(DEFINED ENV{CONDA_PREFIX})
+  target_link_directories(codebook_init_benchmark BEFORE PRIVATE $ENV{CONDA_PREFIX}/lib)
+  target_link_options(codebook_init_benchmark PRIVATE "LINKER:--enable-new-dtags")
+endif()
