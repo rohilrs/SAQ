@@ -60,10 +60,39 @@ void GpuIVF::construct(const FloatRowMat& data,
 
     // Build segment codebooks if codebook mode is active
     if (has_codebooks_) {
+        // Native data-driven derivation: build per-dim Lloyd codebooks from the
+        // (PCA-transformed) data, then select each dimension's codebook at the
+        // bit-count its segment was allocated in quant_plan.
+        if (derive_codebooks_ && codebooks_explicit_.empty()) {
+            std::vector<CodebookResult> per_dim = build_all_dims(data, lloyd_opts_);
+
+            // Stash per-dim costs for the future allocation sub-project.
+            saq_data_->codebook_costs.resize(per_dim.size());
+            for (size_t d = 0; d < per_dim.size(); ++d) {
+                saq_data_->codebook_costs[d] = per_dim[d].costs;
+            }
+
+            // Assemble explicit codebooks[seg][dim_in_seg] at each segment's bits.
+            codebooks_explicit_.clear();
+            codebooks_explicit_.resize(quant_plan.size());
+            size_t gdim = 0;
+            for (size_t s = 0; s < quant_plan.size(); ++s) {
+                const size_t dim_len = quant_plan[s].first;
+                const size_t bits    = quant_plan[s].second;
+                codebooks_explicit_[s].reserve(dim_len);
+                for (size_t j = 0; j < dim_len; ++j, ++gdim) {
+                    CHECK_LT(gdim, per_dim.size());
+                    CHECK_LT(bits, per_dim[gdim].codebooks.size())
+                        << "lloyd_opts_.max_bits too small for allocated bits=" << bits;
+                    codebooks_explicit_[s].push_back(per_dim[gdim].codebooks[bits]);
+                }
+            }
+        }
         saq_data_->segment_codebooks = build_segment_codebooks(
             quant_plan, codebooks_explicit_,
             gaussian_codebook_centroids_, residual_stds_);
-        LOG(INFO) << "Built codebooks for " << num_segments << " segments";
+        LOG(INFO) << "Built codebooks for " << num_segments << " segments"
+                  << (derive_codebooks_ ? " (native Lloyd)" : "");
     }
 
     // 2. Compute cluster sizes and offsets (CPU-side)

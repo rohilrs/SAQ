@@ -104,6 +104,11 @@ struct SaqData {
     /// segment_codebooks[seg_idx][dim_within_seg].
     std::vector<std::vector<DimensionCodebook>> segment_codebooks;
 
+    // Per-dimension reconstruction MSE at each bit-rate, from the codebook
+    // builder. costs[d][bits]. Empty unless native derivation ran. Consumed
+    // by the (future) greedy bit-allocation sub-project; unused here.
+    std::vector<std::vector<float>> codebook_costs;
+
     /// @brief Serialize the entire SaqData to a binary stream.
     void save(std::ofstream &output) const;
 

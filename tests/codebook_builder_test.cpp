@@ -2,6 +2,7 @@
 /// @brief Tests for the data-driven codebook builder (Lloyd + DP reference).
 
 #include "saq/preprocessing/codebook_builder.h"
+#include "index/ivf_index.h"
 
 #include <algorithm>
 #include <cassert>
@@ -217,6 +218,34 @@ void TestBuildAllDims() {
     std::printf("TestBuildAllDims: OK\n");
 }
 
+void TestNativeDerivationEndToEnd() {
+    // D must be a multiple of kDimPaddingSize (64) when calling construct()
+    // directly, since compute_variance() checks data.cols() == num_dim_padded_.
+    const int N = 1000, D = 64, K = 4;
+    saq::FloatRowMat data(N, D);
+    std::mt19937 rng(9);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (int i = 0; i < N; ++i)
+        for (int d = 0; d < D; ++d) data(i, d) = nd(rng);
+
+    // Minimal centroids + cluster ids for a tiny IVF.
+    saq::FloatRowMat centroids(K, D); centroids.setZero();
+    std::vector<saq::PID> cluster_ids(N);
+    for (int i = 0; i < N; ++i) cluster_ids[i] = static_cast<saq::PID>(i % K);
+
+    saq::QuantizeConfig cfg; cfg.avg_bits = 4;
+    saq::IVF ivf(static_cast<size_t>(N), static_cast<size_t>(D),
+                 static_cast<size_t>(K), cfg);
+    saq::LloydOpts opts; opts.max_bits = 13;
+    ivf.set_derive_codebooks(opts);
+    ivf.construct(data, centroids, cluster_ids.data());  // must not crash; derives natively
+
+    assert(ivf.get_saq_data()->segment_codebooks.size() ==
+           ivf.get_saq_data()->quant_plan.size());
+    assert(!ivf.get_saq_data()->codebook_costs.empty());
+    std::printf("TestNativeDerivationEndToEnd: OK\n");
+}
+
 }  // namespace
 
 int main() {
@@ -233,6 +262,7 @@ int main() {
     TestLloydVsDp();
     TestRecommendedSampleSize();
     TestBuildAllDims();
+    TestNativeDerivationEndToEnd();
     std::printf("ALL TESTS PASSED\n");
     return 0;
 }

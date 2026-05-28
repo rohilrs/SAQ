@@ -28,6 +28,7 @@
 #include "saq/initializer.h"
 #include "saq/memory.h"
 #include "saq/pool.h"
+#include "saq/preprocessing/codebook_builder.h"
 #include "saq/preprocessing/preprocessing.h"
 #include "saq/quantization_plan.h"
 #include "saq/quantizer.h"
@@ -86,6 +87,9 @@ class IVF {
     std::vector<std::vector<DimensionCodebook>> codebooks_;       // from set_codebooks()
     std::vector<std::vector<float>> gaussian_codebook_centroids_; // base[bits][entry]
     std::vector<float> residual_stds_;                            // per-dim std for gaussian path
+    bool      derive_codebooks_ = false;  // derive natively from data in construct()
+    LloydOpts lloyd_opts_{};
+
 
     void allocate_clusters(const std::vector<size_t> &cluster_sizes);
 
@@ -178,6 +182,17 @@ class IVF {
     /// Set explicit per-segment, per-dimension codebooks.
     void set_codebooks(std::vector<std::vector<DimensionCodebook>> cbs) {
         codebooks_ = std::move(cbs);
+        has_codebooks_ = true;
+    }
+
+    /// Enable native, data-driven codebook derivation during construct().
+    /// Mutually exclusive with set_codebooks()/set_gaussian_codebooks() (those
+    /// inject precomputed codebooks instead). After calling, construct() will
+    /// build per-dim Lloyd codebooks from the data matrix at the bit-counts
+    /// allocated by quant_plan.
+    void set_derive_codebooks(LloydOpts opts = {}) {
+        lloyd_opts_ = opts;
+        derive_codebooks_ = true;
         has_codebooks_ = true;
     }
 

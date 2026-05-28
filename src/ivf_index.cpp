@@ -43,10 +43,39 @@ void IVF::construct(const FloatRowMat &data, const FloatRowMat &centroids,
 
     // Build segment codebooks if codebook mode is active
     if (has_codebooks_) {
+        // Native data-driven derivation: build per-dim Lloyd codebooks from the
+        // (PCA-transformed) data, then select each dimension's codebook at the
+        // bit-count its segment was allocated in quant_plan.
+        if (derive_codebooks_ && codebooks_.empty()) {
+            std::vector<CodebookResult> per_dim = build_all_dims(data, lloyd_opts_);
+
+            // Stash per-dim costs for the future allocation sub-project.
+            saq_data_->codebook_costs.resize(per_dim.size());
+            for (size_t d = 0; d < per_dim.size(); ++d) {
+                saq_data_->codebook_costs[d] = per_dim[d].costs;
+            }
+
+            // Assemble explicit codebooks[seg][dim_in_seg] at each segment's bits.
+            codebooks_.clear();
+            codebooks_.resize(saq_data_->quant_plan.size());
+            size_t gdim = 0;
+            for (size_t s = 0; s < saq_data_->quant_plan.size(); ++s) {
+                const size_t dim_len = saq_data_->quant_plan[s].first;
+                const size_t bits    = saq_data_->quant_plan[s].second;
+                codebooks_[s].reserve(dim_len);
+                for (size_t j = 0; j < dim_len; ++j, ++gdim) {
+                    CHECK_LT(gdim, per_dim.size());
+                    CHECK_LT(bits, per_dim[gdim].codebooks.size())
+                        << "lloyd_opts_.max_bits too small for allocated bits=" << bits;
+                    codebooks_[s].push_back(per_dim[gdim].codebooks[bits]);
+                }
+            }
+        }
         saq_data_->segment_codebooks = build_segment_codebooks(
             saq_data_->quant_plan, codebooks_,
             gaussian_codebook_centroids_, residual_stds_);
-        LOG(INFO) << "Built codebooks for " << saq_data_->quant_plan.size() << " segments";
+        LOG(INFO) << "Built codebooks for " << saq_data_->quant_plan.size() << " segments"
+                  << (derive_codebooks_ ? " (native Lloyd)" : "");
     }
 
     // 3. prepare clusters

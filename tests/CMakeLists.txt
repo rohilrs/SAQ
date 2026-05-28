@@ -39,6 +39,18 @@ if(DEFINED ENV{CONDA_PREFIX})
   target_link_options(test_codebook_builder PRIVATE "LINKER:--enable-new-dtags")
 endif()
 
+# test_codebook_builder now includes ivf_index.h (via TestNativeDerivationEndToEnd),
+# which transitively pulls in fast_scan.h. Mirror the same AVX-512 flag block as
+# test_fit_decompress so the static_assert in transfer_lut_hacc doesn't fire.
+if(SAQ_REQUIRE_AVX512)
+  if(MSVC)
+    target_compile_options(test_codebook_builder PRIVATE /arch:AVX512)
+  else()
+    target_compile_options(test_codebook_builder PRIVATE
+      -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma)
+  endif()
+endif()
+
 # Manual-run benchmark: codebook init strategy speed + quality comparison.
 add_executable(codebook_init_benchmark codebook_init_benchmark.cpp)
 target_link_libraries(codebook_init_benchmark PRIVATE saq)

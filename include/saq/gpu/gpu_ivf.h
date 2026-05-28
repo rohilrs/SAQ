@@ -8,6 +8,7 @@
 #include "saq/codebook_encoder.h"
 #include "saq/defines.h"
 #include "saq/config.h"
+#include "saq/preprocessing/codebook_builder.h"
 #include "saq/quantization_plan.h"
 #include "saq/initializer.h"
 #include "saq/gpu/gpu_cluster_data.cuh"
@@ -37,6 +38,9 @@ class GpuIVF {
     std::vector<std::vector<DimensionCodebook>> codebooks_explicit_;
     std::vector<std::vector<float>> gaussian_codebook_centroids_;
     std::vector<float> residual_stds_;
+    bool      derive_codebooks_ = false;  // derive natively from data in construct()
+    LloydOpts lloyd_opts_{};
+
 
 public:
     GpuIVF() = default;
@@ -63,6 +67,17 @@ public:
 
     void set_codebooks(std::vector<std::vector<DimensionCodebook>> cbs) {
         codebooks_explicit_ = std::move(cbs);
+        has_codebooks_ = true;
+    }
+
+    /// Enable native, data-driven codebook derivation during construct().
+    /// Mutually exclusive with set_codebooks()/set_gaussian_codebooks() (those
+    /// inject precomputed codebooks instead). After calling, construct() will
+    /// build per-dim Lloyd codebooks from the data matrix at the bit-counts
+    /// allocated by quant_plan.
+    void set_derive_codebooks(LloydOpts opts = {}) {
+        lloyd_opts_ = opts;
+        derive_codebooks_ = true;
         has_codebooks_ = true;
     }
 
