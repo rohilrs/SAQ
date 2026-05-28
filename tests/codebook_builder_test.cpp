@@ -196,6 +196,27 @@ void TestRecommendedSampleSize() {
     std::printf("TestRecommendedSampleSize: OK\n");
 }
 
+void TestBuildAllDims() {
+    const int N = 2000, D = 8;
+    saq::FloatRowMat data(N, D);
+    std::mt19937 rng(5);
+    for (int d = 0; d < D; ++d) {
+        std::normal_distribution<float> nd(0.f, 1.f + d);  // per-dim variance grows
+        for (int i = 0; i < N; ++i) data(i, d) = nd(rng);
+    }
+    saq::LloydOpts opts; opts.max_bits = 5;
+    std::vector<saq::CodebookResult> all = saq::build_all_dims(data, opts);
+
+    assert(all.size() == static_cast<size_t>(D));
+    // Per-dim result must match building that column directly.
+    std::vector<float> col(N);
+    for (int i = 0; i < N; ++i) col[i] = data(i, 3);
+    saq::CodebookResult direct = saq::build_codebook_lloyd(col, opts);
+    for (size_t bits = 0; bits <= opts.max_bits; ++bits)
+        assert(std::fabs(all[3].costs[bits] - direct.costs[bits]) < 1e-6f);
+    std::printf("TestBuildAllDims: OK\n");
+}
+
 }  // namespace
 
 int main() {
@@ -211,6 +232,7 @@ int main() {
     TestInitVariant(saq::CodebookInit::CubeRootDensity, "CubeRootDensity");
     TestLloydVsDp();
     TestRecommendedSampleSize();
+    TestBuildAllDims();
     std::printf("ALL TESTS PASSED\n");
     return 0;
 }

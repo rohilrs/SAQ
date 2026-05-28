@@ -398,8 +398,22 @@ CodebookResult build_codebook_lloyd(std::span<const float> values, const LloydOp
     }
     return R;
 }
-std::vector<CodebookResult> build_all_dims(const FloatRowMat&, const LloydOpts&) {
-    return {};  // Task 5
+std::vector<CodebookResult> build_all_dims(const FloatRowMat& data, const LloydOpts& opts) {
+    const size_t Nrows = static_cast<size_t>(data.rows());
+    const size_t D = static_cast<size_t>(data.cols());
+    std::vector<CodebookResult> out(D);
+#ifdef SAQ_USE_OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (long long d = 0; d < static_cast<long long>(D); ++d) {
+        std::vector<float> col(Nrows);
+        for (size_t i = 0; i < Nrows; ++i) {
+            col[i] = data(static_cast<Eigen::Index>(i),
+                          static_cast<Eigen::Index>(d));
+        }
+        out[static_cast<size_t>(d)] = build_codebook_lloyd(col, opts);
+    }
+    return out;
 }
 
 float codebook_mse(std::span<const float> values, const DimensionCodebook& cb) {
