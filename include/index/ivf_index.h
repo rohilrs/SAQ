@@ -27,6 +27,7 @@
 #include "saq/initializer.h"
 #include "saq/memory.h"
 #include "saq/pool.h"
+#include "saq/preprocessing/codebook_builder.h"
 #include "saq/preprocessing/preprocessing.h"
 #include "saq/quantization_plan.h"
 #include "saq/quantizer.h"
@@ -63,6 +64,8 @@ class IVF {
     FloatRowMat raw_codebooks_;  ///< D × cb_cols raw codebook centroids (optional)
     FloatRowMat gaussian_codebook_;  ///< (max_bits+1) × max_entries base Gaussian codebook
     FloatVec residual_stds_;         ///< per-dimension residual std for Gaussian scaling
+    bool      derive_codebooks_ = false;  ///< derive natively from data in construct()
+    LloydOpts lloyd_opts_{};              ///< options for native derivation
 
     // Maps global vector ID -> {cluster_idx, local_idx_within_cluster}.
     // Populated by construct() only when raw_codes_out is non-null (the
@@ -177,16 +180,30 @@ class IVF {
     ///        Layout: row d, bits b -> centroids at [b*256 : b*256 + 2^b].
     ///        Must be called before construct().
     void set_codebooks(FloatRowMat codebooks) {
+        CHECK(!derive_codebooks_) << "set_codebooks: native derivation was already enabled via set_derive_codebooks(); these modes are mutually exclusive";
         raw_codebooks_ = std::move(codebooks);
     }
 
+    /// Enable native, data-driven codebook derivation during construct().
+    /// Mutually exclusive with set_codebooks()/set_gaussian_codebooks() (those
+    /// inject precomputed codebooks instead). After calling, construct() will
+    /// build per-dim Lloyd codebooks from the data matrix at the bit-counts
+    /// allocated by quant_plan.
+    void set_derive_codebooks(LloydOpts opts = {}) {
+        CHECK(raw_codebooks_.rows() == 0) << "set_derive_codebooks: explicit codebooks already set via set_codebooks(); these modes are mutually exclusive";
+        CHECK(gaussian_codebook_.rows() == 0) << "set_derive_codebooks: gaussian codebooks already set; these modes are mutually exclusive";
+        lloyd_opts_ = opts;
+        derive_codebooks_ = true;
+    }
+
     bool has_codebooks() const {
-        return raw_codebooks_.rows() > 0 || gaussian_codebook_.rows() > 0;
+        return raw_codebooks_.rows() > 0 || gaussian_codebook_.rows() > 0 || derive_codebooks_;
     }
 
     /// @brief Set Gaussian base codebook + per-dimension residual stds.
     ///        Codebooks constructed at runtime as base_codebook[bits] * std[d].
     void set_gaussian_codebooks(FloatRowMat base_codebook, FloatVec stds) {
+        CHECK(!derive_codebooks_) << "set_gaussian_codebooks: native derivation was already enabled via set_derive_codebooks(); these modes are mutually exclusive";
         gaussian_codebook_ = std::move(base_codebook);
         residual_stds_ = std::move(stds);
     }

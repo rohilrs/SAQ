@@ -19,6 +19,7 @@ target_sources(saq
 # Preprocessing module (shared across all variants)
 target_sources(saq PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/preprocessing/preprocessing.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/preprocessing/codebook_builder.cpp
 )
 
 if(SAQ_USE_FAISS)
