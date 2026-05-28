@@ -130,6 +130,10 @@ void TestLloydVsDp() {
     for (auto& x : v) x = nd(rng);
 
     saq::LloydOpts opts; opts.max_bits = 6;
+    // Match the experiment's recommendation: at low k (k<=1024) use a few
+    // restarts to suppress kpp seed-variance. See
+    // research-hub/experiments/2026-05-27-codebook-init-sizing.md.
+    opts.restarts = 3;
     saq::CodebookResult lloyd = saq::build_codebook_lloyd(v, opts);
     // num_bins >= n makes the DP *exact* (each point its own bin -> arbitrary
     // boundaries). Binned DP (num_bins < n) is only optimal among bin-edge
