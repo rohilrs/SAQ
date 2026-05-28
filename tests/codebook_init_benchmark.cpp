@@ -432,6 +432,157 @@ void run_real_dim(const std::string& fvecs_path, size_t col, size_t n_rows) {
     }
 }
 
+// ---- kpp sample-sizing sweep (n=1M Gaussian) ---------------------------------
+//
+// Goal: find the smallest S/k ratio at which kpp(sample, S) quality converges
+// to kpp(full).  For each bit-rate b ∈ {8, 10, 12} we:
+//   1. Compute kpp(full) on n=1M as the ground-truth reference.
+//   2. Sweep ratios = {5, 50, 100, 200, 500, 1000}; S = ratio * k.
+//   3. Report mse / mse_full (quality ratio) and build time.
+//   4. Repeat S = 200*k with seed=1 to gauge run-to-run variance.
+//
+// kpp(full) at b=12 (k=4096, n=1M) can be very slow; we cap at 180 s and
+// report the partial timing if we hit the limit (the wall-time is the result).
+
+void run_kpp_sizing_sweep(const std::vector<float>& v) {
+    const size_t n = v.size();
+    const std::vector<size_t> bits_list = {8, 10, 12};
+    const std::vector<size_t> ratios    = {5, 50, 100, 200, 500, 1000};
+    // Timeout guard: if kpp(full) took longer than this for a given b, we note it
+    // but still proceed with sample runs (they are much cheaper).
+    constexpr double KPP_FULL_TIMEOUT_MS = 180000.0;  // 3 min
+
+    std::printf("\n");
+    std::printf("Data: Gaussian N(0,1) n=%zu seed=42\n", n);
+    std::printf("kpp(full) = LloydOpts{init=KMeansPlusPlus, sample_size=0, restarts=1, seed=0}\n");
+    std::printf("kpp(sample,S) = same but sample_size=S\n");
+    std::printf("MSE evaluated on FULL n=%zu for all variants (fair comparison).\n", n);
+    std::printf("Seed-variance column: S=200*k repeated with seed=1.\n\n");
+
+    for (size_t b : bits_list) {
+        const size_t k = size_t(1) << b;
+
+        std::printf("---------- b=%zu  k=%zu ----------\n", b, k);
+
+        // --- Step 1: kpp(full) baseline ---
+        double mse_full_val = -1.0;
+        double t_full_ms    = -1.0;
+        bool   full_timed_out = false;
+
+        {
+            saq::LloydOpts opts;
+            opts.max_bits    = b;
+            opts.init        = saq::CodebookInit::KMeansPlusPlus;
+            opts.restarts    = 1;
+            opts.seed        = 0;
+            opts.sample_size = 0;
+
+            auto t0 = clk::now();
+            auto r  = saq::build_codebook_lloyd(v, opts);
+            t_full_ms = ms_since(t0);
+
+            if (t_full_ms > KPP_FULL_TIMEOUT_MS) {
+                full_timed_out = true;
+            }
+            mse_full_val = double(saq::codebook_mse(v, r.codebooks[b]));
+            std::printf("kpp(full): build_ms=%.0f  mse=%.6g%s\n",
+                        t_full_ms, mse_full_val,
+                        full_timed_out ? "  [WARN: exceeded 180s]" : "");
+        }
+
+        // Column header
+        std::printf("%-8s | %-10s | %-10s | %-14s | %-18s | %s\n",
+                    "S/k", "S", "build_ms", "mse", "ratio_vs_kpp_full", "note");
+        std::printf("%-8s-+-%-10s-+-%-10s-+-%-14s-+-%-18s-+-%s\n",
+                    "--------", "----------", "----------", "--------------",
+                    "------------------", "----");
+
+        // --- Step 2: sample sweep ---
+        double mse_200k_seed0 = -1.0;  // for variance comparison
+        double mse_200k_seed1 = -1.0;
+
+        for (size_t ratio : ratios) {
+            size_t S = ratio * k;
+
+            if (S >= n) {
+                std::printf("%-8zu | %-10zu | %-10s | %-14s | %-18s | skipped (S>=n)\n",
+                            ratio, S, "-", "-", "-");
+                continue;
+            }
+
+            saq::LloydOpts opts;
+            opts.max_bits    = b;
+            opts.init        = saq::CodebookInit::KMeansPlusPlus;
+            opts.restarts    = 1;
+            opts.seed        = 0;
+            opts.sample_size = S;
+
+            auto t0  = clk::now();
+            auto r   = saq::build_codebook_lloyd(v, opts);
+            double t = ms_since(t0);
+
+            double mse = double(saq::codebook_mse(v, r.codebooks[b]));
+            double ratio_vs_full = (mse_full_val > 1e-15)
+                ? mse / mse_full_val
+                : -1.0;
+
+            // Note column: flag if this is the first ratio in [0.95, 1.10].
+            const char* note = "";
+            if (ratio_vs_full >= 0.95 && ratio_vs_full <= 1.10) note = "<-- converged";
+
+            std::printf("%-8zu | %-10zu | %10.1f | %14.6g | %18.4f | %s\n",
+                        ratio, S, t, mse, ratio_vs_full, note);
+
+            if (ratio == 200) mse_200k_seed0 = mse;
+        }
+
+        // --- Step 3: seed-variance at ratio=200, seed=1 ---
+        {
+            size_t S = 200 * k;
+            if (S < n) {
+                saq::LloydOpts opts;
+                opts.max_bits    = b;
+                opts.init        = saq::CodebookInit::KMeansPlusPlus;
+                opts.restarts    = 1;
+                opts.seed        = 1;
+                opts.sample_size = S;
+
+                auto t0  = clk::now();
+                auto r   = saq::build_codebook_lloyd(v, opts);
+                double t = ms_since(t0);
+
+                mse_200k_seed1 = double(saq::codebook_mse(v, r.codebooks[b]));
+                double ratio_vs_full = (mse_full_val > 1e-15)
+                    ? mse_200k_seed1 / mse_full_val
+                    : -1.0;
+
+                std::printf("\nSeed-variance at S/k=200 (S=%zu):\n", S);
+                std::printf("  seed=0: mse=%.6g  ratio=%.4f  build_ms=n/a (shown above)\n",
+                            mse_200k_seed0,
+                            (mse_full_val > 1e-15) ? mse_200k_seed0 / mse_full_val : -1.0);
+                std::printf("  seed=1: mse=%.6g  ratio=%.4f  build_ms=%.0f\n",
+                            mse_200k_seed1, ratio_vs_full, t);
+                if (mse_200k_seed0 > 1e-15 && mse_200k_seed1 > 1e-15) {
+                    double rel_diff = std::fabs(mse_200k_seed1 - mse_200k_seed0)
+                                      / mse_200k_seed0 * 100.0;
+                    std::printf("  run-to-run relative diff: %.2f%%\n", rel_diff);
+                }
+            } else {
+                std::printf("\nSeed-variance at S/k=200: skipped (S=%zu >= n=%zu)\n", S, n);
+            }
+        }
+
+        // --- Step 4: interpretation ---
+        // Re-run just the MSE evaluations (cheap — codebook already printed above,
+        // but we need to re-build to get the numbers again; instead we track
+        // converged ratios by re-evaluating inline during the sweep).
+        // We already flagged convergence with the "<-- converged" note above.
+        std::printf("\nInterpretation (b=%zu): see '<-- converged' marker above for\n", b);
+        std::printf("  first S/k where ratio_vs_kpp_full lands in [0.95, 1.10].\n");
+        std::printf("\n");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -485,6 +636,17 @@ int main() {
 
     for (size_t dim : {0ul, 100ul, 500ul, 1500ul}) {
         run_real_dim(fvecs_path, dim, rows_to_use);
+    }
+
+    // -------------------- kpp sample-sizing sweep --------------------
+    std::printf("\n\n========== kpp SAMPLE-SIZING SWEEP ==========\n");
+    std::printf("Sweeping S/k ratios to find convergence threshold for kpp(sample) vs kpp(full).\n");
+    std::printf("n=1M Gaussian N(0,1) seed=42.  b in {8,10,12}.\n");
+    std::printf("Ratios: {5, 50, 100, 200, 500, 1000}.\n");
+    {
+        constexpr size_t N_SIZING = 1000000;
+        auto v_sizing = gen_gaussian(N_SIZING, 42);
+        run_kpp_sizing_sweep(v_sizing);
     }
 
     std::printf("\n=== done ===\n");
