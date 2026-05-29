@@ -106,17 +106,89 @@ int main() {
     auto cluster_rows = read_ivecs(dir + "/cluster_ids_4096.ivecs");
     auto gt_rows      = read_ivecs(dir + "/groundtruth.ivecs");
 
+    // Flatten cluster_rows (each row has 1 element) into a contiguous PID array.
+    std::vector<saq::PID> cluster_ids;
+    cluster_ids.reserve(cluster_rows.size());
+    for (const auto& row : cluster_rows) cluster_ids.push_back(static_cast<saq::PID>(row[0]));
+
+    const size_t N = static_cast<size_t>(data.rows());
+    const size_t D = static_cast<size_t>(data.cols());
+    const size_t K = static_cast<size_t>(centroids.rows());
+    const size_t k_top = 10;
+    const size_t nprobe = 200;
+
     std::fprintf(stderr,
                  "data=%lldx%lld  queries=%lldx%lld  centroids=%lldx%lld  "
-                 "cluster_rows=%zu  gt_rows=%zu  peak_rss=%ld KB\n",
+                 "cluster_ids=%zu  gt_rows=%zu  peak_rss=%ld KB\n",
                  (long long)data.rows(), (long long)data.cols(),
                  (long long)queries.rows(), (long long)queries.cols(),
                  (long long)centroids.rows(), (long long)centroids.cols(),
-                 cluster_rows.size(), gt_rows.size(), peak_rss_kb());
+                 cluster_ids.size(), gt_rows.size(), peak_rss_kb());
 
-    std::printf("{\"status\":\"loaded\",\"n_data\":%lld,\"n_queries\":%lld,"
-                "\"d\":%lld,\"k_clusters\":%lld}\n",
-                (long long)data.rows(), (long long)queries.rows(),
-                (long long)data.cols(), (long long)centroids.rows());
+    // --- IVF #1: kpp+Lloyd codebooks ---
+    saq::QuantizeConfig cfg_lloyd;
+    cfg_lloyd.avg_bits = 4;  // headline regime; segment bits stay <= 8 so the DP run will work too.
+
+    std::fprintf(stderr, "[lloyd] constructing IVF with set_derive_codebooks(KMeansPlusPlus)...\n");
+    saq::IVF ivf_lloyd(N, D, K, cfg_lloyd);
+    saq::LloydOpts opts;
+    opts.init = saq::CodebookInit::KMeansPlusPlus;
+    opts.restarts = 1;
+    opts.seed = 0;
+    opts.max_bits = 13;
+    ivf_lloyd.set_derive_codebooks(opts);
+    double t0 = now_s();
+    ivf_lloyd.construct(data, centroids, cluster_ids.data());
+    double t1 = now_s();
+    std::fprintf(stderr, "[lloyd] construct: %.2fs, peak_rss=%ld KB\n", t1 - t0, peak_rss_kb());
+
+    // search() writes into a PID output array (no return value); nprobe is a
+    // separate parameter (not part of SearcherConfig).
+    saq::SearcherConfig scfg;
+    scfg.dist_type = saq::DistType::L2Sqr;
+    std::vector<std::vector<int32_t>> found_lloyd(static_cast<size_t>(queries.rows()));
+    t0 = now_s();
+    {
+        std::vector<saq::PID> result_buf(k_top);
+        for (Eigen::Index q = 0; q < queries.rows(); ++q) {
+            ivf_lloyd.search(queries.row(q), k_top, nprobe, scfg, result_buf.data());
+            auto& row = found_lloyd[static_cast<size_t>(q)];
+            row.resize(k_top);
+            for (size_t i = 0; i < k_top; ++i)
+                row[i] = static_cast<int32_t>(result_buf[i]);
+        }
+    }
+    t1 = now_s();
+    double recall_lloyd = recall_at_k(gt_rows, found_lloyd, k_top);
+    std::fprintf(stderr, "[lloyd] search %zu queries: %.2fs total, recall@%zu=%.4f\n",
+                 static_cast<size_t>(queries.rows()), t1 - t0, k_top, recall_lloyd);
+
+    // Capture the quant_plan from IVF #1 — we'll use the same bit allocation for the DP run
+    // so the comparison is apples-to-apples (same segment structure, different codebook).
+    auto quant_plan = ivf_lloyd.get_saq_data()->quant_plan;
+    std::fprintf(stderr, "[lloyd] quant_plan: %zu segments\n", quant_plan.size());
+    for (size_t s = 0; s < quant_plan.size(); ++s) {
+        std::fprintf(stderr, "  seg %zu: dim_len=%zu bits=%zu\n",
+                     s, quant_plan[s].first, quant_plan[s].second);
+    }
+    // Sanity: every segment must have bits <= 8 so we can run build_codebook_dp later.
+    for (size_t s = 0; s < quant_plan.size(); ++s) {
+        if (quant_plan[s].second > 8) {
+            std::fprintf(stderr, "ERROR seg %zu has bits=%zu > 8; build_codebook_dp won't run.\n"
+                                 "Pick a smaller cfg.avg_bits and rerun.\n",
+                         s, quant_plan[s].second);
+            return 2;
+        }
+    }
+
+    // --- Emit partial JSON now; Task 9 adds the DP side. ---
+    std::printf("{\n"
+                "  \"k_top\": %zu,\n"
+                "  \"nprobe\": %zu,\n"
+                "  \"avg_bits\": %.2f,\n"
+                "  \"recall_lloyd\": %.6f,\n"
+                "  \"recall_dp\":    null,\n"
+                "  \"delta_pp\":     null\n"
+                "}\n", k_top, nprobe, cfg_lloyd.avg_bits, recall_lloyd);
     return 0;
 }
