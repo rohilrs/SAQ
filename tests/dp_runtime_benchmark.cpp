@@ -16,6 +16,15 @@
 
 namespace {
 
+// One column of n N(0,1) samples, seeded for reproducibility.
+std::vector<float> make_gaussian(size_t n, uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> v(n);
+    for (auto& x : v) x = nd(rng);
+    return v;
+}
+
 // Peak RSS in kilobytes (Linux: ru_maxrss is in KB).
 long peak_rss_kb() {
     struct rusage ru{};
@@ -32,7 +41,13 @@ double now_s() {
 }  // namespace
 
 int main() {
-    std::fprintf(stderr, "dp_runtime_benchmark: scaffold ok, peak_rss=%ld KB\n", peak_rss_kb());
-    std::printf("{\"status\":\"scaffold\"}\n");
+    auto v = make_gaussian(/*n=*/5000, /*seed=*/42);
+    double sum = 0.0, sq = 0.0;
+    for (float x : v) { sum += x; sq += double(x) * x; }
+    double mean = sum / v.size();
+    double var  = sq / v.size() - mean * mean;
+    std::fprintf(stderr, "synthetic: n=%zu mean=%.3f var=%.3f peak_rss=%ld KB\n",
+                 v.size(), mean, var, peak_rss_kb());
+    std::printf("{\"status\":\"synthetic_ok\",\"n\":%zu}\n", v.size());
     return 0;
 }
