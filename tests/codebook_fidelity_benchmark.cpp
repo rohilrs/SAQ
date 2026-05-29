@@ -77,6 +77,46 @@ double bennett_lower_bound(double cube_root_integral, size_t bits) {
     return (1.0 / 12.0) * pow2 * std::pow(cube_root_integral, 3.0);
 }
 
+struct Cell {
+    std::string source;       // e.g. "dbpedia_d0"
+    size_t      bits;
+    size_t      restart_seed; // 0,1,2 for the seed-variance sweep
+    double      dp_mse;       // empty if b > 8
+    double      lloyd_mse;
+    double      bennett_lb;   // empty if b <= 8
+    bool        has_dp;
+    bool        has_bennett;
+};
+
+void emit_cell_json(const Cell& c, bool first) {
+    std::printf("%s\n  {\"source\":\"%s\",\"bits\":%zu,\"seed\":%zu,"
+                "\"lloyd_mse\":%.6e",
+                first ? "" : ",", c.source.c_str(), c.bits, c.restart_seed,
+                c.lloyd_mse);
+    if (c.has_dp)      std::printf(",\"dp_mse\":%.6e", c.dp_mse);
+    if (c.has_bennett) std::printf(",\"bennett_lb\":%.6e", c.bennett_lb);
+    std::printf("}");
+}
+
+// Build a Lloyd codebook for `col` at `bits`, seeded by `seed`. Returns the
+// MSE of the resulting codebook on the FULL column (via codebook_mse).
+double lloyd_mse_for(const std::vector<float>& col, size_t bits, uint64_t seed) {
+    saq::LloydOpts opts;
+    opts.max_bits = bits;
+    opts.init     = saq::CodebookInit::KMeansPlusPlus;
+    opts.restarts = 1;
+    opts.seed     = seed;
+    saq::CodebookResult r = saq::build_codebook_lloyd(col, opts);
+    return static_cast<double>(saq::codebook_mse(col, r.codebooks[bits]));
+}
+
+// Build the DP-optimal codebook for `col` at `bits` (only valid bits <= 8).
+// Returns the MSE on the FULL column.
+double dp_mse_for(const std::vector<float>& col, size_t bits) {
+    saq::CodebookResult r = saq::build_codebook_dp(col, bits, /*num_bins=*/500);
+    return static_cast<double>(saq::codebook_mse(col, r.codebooks[bits]));
+}
+
 long peak_rss_kb() {
     struct rusage ru{};
     getrusage(RUSAGE_SELF, &ru);
@@ -91,19 +131,58 @@ double now_s() {
 }  // namespace
 
 int main() {
-    const std::string pca_path =
-        "data/datasets/dbpedia_100k/vectors_pca.fvecs";
-    auto col = read_pca_column(pca_path, /*n=*/5000, /*dim_idx=*/0);
-    if (col.size() != 5000) {
-        std::fprintf(stderr, "dbpedia read FAILED (size=%zu). symlink ok?\n", col.size());
-        return 1;
+    const std::string pca_path = "data/datasets/dbpedia_100k/vectors_pca.fvecs";
+    const size_t N = 5000;
+
+    struct Source { std::string name; std::vector<float> col; double cube_root_I; };
+    std::vector<Source> sources;
+    for (size_t dim : {0, 100, 300, 500, 1000, 1500}) {
+        std::string name = "dbpedia_d" + std::to_string(dim);
+        std::vector<float> col = read_pca_column(pca_path, N, dim);
+        if (col.size() != N) {
+            std::fprintf(stderr, "source %s: read FAILED (got %zu)\n", name.c_str(), col.size());
+            return 1;
+        }
+        double I = estimate_cube_root_integral(col, /*num_bins=*/500);
+        sources.push_back({name, std::move(col), I});
+        std::fprintf(stderr, "%-15s loaded, I(cube_root)=%.5f\n", name.c_str(), I);
     }
-    double I = estimate_cube_root_integral(col, /*num_bins=*/500);
-    std::fprintf(stderr, "dbpedia dim0: I(cube_root) = %.6f\n", I);
-    for (size_t b : {4, 6, 8, 10, 12}) {
-        double lb = bennett_lower_bound(I, b);
-        std::fprintf(stderr, "  Bennett lower bound at b=%zu: %.6e\n", b, lb);
+
+    const std::vector<size_t> e2_bits = {2, 4, 6, 8};
+    const std::vector<size_t> e3_bits = {9, 10, 11, 12, 13};
+    const std::vector<size_t> seeds   = {0, 1, 2};
+
+    std::vector<Cell> cells;
+    for (const auto& s : sources) {
+        // E2 range: DP available, ratio vs DP.
+        for (size_t b : e2_bits) {
+            double dp = dp_mse_for(s.col, b);
+            for (uint64_t seed : seeds) {
+                std::fprintf(stderr, "E2 %-15s b=%zu seed=%lu...\n", s.name.c_str(), b, seed);
+                double ll = lloyd_mse_for(s.col, b, seed);
+                cells.push_back(Cell{s.name, b, seed, dp, ll, 0.0, true, false});
+                std::fprintf(stderr, "  dp=%.4e lloyd=%.4e ratio=%.4f\n",
+                             dp, ll, ll / std::max(dp, 1e-300));
+            }
+        }
+        // E3 range: DP unavailable, ratio vs Bennett.
+        for (size_t b : e3_bits) {
+            double lb = bennett_lower_bound(s.cube_root_I, b);
+            for (uint64_t seed : seeds) {
+                std::fprintf(stderr, "E3 %-15s b=%zu seed=%lu...\n", s.name.c_str(), b, seed);
+                double ll = lloyd_mse_for(s.col, b, seed);
+                cells.push_back(Cell{s.name, b, seed, 0.0, ll, lb, false, true});
+                std::fprintf(stderr, "  lloyd=%.4e bennett_lb=%.4e ratio=%.4f\n",
+                             ll, lb, ll / std::max(lb, 1e-300));
+            }
+        }
     }
-    std::printf("{\"status\":\"bennett_ok\"}\n");
+
+    std::printf("{\n \"cells\": [");
+    bool first = true;
+    for (const auto& c : cells) { emit_cell_json(c, first); first = false; }
+    std::printf("\n ]\n}\n");
+    std::fprintf(stderr, "\nDone. Cells: %zu, peak_rss=%ld KB\n",
+                 cells.size(), peak_rss_kb());
     return 0;
 }
