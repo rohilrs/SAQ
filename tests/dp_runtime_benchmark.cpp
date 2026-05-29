@@ -89,6 +89,21 @@ Cell run_dp(const std::string& source, const std::vector<float>& v, size_t bits)
                 r.costs.empty() ? 0.f : r.costs[bits]};
 }
 
+Cell run_lloyd(const std::string& source, const std::vector<float>& v, size_t bits) {
+    saq::LloydOpts opts;
+    opts.max_bits = bits;
+    opts.init     = saq::CodebookInit::KMeansPlusPlus;
+    opts.restarts = 1;
+    opts.seed     = 0;
+    long rss_before = peak_rss_kb();
+    double t0 = now_s();
+    saq::CodebookResult r = saq::build_codebook_lloyd(v, opts);
+    double t1 = now_s();
+    long rss_after = peak_rss_kb();
+    return Cell{source, "lloyd_kpp", bits, t1 - t0, rss_after, rss_after - rss_before,
+                r.costs.empty() ? 0.f : r.costs[bits]};
+}
+
 }  // namespace
 
 int main() {
@@ -118,6 +133,17 @@ int main() {
         for (size_t b : dp_bits) {
             std::fprintf(stderr, "DP  %-16s b=%zu...\n", s.name.c_str(), b);
             Cell c = run_dp(s.name, s.col, b);
+            emit_cell_json(c, first); first = false;
+            std::fprintf(stderr, "  t=%.4fs delta_rss=%ld KB cost=%.4g\n",
+                         c.seconds, c.delta_rss_kb, c.cost_at_bits);
+        }
+    }
+    // Lloyd runs at all bits 4..13 (DP can't go past 8; Lloyd is the production path).
+    std::vector<size_t> lloyd_bits = {4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
+    for (const auto& s : sources) {
+        for (size_t b : lloyd_bits) {
+            std::fprintf(stderr, "LLD %-16s b=%zu...\n", s.name.c_str(), b);
+            Cell c = run_lloyd(s.name, s.col, b);
             emit_cell_json(c, first); first = false;
             std::fprintf(stderr, "  t=%.4fs delta_rss=%ld KB cost=%.4g\n",
                          c.seconds, c.delta_rss_kb, c.cost_at_bits);
