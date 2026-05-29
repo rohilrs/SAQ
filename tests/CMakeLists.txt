@@ -58,3 +58,12 @@ if(DEFINED ENV{CONDA_PREFIX})
   target_link_directories(codebook_init_benchmark BEFORE PRIVATE $ENV{CONDA_PREFIX}/lib)
   target_link_options(codebook_init_benchmark PRIVATE "LINKER:--enable-new-dtags")
 endif()
+
+# E1/E1b benchmark: DP runtime + memory vs b, plus Lloyd comparison.
+# Does NOT include ivf_index.h / fast_scan.h, so no AVX-512 flags needed.
+add_executable(dp_runtime_benchmark dp_runtime_benchmark.cpp)
+target_link_libraries(dp_runtime_benchmark PRIVATE saq)
+if(DEFINED ENV{CONDA_PREFIX})
+  target_link_directories(dp_runtime_benchmark BEFORE PRIVATE $ENV{CONDA_PREFIX}/lib)
+  target_link_options(dp_runtime_benchmark PRIVATE "LINKER:--enable-new-dtags")
+endif()
