@@ -68,3 +68,20 @@ if(DEFINED ENV{CONDA_PREFIX})
   target_link_directories(codebook_fidelity_benchmark BEFORE PRIVATE $ENV{CONDA_PREFIX}/lib)
   target_link_options(codebook_fidelity_benchmark PRIVATE "LINKER:--enable-new-dtags")
 endif()
+
+# E2b recall-delta benchmark: Recall@10 for Lloyd-derived vs DP-derived codebooks
+# on dbpedia-100K. Transitively includes ivf_index.h -> fast_scan.h, so AVX-512 required.
+add_executable(recall_delta_benchmark recall_delta_benchmark.cpp)
+target_link_libraries(recall_delta_benchmark PRIVATE saq)
+if(DEFINED ENV{CONDA_PREFIX})
+  target_link_directories(recall_delta_benchmark BEFORE PRIVATE $ENV{CONDA_PREFIX}/lib)
+  target_link_options(recall_delta_benchmark PRIVATE "LINKER:--enable-new-dtags")
+endif()
+if(SAQ_REQUIRE_AVX512)
+  if(MSVC)
+    target_compile_options(recall_delta_benchmark PRIVATE /arch:AVX512)
+  else()
+    target_compile_options(recall_delta_benchmark PRIVATE
+      -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma)
+  endif()
+endif()
