@@ -104,6 +104,33 @@ Cell run_lloyd(const std::string& source, const std::vector<float>& v, size_t bi
                 r.costs.empty() ? 0.f : r.costs[bits]};
 }
 
+void print_summary(const std::vector<Cell>& cells, double budget_s) {
+    std::fprintf(stderr, "\n=== Summary (budget=%.1fs/dim) ===\n", budget_s);
+    std::fprintf(stderr, "%-16s | %-9s | %-4s | %10s | %10s | %12s\n",
+                 "source", "method", "b", "time(s)", "rss_kb", "cost");
+    std::fprintf(stderr, "%s\n", std::string(80, '-').c_str());
+    for (const auto& c : cells) {
+        std::fprintf(stderr, "%-16s | %-9s | %4zu | %10.4f | %10ld | %12.4g %s\n",
+                     c.source.c_str(), c.method.c_str(), c.bits,
+                     c.seconds, c.peak_rss_kb_after, c.cost_at_bits,
+                     (c.method == "dp" && c.seconds > budget_s) ? "*OVER*" : "");
+    }
+    // Declare b*: the largest b for which dp.seconds <= budget across ALL sources.
+    size_t b_star = 0;
+    for (size_t b = 4; b <= 13; ++b) {
+        bool all_within = false; bool any_dp = false;
+        for (const auto& c : cells) {
+            if (c.method == "dp" && c.bits == b) {
+                any_dp = true;
+                if (c.seconds <= budget_s) all_within = true; else { all_within = false; break; }
+            }
+        }
+        if (any_dp && all_within) b_star = b;
+    }
+    std::fprintf(stderr, "\nb* (largest b with DP <= %.1fs across all sources) = %zu\n",
+                 budget_s, b_star);
+}
+
 }  // namespace
 
 int main() {
@@ -124,31 +151,33 @@ int main() {
         }
     }
 
-    // DP is only valid through b=8 (CHECK in build_codebook_dp).
+    std::vector<Cell> cells;
     std::vector<size_t> dp_bits = {4, 5, 6, 7, 8};
-
-    std::printf("{\n \"cells\": [");
-    bool first = true;
     for (const auto& s : sources) {
         for (size_t b : dp_bits) {
             std::fprintf(stderr, "DP  %-16s b=%zu...\n", s.name.c_str(), b);
             Cell c = run_dp(s.name, s.col, b);
-            emit_cell_json(c, first); first = false;
             std::fprintf(stderr, "  t=%.4fs delta_rss=%ld KB cost=%.4g\n",
                          c.seconds, c.delta_rss_kb, c.cost_at_bits);
+            cells.push_back(c);
         }
     }
-    // Lloyd runs at all bits 4..13 (DP can't go past 8; Lloyd is the production path).
     std::vector<size_t> lloyd_bits = {4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
     for (const auto& s : sources) {
         for (size_t b : lloyd_bits) {
             std::fprintf(stderr, "LLD %-16s b=%zu...\n", s.name.c_str(), b);
             Cell c = run_lloyd(s.name, s.col, b);
-            emit_cell_json(c, first); first = false;
             std::fprintf(stderr, "  t=%.4fs delta_rss=%ld KB cost=%.4g\n",
                          c.seconds, c.delta_rss_kb, c.cost_at_bits);
+            cells.push_back(c);
         }
     }
+
+    std::printf("{\n \"cells\": [");
+    bool first = true;
+    for (const auto& c : cells) { emit_cell_json(c, first); first = false; }
     std::printf("\n ]\n}\n");
+
+    print_summary(cells, /*budget_s=*/60.0);
     return 0;
 }
