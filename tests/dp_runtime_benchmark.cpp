@@ -60,28 +60,69 @@ double now_s() {
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
+struct Cell {
+    std::string source;       // "synthetic" | "dbpedia_d0" | "dbpedia_d500" | "dbpedia_d1500"
+    std::string method;       // "dp" | "lloyd_kpp"
+    size_t      bits;
+    double      seconds;
+    long        peak_rss_kb_after;
+    long        delta_rss_kb;
+    float       cost_at_bits; // costs[bits], for sanity
+};
+
+void emit_cell_json(const Cell& c, bool first) {
+    std::printf("%s\n  {\"source\":\"%s\",\"method\":\"%s\",\"bits\":%zu,"
+                "\"seconds\":%.6f,\"peak_rss_kb\":%ld,\"delta_rss_kb\":%ld,"
+                "\"cost_at_bits\":%.6g}",
+                first ? "" : ",", c.source.c_str(), c.method.c_str(),
+                c.bits, c.seconds, c.peak_rss_kb_after, c.delta_rss_kb,
+                c.cost_at_bits);
+}
+
+Cell run_dp(const std::string& source, const std::vector<float>& v, size_t bits) {
+    long rss_before = peak_rss_kb();
+    double t0 = now_s();
+    saq::CodebookResult r = saq::build_codebook_dp(v, bits, /*num_bins=*/500);
+    double t1 = now_s();
+    long rss_after = peak_rss_kb();
+    return Cell{source, "dp", bits, t1 - t0, rss_after, rss_after - rss_before,
+                r.costs.empty() ? 0.f : r.costs[bits]};
+}
+
 }  // namespace
 
 int main() {
-    const std::string pca_path =
-        "data/datasets/dbpedia_100k/vectors_pca.fvecs";
-    auto col0 = read_pca_column(pca_path, /*n=*/5000, /*dim_idx=*/0);
-    auto col1500 = read_pca_column(pca_path, /*n=*/5000, /*dim_idx=*/1500);
-    if (col0.size() != 5000 || col1500.size() != 5000) {
-        std::fprintf(stderr, "dbpedia read FAILED. Did you symlink data/?\n");
-        return 1;
+    const std::string pca_path = "data/datasets/dbpedia_100k/vectors_pca.fvecs";
+    const size_t N = 5000;
+
+    struct Source { std::string name; std::vector<float> col; };
+    std::vector<Source> sources;
+    sources.push_back({"synthetic",     make_gaussian(N, 42)});
+    sources.push_back({"dbpedia_d0",    read_pca_column(pca_path, N, 0)});
+    sources.push_back({"dbpedia_d500",  read_pca_column(pca_path, N, 500)});
+    sources.push_back({"dbpedia_d1500", read_pca_column(pca_path, N, 1500)});
+    for (auto& s : sources) {
+        if (s.col.size() != N) {
+            std::fprintf(stderr, "source %s: read FAILED (got %zu, want %zu)\n",
+                         s.name.c_str(), s.col.size(), N);
+            return 1;
+        }
     }
-    auto stats = [](const std::vector<float>& v) {
-        double s = 0, sq = 0; for (float x : v) { s += x; sq += double(x) * x; }
-        double m = s / v.size(); return std::pair<double,double>{m, sq / v.size() - m * m};
-    };
-    auto [m0, var0] = stats(col0);
-    auto [m1500, var1500] = stats(col1500);
-    std::fprintf(stderr,
-                 "dbpedia dim0:    n=%zu mean=%.5f var=%.5f\n"
-                 "dbpedia dim1500: n=%zu mean=%.5f var=%.5f\n"
-                 "peak_rss=%ld KB\n",
-                 col0.size(), m0, var0, col1500.size(), m1500, var1500, peak_rss_kb());
-    std::printf("{\"status\":\"reader_ok\"}\n");
+
+    // DP is only valid through b=8 (CHECK in build_codebook_dp).
+    std::vector<size_t> dp_bits = {4, 5, 6, 7, 8};
+
+    std::printf("{\n \"cells\": [");
+    bool first = true;
+    for (const auto& s : sources) {
+        for (size_t b : dp_bits) {
+            std::fprintf(stderr, "DP  %-16s b=%zu...\n", s.name.c_str(), b);
+            Cell c = run_dp(s.name, s.col, b);
+            emit_cell_json(c, first); first = false;
+            std::fprintf(stderr, "  t=%.4fs delta_rss=%ld KB cost=%.4g\n",
+                         c.seconds, c.delta_rss_kb, c.cost_at_bits);
+        }
+    }
+    std::printf("\n ]\n}\n");
     return 0;
 }
