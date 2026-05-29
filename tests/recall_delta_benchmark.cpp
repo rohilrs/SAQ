@@ -181,14 +181,79 @@ int main() {
         }
     }
 
-    // --- Emit partial JSON now; Task 9 adds the DP side. ---
+    // --- IVF #2: DP-derived codebooks, injected via set_codebooks ---
+    // Build per-segment, per-dim DimensionCodebooks by running build_codebook_dp
+    // on each global dim at its segment's bit count. quant_plan is what IVF #1
+    // computed; we honor it to keep segment structure identical.
+
+    std::fprintf(stderr, "[dp] deriving DP codebooks per dim (parallel over dims; not part of recall timing)...\n");
+    std::vector<std::vector<saq::DimensionCodebook>> dp_codebooks(quant_plan.size());
+    for (size_t s = 0; s < quant_plan.size(); ++s) {
+        dp_codebooks[s].resize(quant_plan[s].first);
+    }
+
+    // Precompute the per-segment global-dim start indices, so each thread
+    // can independently figure out which segment its dim belongs to.
+    std::vector<size_t> seg_start(quant_plan.size() + 1, 0);
+    for (size_t s = 0; s < quant_plan.size(); ++s) {
+        seg_start[s + 1] = seg_start[s] + quant_plan[s].first;
+    }
+    const size_t total_dims = seg_start.back();
+
+    double t_dp_start = now_s();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 8)
+#endif
+    for (long long gdim_ll = 0; gdim_ll < static_cast<long long>(total_dims); ++gdim_ll) {
+        size_t gdim = static_cast<size_t>(gdim_ll);
+        // Find which segment this gdim belongs to.
+        size_t seg = 0;
+        while (seg + 1 < seg_start.size() && seg_start[seg + 1] <= gdim) ++seg;
+        const size_t bits = quant_plan[seg].second;
+        const size_t j    = gdim - seg_start[seg];
+        std::vector<float> col(static_cast<size_t>(data.rows()));
+        for (Eigen::Index i = 0; i < data.rows(); ++i)
+            col[static_cast<size_t>(i)] = data(i, static_cast<Eigen::Index>(gdim));
+        auto r = saq::build_codebook_dp(col, bits, /*num_bins=*/500);
+        dp_codebooks[seg][j] = r.codebooks[bits];
+    }
+    std::fprintf(stderr, "[dp] per-dim DP build done in %.1fs (total_dims=%zu)\n",
+                 now_s() - t_dp_start, total_dims);
+
+    std::fprintf(stderr, "[dp] constructing IVF with set_codebooks(DP-derived)...\n");
+    saq::QuantizeConfig cfg_dp = cfg_lloyd;
+    saq::IVF ivf_dp(N, D, K, cfg_dp);
+    ivf_dp.set_codebooks(std::move(dp_codebooks));
+    t0 = now_s();
+    ivf_dp.construct(data, centroids, cluster_ids.data());
+    t1 = now_s();
+    std::fprintf(stderr, "[dp] construct: %.2fs\n", t1 - t0);
+
+    std::vector<std::vector<int32_t>> found_dp(queries.rows());
+    t0 = now_s();
+    {
+        std::vector<saq::PID> result_buf(k_top);
+        for (Eigen::Index q = 0; q < queries.rows(); ++q) {
+            ivf_dp.search(queries.row(q), k_top, nprobe, scfg, result_buf.data());
+            auto& row = found_dp[static_cast<size_t>(q)];
+            row.resize(k_top);
+            for (size_t i = 0; i < k_top; ++i)
+                row[i] = static_cast<int32_t>(result_buf[i]);
+        }
+    }
+    t1 = now_s();
+    double recall_dp = recall_at_k(gt_rows, found_dp, k_top);
+    std::fprintf(stderr, "[dp] search %zu queries: %.2fs total, recall@%zu=%.4f\n",
+                 static_cast<size_t>(queries.rows()), t1 - t0, k_top, recall_dp);
+
+    double delta_pp = (recall_dp - recall_lloyd) * 100.0;  // in percentage points
     std::printf("{\n"
                 "  \"k_top\": %zu,\n"
                 "  \"nprobe\": %zu,\n"
                 "  \"avg_bits\": %.2f,\n"
                 "  \"recall_lloyd\": %.6f,\n"
-                "  \"recall_dp\":    null,\n"
-                "  \"delta_pp\":     null\n"
-                "}\n", k_top, nprobe, cfg_lloyd.avg_bits, recall_lloyd);
+                "  \"recall_dp\":    %.6f,\n"
+                "  \"delta_pp\":     %.4f\n"
+                "}\n", k_top, nprobe, cfg_lloyd.avg_bits, recall_lloyd, recall_dp, delta_pp);
     return 0;
 }
