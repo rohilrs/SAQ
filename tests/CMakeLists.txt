@@ -58,3 +58,13 @@ if(DEFINED ENV{CONDA_PREFIX})
   target_link_directories(codebook_init_benchmark BEFORE PRIVATE $ENV{CONDA_PREFIX}/lib)
   target_link_options(codebook_init_benchmark PRIVATE "LINKER:--enable-new-dtags")
 endif()
+
+# E2 + E3-strategy-2 fidelity benchmark: per-dim ratio-vs-DP (b <= 8) and
+# ratio-vs-Bennett (b >= 9), across the dbpedia PCA variance gradient.
+# No AVX-512 flags needed — only includes codebook_builder.h, not ivf_index.h.
+add_executable(codebook_fidelity_benchmark codebook_fidelity_benchmark.cpp)
+target_link_libraries(codebook_fidelity_benchmark PRIVATE saq)
+if(DEFINED ENV{CONDA_PREFIX})
+  target_link_directories(codebook_fidelity_benchmark BEFORE PRIVATE $ENV{CONDA_PREFIX}/lib)
+  target_link_options(codebook_fidelity_benchmark PRIVATE "LINKER:--enable-new-dtags")
+endif()
