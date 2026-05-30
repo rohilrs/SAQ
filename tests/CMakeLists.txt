@@ -6,6 +6,13 @@
 # TransformQuery, WorkingDim) that was replaced when the codebase was
 # ported to the reference IVF / SaqData pipeline. They are left in-tree
 # for historical reference but intentionally not wired into the build.
+#
+# bit_allocation_dp_test.cpp additionally references a pre-scaffolded
+# BitAllocatorDP::Allocate / ComputeDistortion / ApplyAllocation interface
+# that is out of scope for Sub-Project 2 (only AllocateJoint exists today).
+# Re-enable when those static helpers + non-joint Allocate path land.
+# add_executable(bit_allocation_dp_test bit_allocation_dp_test.cpp)
+# target_link_libraries(bit_allocation_dp_test PRIVATE saq)
 
 add_executable(test_fit_decompress test_fit_decompress.cpp)
 target_link_libraries(test_fit_decompress PRIVATE saq)
@@ -49,6 +56,13 @@ if(SAQ_REQUIRE_AVX512)
     target_compile_options(test_codebook_builder PRIVATE
       -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma)
   endif()
+endif()
+
+add_executable(bit_allocator_greedy_test bit_allocator_greedy_test.cpp)
+target_link_libraries(bit_allocator_greedy_test PRIVATE saq)
+if(DEFINED ENV{CONDA_PREFIX})
+  target_link_directories(bit_allocator_greedy_test BEFORE PRIVATE $ENV{CONDA_PREFIX}/lib)
+  target_link_options(bit_allocator_greedy_test PRIVATE "LINKER:--enable-new-dtags")
 endif()
 
 # Manual-run benchmark: codebook init strategy speed + quality comparison.
