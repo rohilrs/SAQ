@@ -1,6 +1,7 @@
 target_sources(saq
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/bit_allocator_dp.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/bit_allocator_greedy.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/quantization_plan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/rotator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/caq_encoder.cpp
