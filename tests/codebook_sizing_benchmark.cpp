@@ -101,17 +101,53 @@ std::pair<double, double> run_lloyd_cell(
 }  // namespace
 
 int main() {
-    // Quick sanity: synthetic n=10K (small) at b=6, sweep S/k ∈ {50, 200}.
-    auto col_train = make_gaussian(10'000, 42);
-    auto col_eval  = make_gaussian(10'000, 99);
-    const size_t bits = 6;
-    const size_t k = size_t{1} << bits;
-    for (size_t r : {50u, 200u}) {
-        size_t S = r * k;
-        auto [dt, mse] = run_lloyd_cell(col_train, col_eval, bits, S, /*seed=*/0);
-        std::fprintf(stderr, "synthetic n=10K b=%zu S/k=%zu S=%zu t=%.3fs mse=%.4e\n",
-                     bits, r, S, dt, mse);
+    // -- E4 Sweep 1: Synthetic Gaussian, n=10M, b ∈ {8, 10, 12} --
+    // Stream one column per cell; never materialize the full N×D matrix.
+    // Use a fixed dim index for naming (synthetic doesn't have meaningful dim semantics).
+    const size_t N = 10'000'000;
+    const std::vector<size_t> bits_list = {8, 10, 12};
+    const std::vector<size_t> sk_ratios = {50, 100, 200, 500, 1000};
+    const std::vector<uint64_t> seeds = {0, 1};
+    const size_t proxy_full_S = 2'000'000;  // largest practical kpp(full); covers up to b=12 (k=4096; 2M/4096 ≈ 488 S/k, well-converged per init-sizing benchmark)
+
+    std::fprintf(stderr, "Generating eval column (n=%zu N(0,1), seed=99)...\n", N);
+    auto col_eval = make_gaussian(N, 99);
+    std::fprintf(stderr, "Generating train column (n=%zu N(0,1), seed=42)...\n", N);
+    auto col_train = make_gaussian(N, 42);
+    std::fprintf(stderr, "Both columns ready; peak_rss=%ld KB\n", peak_rss_kb());
+
+    std::vector<Cell> cells;
+    for (size_t bits : bits_list) {
+        // proxy "full" (S=2M, fixed) — used as the baseline for ratio comparisons.
+        for (uint64_t seed : seeds) {
+            std::fprintf(stderr, "[synthetic_10m] b=%zu proxy_full S=%zu seed=%lu...\n",
+                         bits, proxy_full_S, seed);
+            auto [dt, mse] = run_lloyd_cell(col_train, col_eval, bits, proxy_full_S, seed);
+            cells.push_back(Cell{"synthetic_10m", bits, 0, proxy_full_S, seed, 0, dt, mse});
+            std::fprintf(stderr, "  t=%.2fs mse=%.4e\n", dt, mse);
+        }
+        const size_t k = size_t{1} << bits;
+        for (size_t r : sk_ratios) {
+            size_t S = r * k;
+            if (S >= N) {
+                std::fprintf(stderr, "[synthetic_10m] b=%zu S/k=%zu S=%zu SKIPPED (S>=N)\n",
+                             bits, r, S);
+                continue;
+            }
+            for (uint64_t seed : seeds) {
+                std::fprintf(stderr, "[synthetic_10m] b=%zu S/k=%zu S=%zu seed=%lu...\n",
+                             bits, r, S, seed);
+                auto [dt, mse] = run_lloyd_cell(col_train, col_eval, bits, S, seed);
+                cells.push_back(Cell{"synthetic_10m", bits, r, S, seed, 0, dt, mse});
+                std::fprintf(stderr, "  t=%.2fs mse=%.4e\n", dt, mse);
+            }
+        }
     }
-    std::printf("{\"status\":\"sweep_ok\"}\n");
+
+    std::printf("{\n \"cells\": [");
+    bool first = true;
+    for (const auto& c : cells) { emit_cell_json(c, first); first = false; }
+    std::printf("\n ]\n}\n");
+    std::fprintf(stderr, "\nDone. Cells: %zu, peak_rss=%ld KB\n", cells.size(), peak_rss_kb());
     return 0;
 }
