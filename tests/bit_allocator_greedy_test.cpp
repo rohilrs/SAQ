@@ -21,9 +21,9 @@ saq::JointAllocationConfig make_config(size_t num_blocks, float avg_bits,
     c.dim_padding_size   = kDimPad;
     c.max_bits_per_dim   = max_bits;
     c.num_bit_factors    = kNumBitFactors;
-    // Match the DP's total_bits formula plus pessimistic per-block factor reserve
-    // for the greedy (so the budget is comparable).
-    c.total_bits         = static_cast<size_t>(avg_bits * c.num_dim_padded) + c.num_bit_factors * num_blocks;
+    // Match the production dispatcher's total_bits formula (one factor of overhead,
+    // not one-per-block) — see SaqDataMaker::analyze_plan.
+    c.total_bits         = static_cast<size_t>(avg_bits * c.num_dim_padded) + c.num_bit_factors;
     return c;
 }
 
@@ -110,6 +110,35 @@ void TestEqualVarianceParity() {
     std::printf("TestEqualVarianceParity: OK (uniform b=%zu, %zu seg merged)\n",
                 bits[0], r.quant_plan.size());
 }
+
+// Regression test for the under-allocation bug — 24 blocks with a PCA-like
+// descending variance gradient at avg_bits=2 (similar shape to dbpedia at b=2).
+// Pre-fix greedy left ~43% of the budget unused; post-fix should use >=95%.
+void TestBudgetUtilizationOnGradient() {
+    const size_t num_blocks = 24;
+    auto cfg = make_config(num_blocks, /*avg_bits=*/2.0f);
+
+    // Build a synthetic 24-block PCA-rotated-style variance gradient:
+    // var_per_block ranges from 1e-2 (head) to 1e-9 (tail), log-spaced.
+    std::vector<float> vars(num_blocks);
+    for (size_t i = 0; i < num_blocks; ++i) {
+        // 7 decades of decay across 24 blocks, ≈ 0.3 decades per block.
+        vars[i] = static_cast<float>(1e-2 * std::pow(10.0, -7.0 * double(i) / double(num_blocks - 1)));
+    }
+    auto mse = build_mse_table(vars);
+    saq::BitAllocatorGreedy alloc;
+    auto r = alloc.AllocateJoint(mse, cfg);
+    assert(r.ok());
+
+    // Budget check: ≥ 95% of the budget should be used (was ~57% pre-fix).
+    const double frac_used = double(r.total_bits_used) / double(cfg.total_bits);
+    std::printf("TestBudgetUtilizationOnGradient: "
+                "total_bits_used=%zu, tot_bits=%zu (%.1f%% used), n_segs=%zu\n",
+                r.total_bits_used, cfg.total_bits, 100.0 * frac_used, r.quant_plan.size());
+    assert(frac_used >= 0.95);
+    // And we shouldn't overspend the budget.
+    assert(r.total_bits_used <= cfg.total_bits);
+}
 }  // namespace
 
 int main() {
@@ -117,6 +146,7 @@ int main() {
     TestTwoBlockUnequalVariance();
     TestBitCap();
     TestEqualVarianceParity();
+    TestBudgetUtilizationOnGradient();
     std::printf("\nAll bit_allocator_greedy tests passed!\n");
     return 0;
 }

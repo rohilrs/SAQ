@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <limits>
 #include <vector>
 
 namespace saq {
@@ -22,13 +23,8 @@ BitAllocationResult BitAllocatorGreedy::AllocateJoint(const Eigen::MatrixXf &mse
 
     const size_t num_blocks = num_dim_padded / dim_padding;
 
-    // Reserve factor overhead pessimistically (one factor per block); merging recovers some.
-    // This means the greedy result may use slightly fewer total bits than the DP's exact budget.
-    const size_t budget_after_factors = (tot_bits > num_blocks * num_bit_factors)
-        ? tot_bits - num_blocks * num_bit_factors : 0;
-    const size_t block_bit_units = budget_after_factors / dim_padding;
-
-    // Precompute per-block MSE at each bit level: block_mse[i][b].
+    // Precompute per-block MSE at each bit level: block_mse[i][b] = sum of mse_table(d, b)
+    // for d in block i.
     std::vector<std::vector<double>> block_mse(num_blocks,
                                                 std::vector<double>(max_bits + 1, 0.0));
     for (size_t i = 0; i < num_blocks; ++i) {
@@ -43,18 +39,45 @@ BitAllocationResult BitAllocatorGreedy::AllocateJoint(const Eigen::MatrixXf &mse
         }
     }
 
-    // Greedy loop.
+    // Bit usage = sum(bits) * dim_padding + (# segments with b > 0) * num_bit_factors.
+    // Re-uses the same merge logic as the final emit.
+    auto compute_usage = [&](const std::vector<size_t> &bits) -> size_t {
+        size_t dim_bits = 0;
+        for (size_t i = 0; i < num_blocks; ++i) dim_bits += bits[i];
+        dim_bits *= dim_padding;
+        size_t segs_with_bits = 0;
+        for (size_t i = 0; i < num_blocks; ) {
+            const size_t b = bits[i];
+            size_t j = i + 1;
+            while (j < num_blocks && bits[j] == b) ++j;
+            if (b > 0) ++segs_with_bits;
+            i = j;
+        }
+        return dim_bits + segs_with_bits * num_bit_factors;
+    };
+
+    // Greedy loop: bump the block with the largest marginal MSE drop. After each
+    // tentative bump, recompute total usage (which depends on how many segments
+    // currently exist with bits > 0); roll back if the new total exceeds tot_bits.
+    // This naturally accounts for factor overhead being created (a bump on a
+    // previously-zero block adds one segment of factors) or recovered (a bump
+    // that merges two segments removes one segment's overhead).
     std::vector<size_t> bits(num_blocks, 0);
-    for (size_t step = 0; step < block_bit_units; ++step) {
+    while (true) {
         ssize_t best_i = -1;
-        double  best_drop = -1.0;
+        double  best_drop = -std::numeric_limits<double>::infinity();
         for (size_t i = 0; i < num_blocks; ++i) {
             if (bits[i] >= max_bits) continue;
-            double drop = block_mse[i][bits[i]] - block_mse[i][bits[i] + 1];
+            const double drop = block_mse[i][bits[i]] - block_mse[i][bits[i] + 1];
             if (drop > best_drop) { best_drop = drop; best_i = static_cast<ssize_t>(i); }
         }
-        if (best_i < 0) break;  // all blocks capped
+        if (best_i < 0) break;  // every block at max_bits already
+
         bits[static_cast<size_t>(best_i)]++;
+        if (compute_usage(bits) > tot_bits) {
+            bits[static_cast<size_t>(best_i)]--;  // rollback — bump would exceed budget
+            break;
+        }
     }
 
     // Merge consecutive equal-bit blocks into segments.
