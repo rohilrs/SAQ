@@ -8,10 +8,47 @@
 
 #include <algorithm>
 #include <limits>
+#include <span>
 #include <utility>
 #include <vector>
 
 namespace saq {
+
+// ============================================================================
+// build_mse_table_for_allocation
+// ============================================================================
+
+Eigen::MatrixXf build_mse_table_for_allocation(const FloatRowMat &data,
+                                               size_t max_bits) {
+    const Eigen::Index N = data.rows();
+    const Eigen::Index D = data.cols();
+    Eigen::MatrixXf mse_table(D, static_cast<Eigen::Index>(max_bits + 1));
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 8)
+    #endif
+    for (Eigen::Index d = 0; d < D; ++d) {
+        std::vector<float> col(static_cast<size_t>(N));
+        for (Eigen::Index i = 0; i < N; ++i) {
+            col[static_cast<size_t>(i)] = data(i, d);
+        }
+        LloydOpts opts;
+        opts.max_bits    = max_bits;
+        opts.init        = CodebookInit::KMeansPlusPlus;
+        opts.restarts    = 1;
+        opts.seed        = 0;
+        opts.sample_size = recommended_sample_size(static_cast<size_t>(N), max_bits);
+
+        auto r = build_codebook_lloyd(std::span<const float>(col), opts);
+
+        CHECK_EQ(r.costs.size(), max_bits + 1)
+            << "build_codebook_lloyd returned unexpected costs size";
+        for (size_t b = 0; b <= max_bits; ++b) {
+            mse_table(d, static_cast<Eigen::Index>(b)) = r.costs[b];
+        }
+    }
+    return mse_table;
+}
 
 // ============================================================================
 // SaqData::save / SaqData::load

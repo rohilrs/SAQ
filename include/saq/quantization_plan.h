@@ -23,13 +23,17 @@
 #include <utility>
 #include <vector>
 
+#include <Eigen/Dense>
 #include <glog/logging.h>
 #include <fmt/core.h>
 
+#include "saq/bit_allocator.h"
+#include "saq/bit_allocator_greedy.h"
 #include "saq/codebook_encoder.h"
 #include "saq/defines.h"
 #include "saq/config.h"
 #include "saq/io_utils.h"
+#include "saq/preprocessing/codebook_builder.h"
 #include "saq/rotator.h"
 #include "saq/tools.h"
 
@@ -133,6 +137,22 @@ struct SaqData {
 };
 
 // ============================================================================
+// MSE table builder for greedy allocation
+// ============================================================================
+
+/// @brief Build a per-dimension empirical MSE table for greedy bit allocation.
+///
+/// Returns a matrix of shape (num_dim_padded, max_bits + 1) where entry (d, b)
+/// is the Lloyd reconstruction MSE for dimension d quantized at b bits.
+/// Uses OpenMP parallelism when available. Typical runtime: 10-20 s for
+/// D=1536 with max_bits=8 and OpenMP enabled.
+///
+/// @param data   Rotated data matrix, shape (N, num_dim_padded).
+/// @param max_bits  Per-dimension bit cap; typically KMaxQuantizeBits (13).
+Eigen::MatrixXf build_mse_table_for_allocation(const FloatRowMat &data,
+                                               size_t max_bits);
+
+// ============================================================================
 // SaqDataMaker — builds SaqData via DP-based segmentation + bit allocation
 // ============================================================================
 
@@ -150,6 +170,11 @@ class SaqDataMaker {
     const size_t num_dim_padded_; ///< Padded dimension (multiple of kDimPaddingSize)
     std::unique_ptr<SaqData> data_;
 
+    /// Non-owning pointer to the rotated data matrix — set by set_rotated_data().
+    /// Only used when cfg.allocator == AllocatorKind::Greedy.
+    const FloatRowMat *rotated_data_ = nullptr;
+    bool rotated_data_set_ = false;
+
   public:
     /// @brief Construct a SaqDataMaker with the given config and dimension.
     explicit SaqDataMaker(QuantizeConfig cfg, size_t num_dim)
@@ -166,6 +191,17 @@ class SaqDataMaker {
 
     bool is_variance_set() const {
         return data_->data_variance.cols() != 0;
+    }
+
+    /// @brief Register the rotated data matrix for greedy allocation.
+    ///
+    /// Must be called before set_variance() / compute_variance() when
+    /// cfg.allocator == AllocatorKind::Greedy.  SaqDataMaker does NOT take
+    /// ownership; the caller must ensure @p data outlives the call to
+    /// set_variance() / compute_variance().
+    void set_rotated_data(const FloatRowMat &data) {
+        rotated_data_    = &data;
+        rotated_data_set_ = true;
     }
 
     /// @brief Set per-dimension variance directly; pads with zeros if needed.
@@ -186,19 +222,52 @@ class SaqDataMaker {
     /// @brief Create BaseQuantizerData entries from the quantization plan.
     void prepare_quantizers();
 
-    /// @brief Analyze config and run DP or equal segmentation.
+    /// @brief Analyze config and run the appropriate allocator.
+    ///
+    /// Dispatch order:
+    ///   1. No segmentation → equal_segmentation(1)
+    ///   2. Equal-segment override → equal_segmentation(seg_eqseg)
+    ///   3. Greedy + rotated data available → build_mse_table_for_allocation + BitAllocatorGreedy
+    ///   4. Greedy requested but data missing → warning + DP fallback
+    ///   5. DP (default) → dynamic_programming(variance, avg_bits)
     void analyze_plan() {
         DCHECK_EQ(num_dim_padded_ % kDimPaddingSize, 0);
 
-        if (data_->cfg.enable_segmentation) {
-            if (data_->cfg.seg_eqseg > 0) {
-                data_->quant_plan = equal_segmentation(data_->cfg.seg_eqseg);
-            } else {
-                data_->quant_plan = dynamic_programming(data_->data_variance, data_->cfg.avg_bits);
-            }
-        } else {
+        if (!data_->cfg.enable_segmentation) {
             data_->quant_plan = equal_segmentation(1);
+            return;
         }
+
+        if (data_->cfg.seg_eqseg > 0) {
+            data_->quant_plan = equal_segmentation(data_->cfg.seg_eqseg);
+            return;
+        }
+
+        if (data_->cfg.allocator == AllocatorKind::Greedy) {
+            if (!rotated_data_set_) {
+                LOG(WARNING) << "AllocatorKind::Greedy requested but set_rotated_data() "
+                                "was not called — falling back to DP allocator.";
+            } else {
+                auto mse_table = build_mse_table_for_allocation(*rotated_data_, kMaxQuantBit);
+
+                JointAllocationConfig jcfg{};
+                jcfg.num_dim_padded   = num_dim_padded_;
+                jcfg.dim_padding_size = kDimPaddingSize;
+                jcfg.max_bits_per_dim = kMaxQuantBit;
+                jcfg.num_bit_factors  = kNumShortFactors * sizeof(float) * 8;
+                jcfg.total_bits       = static_cast<size_t>(data_->cfg.avg_bits * num_dim_padded_)
+                                        + jcfg.num_bit_factors;
+
+                BitAllocatorGreedy alloc;
+                auto r = alloc.AllocateJoint(mse_table, jcfg);
+                CHECK(r.ok()) << "Greedy allocation failed: " << r.error;
+                data_->quant_plan = std::move(r.quant_plan);
+                return;
+            }
+        }
+
+        // Default DP path — preserves existing behavior exactly.
+        data_->quant_plan = dynamic_programming(data_->data_variance, data_->cfg.avg_bits);
     }
 
     /// @brief Uniformly partition dimensions into num_segs segments with equal bits.

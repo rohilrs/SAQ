@@ -34,6 +34,11 @@ void IVF::construct(const FloatRowMat &data, const FloatRowMat &centroids,
 
     // 2. prepare SAQ data
     {
+        // Provide rotated data to SaqDataMaker before variance computation so
+        // the Greedy allocator path can build the empirical MSE table.  This is
+        // a no-op pointer store; no copy is made and the DP path ignores it.
+        saq_data_maker_->set_rotated_data(data);
+
         if (!saq_data_maker_->is_variance_set()) {
             saq_data_maker_->compute_variance(data);
         }
@@ -169,11 +174,13 @@ void IVF::fit(const FloatRowMat &X, bool apply_pca, int K, int seed, int num_thr
     pca_mean_     = pp.pca.mean;      // row vector (1, D)
     pca_rotation_ = pp.pca.rotation;  // (D, D)
 
-    set_variance(pp.pca.variances);
-
     // 3. Apply PCA to training data. Centroids are already rotated when
     //    apply_pca=true, so no extra transform is needed for them.
     //    FloatVec is a row vector -> broadcast with .rowwise() without transpose.
+    //
+    //    NOTE: X_proc is computed BEFORE set_variance() so that set_rotated_data()
+    //    can register it with SaqDataMaker before the plan is finalized.  The
+    //    Greedy allocator needs the full rotated matrix; the DP path ignores it.
     FloatRowMat X_proc;
     if (apply_pca) {
         X_proc = (X.rowwise() - pp.pca.mean) * pp.pca.rotation;
@@ -181,6 +188,13 @@ void IVF::fit(const FloatRowMat &X, bool apply_pca, int K, int seed, int num_thr
         X_proc = X;
     }
     const FloatRowMat &centroids_proc = pp.kmeans.centroids;
+
+    // Register the rotated data before set_variance triggers analyze_plan().
+    // construct() will repeat this call (no-op since variance will already be
+    // set by then), but we must do it here too because fit() calls set_variance
+    // directly rather than going through construct()'s compute_variance path.
+    saq_data_maker_->set_rotated_data(X_proc);
+    set_variance(pp.pca.variances);
 
     // 4. Single-pass construction with raw-code caching.
     raw_codes_.clear();  // construct() will resize to num_cen_

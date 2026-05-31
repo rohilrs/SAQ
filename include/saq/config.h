@@ -6,6 +6,7 @@
 #include <fmt/core.h>
 
 #include "saq/defines.h"
+#include "saq/bit_allocator.h"
 
 namespace saq {
 
@@ -23,6 +24,11 @@ struct QuantizeConfig {
     int seg_eqseg = 0;               // segment equally into this number of segments. 0 means disable.
     bool enable_segmentation = true; // enable SAQ or not.
     bool use_compact_layout = false; // use compact memory layout for segmentation.
+
+    /// Which bit allocator to use for joint segmentation + bit allocation.
+    /// Default: DP (preserves existing behavior exactly).
+    /// Greedy: requires set_rotated_data() before set_variance()/compute_variance().
+    AllocatorKind allocator = AllocatorKind::DP;
 
     QuantSingleConfig single; // CAQ configuration
 
