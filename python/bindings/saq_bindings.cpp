@@ -11,6 +11,7 @@
 
 #include "index/ivf_index.h"
 #include "saq/codebook_encoder.h"
+#include "saq/preprocessing/codebook_builder.h"
 #include "saq/config.h"
 #include "saq/defines.h"
 #include "saq/io_utils.h"
@@ -33,6 +34,11 @@ PYBIND11_MODULE(_saq_core, m) {
         .value("LVQ", BaseQuantType::LVQ)
         .export_values();
 
+    py::enum_<AllocatorKind>(m, "AllocatorKind")
+        .value("DP", AllocatorKind::DP)
+        .value("Greedy", AllocatorKind::Greedy)
+        .export_values();
+
     // ---- QuantSingleConfig ----
     py::class_<QuantSingleConfig>(m, "QuantSingleConfig")
         .def(py::init<>())
@@ -46,8 +52,10 @@ PYBIND11_MODULE(_saq_core, m) {
     py::class_<QuantizeConfig>(m, "QuantizeConfig")
         .def(py::init<>())
         .def_readwrite("avg_bits", &QuantizeConfig::avg_bits)
+        .def_readwrite("seg_eqseg", &QuantizeConfig::seg_eqseg)
         .def_readwrite("enable_segmentation", &QuantizeConfig::enable_segmentation)
         .def_readwrite("use_compact_layout", &QuantizeConfig::use_compact_layout)
+        .def_readwrite("allocator", &QuantizeConfig::allocator)
         .def_readwrite("single", &QuantizeConfig::single);
 
     // ---- SearcherConfig ----
@@ -245,6 +253,25 @@ PYBIND11_MODULE(_saq_core, m) {
              py::arg("codebooks"), py::arg("variances"),
              "Set Gaussian base codebooks + per-dimension variances. "
              "codebooks: dict {bits: 1D float array with 2^bits entries}, variances: 1D float array.")
+        .def("set_derive_codebooks",
+             [](IVF &self, size_t max_bits, size_t restarts,
+                size_t max_iters, uint64_t seed, size_t sample_size) {
+                 LloydOpts opts;
+                 opts.max_bits    = max_bits;
+                 opts.restarts    = restarts;
+                 opts.max_iters   = max_iters;
+                 opts.seed        = seed;
+                 opts.sample_size = sample_size;
+                 self.set_derive_codebooks(opts);
+             },
+             py::arg("max_bits") = 13, py::arg("restarts") = 1,
+             py::arg("max_iters") = 50, py::arg("seed") = 0,
+             py::arg("sample_size") = 0,
+             "Enable native data-driven Lloyd (k-means) codebook derivation "
+             "during construct()/fit(). Mutually exclusive with set_codebooks() "
+             "and set_gaussian_codebooks(). Builds per-dimension Lloyd codebooks "
+             "from the (PCA-transformed) data at the bit-counts chosen by the "
+             "allocator. This is the 'our method' Lloyd-codebook path.")
         .def_property_readonly("has_codebooks", &IVF::has_codebooks);
 
     // ---- Utility functions ----

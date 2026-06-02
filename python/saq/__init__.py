@@ -23,6 +23,7 @@ __all__ = [
 
 try:
     from ._saq_core import (
+        AllocatorKind,
         BaseQuantType,
         DistType,
         IVF,
@@ -36,6 +37,7 @@ except ImportError:
     pass
 else:
     __all__ += [
+        "AllocatorKind",
         "BaseQuantType",
         "DistType",
         "IVF",
