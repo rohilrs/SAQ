@@ -148,9 +148,20 @@ SaqDataMaker::QuantPlanT SaqDataMaker::dynamic_programming(
 
     const auto num_bit_factors = kNumShortFactors * sizeof(float) * 8;
     const size_t tot_bits = static_cast<size_t>(avg_bits * num_dim_padded_ + num_bit_factors);
-    const size_t max_num_segs = avg_bits < 2
-        ? num_dim_padded_ / kDimPaddingSize
-        : num_dim_padded_ / kDimPaddingSize / 2;
+    // Cap on the number of segments. For avg_bits >= 2 the reference halves the
+    // block count to bound DP cost, but for small dimensionalities (few blocks)
+    // this can round down to 0 — and a 0-segment cap makes the DP unable to
+    // form ANY segment: the start state (ns==0) immediately hits the
+    // `ns == max_num_segs` guard, so neither the quantized transition nor the
+    // 0-bit tail relaxation ever runs. Backtrack then falls through on the
+    // never-relaxed terminal cell and emits a degenerate all-0-bit plan, making
+    // reconstruction MSE constant across avg_bits. Clamp to >= 1 so at least one
+    // segment can always be allocated.
+    const size_t max_num_segs = std::max<size_t>(
+        1,
+        avg_bits < 2
+            ? num_dim_padded_ / kDimPaddingSize
+            : num_dim_padded_ / kDimPaddingSize / 2);
     constexpr auto valid_lmt = std::numeric_limits<double>::max();
 
     // DP table: f[ns][i][used_bits] = (min_error, backtrack_info)
