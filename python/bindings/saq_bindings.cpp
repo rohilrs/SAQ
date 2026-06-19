@@ -12,9 +12,13 @@
 #include "index/ivf_index.h"
 #include "saq/codebook_encoder.h"
 #include "saq/preprocessing/codebook_builder.h"
+#include "saq/bit_allocator_dp.h"
+#include "saq/bit_allocator_greedy.h"
 #include "saq/config.h"
 #include "saq/defines.h"
 #include "saq/io_utils.h"
+
+#include <span>
 
 namespace py = pybind11;
 using namespace saq;
@@ -273,6 +277,146 @@ PYBIND11_MODULE(_saq_core, m) {
              "from the (PCA-transformed) data at the bit-counts chosen by the "
              "allocator. This is the 'our method' Lloyd-codebook path.")
         .def_property_readonly("has_codebooks", &IVF::has_codebooks);
+
+    // ================================================================
+    //  Approximation-quality primitives (professor's experiments #1-#2):
+    //  per-dim codebook builders (DP-optimal vs cumsum-kmeans) and the
+    //  joint bit allocators (DP-Bennett vs empirical greedy). Bound as
+    //  free functions so experiments drive them per-column from Python.
+    // ================================================================
+
+    // ---- DimensionCodebook ----
+    py::class_<DimensionCodebook>(m, "DimensionCodebook")
+        .def_property_readonly("num_entries",
+            [](const DimensionCodebook &c) { return c.num_entries; })
+        .def_property_readonly("centroids",
+            [](const DimensionCodebook &c) {
+                return py::array_t<float>(
+                    static_cast<py::ssize_t>(c.centroids.size()), c.centroids.data());
+            })
+        .def("nearest", &DimensionCodebook::nearest, py::arg("value"),
+             "Nearest centroid index for a value (binary search).");
+
+    // ---- CodebookResult ----
+    py::class_<CodebookResult>(m, "CodebookResult")
+        .def_property_readonly("costs",
+            [](const CodebookResult &r) {
+                return py::array_t<float>(
+                    static_cast<py::ssize_t>(r.costs.size()), r.costs.data());
+            },
+            "Per-bit reconstruction MSE [0..max_bits] (histogram-approximate for DP).")
+        .def_property_readonly("codebooks",
+            [](const CodebookResult &r) {
+                py::list out;
+                for (const auto &cb : r.codebooks) out.append(cb);
+                return out;
+            },
+            "Per-bit DimensionCodebook [0..max_bits].");
+
+    // ---- Lloyd options ----
+    py::enum_<CodebookInit>(m, "CodebookInit")
+        .value("EqualMassQuantile", CodebookInit::EqualMassQuantile)
+        .value("UniformSpaced", CodebookInit::UniformSpaced)
+        .value("KMeansPlusPlus", CodebookInit::KMeansPlusPlus)
+        .value("CubeRootDensity", CodebookInit::CubeRootDensity)
+        .export_values();
+
+    py::class_<LloydOpts>(m, "LloydOpts")
+        .def(py::init<>())
+        .def_readwrite("max_bits", &LloydOpts::max_bits)
+        .def_readwrite("init", &LloydOpts::init)
+        .def_readwrite("restarts", &LloydOpts::restarts)
+        .def_readwrite("max_iters", &LloydOpts::max_iters)
+        .def_readwrite("tol", &LloydOpts::tol)
+        .def_readwrite("seed", &LloydOpts::seed)
+        .def_readwrite("sample_size", &LloydOpts::sample_size);
+
+    // ---- Codebook builders (free functions over a 1-D column) ----
+    m.def("build_codebook_dp",
+          [](py::array_t<float, py::array::c_style | py::array::forcecast> values,
+             size_t max_bits, size_t num_bins) {
+              py::buffer_info buf = values.request();
+              if (buf.ndim != 1) throw std::runtime_error("values must be 1D");
+              std::span<const float> sp(static_cast<const float *>(buf.ptr),
+                                        static_cast<size_t>(buf.shape[0]));
+              return build_codebook_dp(sp, max_bits, num_bins);
+          },
+          py::arg("values"), py::arg("max_bits") = 8, py::arg("num_bins") = 500,
+          "DP-optimal contiguous 1-D clustering (the reference). "
+          "Returns CodebookResult(costs, codebooks). Valid for max_bits <= 8.");
+
+    m.def("build_codebook_lloyd",
+          [](py::array_t<float, py::array::c_style | py::array::forcecast> values,
+             const LloydOpts &opts) {
+              py::buffer_info buf = values.request();
+              if (buf.ndim != 1) throw std::runtime_error("values must be 1D");
+              std::span<const float> sp(static_cast<const float *>(buf.ptr),
+                                        static_cast<size_t>(buf.shape[0]));
+              return build_codebook_lloyd(sp, opts);
+          },
+          py::arg("values"), py::arg("opts") = LloydOpts(),
+          "Fast Lloyd (cumsum k-means) codebook over a 1-D column. "
+          "Returns CodebookResult(costs, codebooks).");
+
+    m.def("codebook_mse",
+          [](py::array_t<float, py::array::c_style | py::array::forcecast> values,
+             const DimensionCodebook &cb) {
+              py::buffer_info buf = values.request();
+              if (buf.ndim != 1) throw std::runtime_error("values must be 1D");
+              std::span<const float> sp(static_cast<const float *>(buf.ptr),
+                                        static_cast<size_t>(buf.shape[0]));
+              return codebook_mse(sp, cb);
+          },
+          py::arg("values"), py::arg("codebook"),
+          "Exact MSE of raw values under a codebook (nearest-centroid). "
+          "Use to re-score DP/Lloyd codebooks on raw data for a fair comparison.");
+
+    // ---- Joint allocation config + result ----
+    py::class_<JointAllocationConfig>(m, "JointAllocationConfig")
+        .def(py::init<>())
+        .def_readwrite("total_bits", &JointAllocationConfig::total_bits)
+        .def_readwrite("max_bits_per_dim", &JointAllocationConfig::max_bits_per_dim)
+        .def_readwrite("dim_padding_size", &JointAllocationConfig::dim_padding_size)
+        .def_readwrite("num_dim_padded", &JointAllocationConfig::num_dim_padded)
+        .def_readwrite("num_bit_factors", &JointAllocationConfig::num_bit_factors);
+
+    py::class_<BitAllocationResult>(m, "BitAllocationResult")
+        .def_property_readonly("quant_plan",
+            [](const BitAllocationResult &r) {
+                py::list out;
+                for (const auto &p : r.quant_plan)
+                    out.append(py::make_tuple(p.first, p.second));
+                return out;
+            },
+            "List of (dim_length, bits) segments, contiguous.")
+        .def_readonly("total_bits_used", &BitAllocationResult::total_bits_used)
+        .def_readonly("total_distortion", &BitAllocationResult::total_distortion)
+        .def_readonly("error", &BitAllocationResult::error)
+        .def("ok", &BitAllocationResult::ok);
+
+    // ---- Allocators (free functions) ----
+    m.def("allocate_dp",
+          [](py::array_t<float, py::array::c_style | py::array::forcecast> variance,
+             const JointAllocationConfig &cfg) {
+              py::buffer_info buf = variance.request();
+              if (buf.ndim != 1) throw std::runtime_error("variance must be 1D");
+              FloatVec v = Eigen::Map<const FloatVec>(
+                  static_cast<const float *>(buf.ptr),
+                  static_cast<Eigen::Index>(buf.shape[0]));
+              return BitAllocatorDP().AllocateJoint(v, cfg);
+          },
+          py::arg("variance"), py::arg("config"),
+          "DP joint segmentation+allocation under the analytic Bennett cost "
+          "model (var/2^b). variance is per-dim, length == config.num_dim_padded.");
+
+    m.def("allocate_greedy",
+          [](Eigen::MatrixXf mse_table, const JointAllocationConfig &cfg) {
+              return BitAllocatorGreedy().AllocateJoint(mse_table, cfg);
+          },
+          py::arg("mse_table"), py::arg("config"),
+          "Greedy joint allocation using an empirical "
+          "(num_dim_padded, max_bits_per_dim+1) per-dim per-bit MSE table. "
+          "Row b=0 should hold per-dim variance (the no-quantization cost).");
 
     // ---- Utility functions ----
     m.def("load_fvecs",
