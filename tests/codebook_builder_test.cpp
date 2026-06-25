@@ -283,9 +283,87 @@ void TestNativeDerivationEndToEnd() {
     std::printf("TestNativeDerivationEndToEnd: OK\n");
 }
 
+// ---------------------------------------------------------- build_codebook_exact
+
+// Reference O(k n^2) DP for the optimal contiguous k-clustering SSE (small n).
+double BruteOptSSE(std::vector<float> v, size_t k) {
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    std::vector<double> ps(n + 1, 0), pq(n + 1, 0);
+    for (size_t i = 0; i < n; ++i) { ps[i + 1] = ps[i] + v[i]; pq[i + 1] = pq[i] + double(v[i]) * v[i]; }
+    auto sse = [&](size_t i, size_t j) { if (j <= i) return 0.0; double c = j - i, s = ps[j] - ps[i]; return (pq[j] - pq[i]) - s * s / c; };
+    std::vector<std::vector<double>> D(k + 1, std::vector<double>(n + 1, 1e18));
+    D[0][0] = 0;
+    for (size_t kk = 1; kk <= k; ++kk)
+        for (size_t m = kk; m <= n; ++m)
+            for (size_t j = kk - 1; j < m; ++j)
+                D[kk][m] = std::min(D[kk][m], D[kk - 1][j] + sse(j, m));
+    return D[k][n];
+}
+
+void TestExactTwoClusters() {
+    std::vector<float> v = {0.f, 0.f, 0.f, 10.f, 10.f, 10.f};
+    saq::CodebookResult r = saq::build_codebook_exact(v, /*max_bits=*/3);
+    assert(r.costs.size() == 4);
+    assert(r.codebooks[1].num_entries == 2);
+    assert(std::fabs(r.codebooks[1].centroids[0] - 0.f) < kEps);
+    assert(std::fabs(r.codebooks[1].centroids[1] - 10.f) < kEps);
+    assert(r.costs[1] < kEps);                  // perfect split
+    std::printf("TestExactTwoClusters: OK\n");
+}
+
+// Exact matches the brute-force optimum, is monotone, sorted, and padded to 2^bits.
+void TestExactMatchesBrute() {
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (int t = 0; t < 20; ++t) {
+        size_t n = 8 + (rng() % 20);
+        std::vector<float> v(n);
+        for (auto& x : v) x = nd(rng);
+        std::vector<float> s = v; std::sort(s.begin(), s.end());
+        size_t ndist = 1; for (size_t i = 1; i < n; ++i) if (s[i] != s[i - 1]) ++ndist;
+        saq::CodebookResult ex = saq::build_codebook_exact(v, /*max_bits=*/3);
+        for (size_t b = 1; b <= 3; ++b) {
+            size_t k = size_t(1) << b;
+            if (k < ndist) {
+                double brute = BruteOptSSE(v, k) / double(n);
+                assert(std::fabs(ex.costs[b] - brute) < 1e-5 * std::max(1.0, brute));
+            }
+            assert(ex.costs[b] <= ex.costs[b - 1] + 1e-6f);
+            const auto& c = ex.codebooks[b].centroids;
+            assert(std::is_sorted(c.begin(), c.end()));
+            assert(ex.codebooks[b].num_entries == k);
+        }
+    }
+    std::printf("TestExactMatchesBrute: OK\n");
+}
+
+// Exact is the GLOBAL optimum: no other codebook scores lower MSE on the raw data.
+void TestExactDominatesDpAndLloyd() {
+    std::mt19937 rng(3);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> v(20000);
+    for (auto& x : v) x = nd(rng);
+    saq::CodebookResult ex = saq::build_codebook_exact(v, /*max_bits=*/6);
+    saq::CodebookResult dp = saq::build_codebook_dp(v, /*max_bits=*/6, /*num_bins=*/20000);
+    saq::LloydOpts opts; opts.max_bits = 6;
+    saq::CodebookResult ll = saq::build_codebook_lloyd(v, opts);
+    for (size_t b = 1; b <= 6; ++b) {
+        double me = saq::codebook_mse(v, ex.codebooks[b]);
+        double md = saq::codebook_mse(v, dp.codebooks[b]);
+        double ml = saq::codebook_mse(v, ll.codebooks[b]);
+        assert(me <= md + 1e-9);   // exact optimum <= histogram-DP on raw
+        assert(me <= ml + 1e-9);   // exact optimum <= Lloyd on raw
+    }
+    std::printf("TestExactDominatesDpAndLloyd: OK\n");
+}
+
 }  // namespace
 
 int main() {
+    TestExactTwoClusters();
+    TestExactMatchesBrute();
+    TestExactDominatesDpAndLloyd();
     TestDpTwoClusters();
     TestDpDegenerateBranch();
     TestDpAllEqual();

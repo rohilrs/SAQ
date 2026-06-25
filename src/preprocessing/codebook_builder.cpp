@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <random>
 
@@ -405,6 +406,105 @@ CodebookResult build_codebook_lloyd(std::span<const float> values, const LloydOp
     }
     return R;
 }
+CodebookResult build_codebook_exact(std::span<const float> values, size_t max_bits) {
+    CodebookResult R;
+    R.costs.assign(max_bits + 1, 0.f);
+    R.codebooks.assign(max_bits + 1, {});
+    const size_t n = values.size();
+    if (n == 0) return R;
+
+    std::vector<double> a(values.begin(), values.end());
+    std::sort(a.begin(), a.end());
+    size_t ndist = 1;
+    for (size_t i = 1; i < n; ++i) if (a[i] != a[i - 1]) ++ndist;
+
+    // Prefix sums over sorted raw values; SSE/centroid of half-open range [i, j).
+    std::vector<double> ps(n + 1, 0.0), pq(n + 1, 0.0);
+    for (size_t i = 0; i < n; ++i) { ps[i + 1] = ps[i] + a[i]; pq[i + 1] = pq[i] + a[i] * a[i]; }
+    auto sse = [&](size_t i, size_t j) -> double {
+        if (j <= i) return 0.0;
+        double c = double(j - i), s = ps[j] - ps[i];
+        return (pq[j] - pq[i]) - s * s / c;
+    };
+    auto cen = [&](size_t i, size_t j) -> double { return (ps[j] - ps[i]) / double(j - i); };
+
+    // bits = 0 : single centroid (global mean).
+    R.costs[0] = static_cast<float>(sse(0, n) / n);
+    R.codebooks[0].centroids = { static_cast<float>(cen(0, n)) };
+    R.codebooks[0].num_entries = 1;
+
+    const size_t K = size_t(1) << max_bits;
+    const double INF = std::numeric_limits<double>::infinity();
+    const size_t Klev = std::min(K, ndist);              // levels we actually run the DP for
+
+    // D_prev/D_cur[m] = optimal SSE of the first m sorted points in (k'-1)/k' clusters.
+    // A[k'][m] = optimal split = start index of the last (k'-th) cluster. Stored for
+    // every level so each recorded bit-rate can be backtracked.
+    std::vector<double> D_prev(n + 1, INF), D_cur(n + 1, INF);
+    std::vector<int> A((Klev + 1) * (n + 1), 0);
+    auto Aat = [&](size_t kp, size_t m) -> int& { return A[kp * (n + 1) + m]; };
+    for (size_t m = 1; m <= n; ++m) { D_prev[m] = sse(0, m); Aat(1, m) = 0; }
+
+    // Divide-and-conquer over m for one DP level kp: the optimal split is monotone in
+    // m, so total work for the level is O(n log n).
+    std::function<void(size_t, size_t, size_t, size_t, size_t)> dc =
+        [&](size_t kp, size_t mlo, size_t mhi, size_t jlo, size_t jhi) {
+            if (mlo > mhi) return;
+            size_t mid = (mlo + mhi) / 2;
+            double best = INF; size_t arg = jlo;
+            size_t lo = std::max(kp - 1, jlo), hi = std::min(mid - 1, jhi);
+            for (size_t j = lo; j <= hi; ++j) {
+                double v = D_prev[j] + sse(j, mid);
+                if (v < best) { best = v; arg = j; }
+            }
+            D_cur[mid] = best; Aat(kp, mid) = static_cast<int>(arg);
+            if (mid > mlo) dc(kp, mlo, mid - 1, jlo, arg);
+            dc(kp, mid + 1, mhi, arg, jhi);
+        };
+
+    auto record = [&](size_t bits, size_t k) {
+        std::vector<float> c; size_t m = n;
+        for (size_t kk = k;; --kk) {                     // backtrack k clusters
+            int j = Aat(kk, m);
+            c.push_back(static_cast<float>(cen(static_cast<size_t>(j), m)));
+            m = static_cast<size_t>(j);
+            if (kk == 1) break;
+        }
+        std::reverse(c.begin(), c.end());
+        c.erase(std::unique(c.begin(), c.end()), c.end());
+        std::vector<double> cd(c.begin(), c.end());
+        nudge_strictly_increasing(cd);
+        c.assign(cd.begin(), cd.end());
+        const size_t k_target = size_t(1) << bits;       // pad to 2^bits (GPU upload)
+        while (c.size() < k_target) c.push_back(c.back());
+        R.codebooks[bits].centroids = c;
+        R.codebooks[bits].num_entries = c.size();
+    };
+
+    size_t kp = 1;
+    for (size_t bits = 1; bits <= max_bits; ++bits) {
+        const size_t k = size_t(1) << bits;
+        if (k >= ndist) {                                // more clusters than distinct values
+            std::vector<float> c;
+            for (size_t i = 0; i < n; ++i) if (i == 0 || a[i] != a[i - 1]) c.push_back(static_cast<float>(a[i]));
+            while (c.size() < k) c.push_back(c.back());
+            R.codebooks[bits].centroids = c;
+            R.codebooks[bits].num_entries = c.size();
+            R.costs[bits] = 0.f;
+            continue;
+        }
+        while (kp < k) {                                 // advance DP to level k (reused across bit-rates)
+            ++kp;
+            std::fill(D_cur.begin(), D_cur.end(), INF);
+            dc(kp, kp, n, kp - 1, n - 1);
+            D_prev.swap(D_cur);
+        }
+        R.costs[bits] = static_cast<float>(D_prev[n] / static_cast<double>(n));
+        record(bits, k);
+    }
+    return R;
+}
+
 std::vector<CodebookResult> build_all_dims(const FloatRowMat& data, const LloydOpts& opts) {
     const size_t Nrows = static_cast<size_t>(data.rows());
     const size_t D = static_cast<size_t>(data.cols());

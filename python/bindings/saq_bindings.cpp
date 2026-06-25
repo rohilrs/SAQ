@@ -358,6 +358,20 @@ PYBIND11_MODULE(_saq_core, m) {
           "Fast Lloyd (cumsum k-means) codebook over a 1-D column. "
           "Returns CodebookResult(costs, codebooks).");
 
+    m.def("build_codebook_exact",
+          [](py::array_t<float, py::array::c_style | py::array::forcecast> values,
+             size_t max_bits) {
+              py::buffer_info buf = values.request();
+              if (buf.ndim != 1) throw std::runtime_error("values must be 1D");
+              std::span<const float> sp(static_cast<const float *>(buf.ptr),
+                                        static_cast<size_t>(buf.shape[0]));
+              return build_codebook_exact(sp, max_bits);
+          },
+          py::arg("values"), py::arg("max_bits") = 8,
+          "Exact (globally optimal) 1-D k-means over raw sorted values, no binning "
+          "(divide-and-conquer DP, O(k n log n); all bit-rates in one pass). "
+          "Returns CodebookResult(costs, codebooks).");
+
     m.def("codebook_mse",
           [](py::array_t<float, py::array::c_style | py::array::forcecast> values,
              const DimensionCodebook &cb) {

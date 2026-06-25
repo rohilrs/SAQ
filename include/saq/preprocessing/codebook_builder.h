@@ -48,6 +48,16 @@ CodebookResult build_codebook_dp(std::span<const float> values,
 CodebookResult build_codebook_lloyd(std::span<const float> values,
                                     const LloydOpts& opts);
 
+/// Exact (globally optimal) 1-D k-means over the RAW sorted column — no histogram
+/// binning. Divide-and-conquer DP optimization (monotone optimal split),
+/// O(k n log n); one pass fills all bit-rates 0..max_bits. Exact-optimal contiguous
+/// 1-D clustering (Wu 1991 "Optimal Quantization by Matrix Searching"; Grønlund
+/// et al. 2017). Costs are exact MSE on the raw values. Intended to replace the
+/// histogram-`build_codebook_dp` reference (faster + no num_bins) and, pending an
+/// A/B, the Lloyd production codebook.
+CodebookResult build_codebook_exact(std::span<const float> values,
+                                    size_t max_bits);
+
 /// Build per-dimension Lloyd codebooks for every column of `data` (parallel).
 std::vector<CodebookResult> build_all_dims(const FloatRowMat& data,
                                            const LloydOpts& opts);
