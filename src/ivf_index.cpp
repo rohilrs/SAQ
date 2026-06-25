@@ -52,7 +52,9 @@ void IVF::construct(const FloatRowMat &data, const FloatRowMat &centroids,
         // (PCA-transformed) data, then select each dimension's codebook at the
         // bit-count its segment was allocated in quant_plan.
         if (derive_codebooks_ && codebooks_.empty()) {
-            std::vector<CodebookResult> per_dim = build_all_dims(data, lloyd_opts_);
+            std::vector<CodebookResult> per_dim = exact_codebooks_
+                ? build_all_dims_exact(data, lloyd_opts_.max_bits)
+                : build_all_dims(data, lloyd_opts_);
 
             // Stash per-dim costs for the future allocation sub-project.
             saq_data_->codebook_costs.resize(per_dim.size());
@@ -80,7 +82,7 @@ void IVF::construct(const FloatRowMat &data, const FloatRowMat &centroids,
             saq_data_->quant_plan, codebooks_,
             gaussian_codebook_centroids_, residual_stds_);
         LOG(INFO) << "Built codebooks for " << saq_data_->quant_plan.size() << " segments"
-                  << (derive_codebooks_ ? " (native Lloyd)" : "");
+                  << (derive_codebooks_ ? (exact_codebooks_ ? " (native exact)" : " (native Lloyd)") : "");
     }
 
     // 3. prepare clusters

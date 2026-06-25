@@ -62,6 +62,12 @@ CodebookResult build_codebook_exact(std::span<const float> values,
 std::vector<CodebookResult> build_all_dims(const FloatRowMat& data,
                                            const LloydOpts& opts);
 
+/// Build per-dimension EXACT codebooks (build_codebook_exact) for every column
+/// of `data` (parallel). Drop-in alternative to build_all_dims for the native
+/// derivation path — exact-optimal, no num_bins, faster than Lloyd.
+std::vector<CodebookResult> build_all_dims_exact(const FloatRowMat& data,
+                                                 size_t max_bits);
+
 /// Mean squared reconstruction error of `values` under codebook `cb`
 /// (each value mapped to its nearest centroid). Brute-force via cb.nearest.
 float codebook_mse(std::span<const float> values, const DimensionCodebook& cb);

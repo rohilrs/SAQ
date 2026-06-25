@@ -88,6 +88,7 @@ class IVF {
     std::vector<std::vector<float>> gaussian_codebook_centroids_; // base[bits][entry]
     std::vector<float> residual_stds_;                            // per-dim std for gaussian path
     bool      derive_codebooks_ = false;  // derive natively from data in construct()
+    bool      exact_codebooks_ = false;   // when deriving, use exact DP instead of Lloyd
     LloydOpts lloyd_opts_{};
 
 
@@ -196,6 +197,18 @@ class IVF {
         CHECK(gaussian_codebook_centroids_.empty()) << "set_derive_codebooks: gaussian codebooks already set; these modes are mutually exclusive";
         lloyd_opts_ = opts;
         derive_codebooks_ = true;
+        has_codebooks_ = true;
+    }
+
+    /// Like set_derive_codebooks() but derives EXACT (globally optimal) per-dim
+    /// codebooks (build_all_dims_exact) instead of Lloyd. `max_bits` caps the
+    /// largest bit-rate built. Exact, parameter-free, faster than Lloyd.
+    void set_derive_codebooks_exact(size_t max_bits = 13) {
+        CHECK(codebooks_.empty()) << "set_derive_codebooks_exact: explicit codebooks already set; mutually exclusive";
+        CHECK(gaussian_codebook_centroids_.empty()) << "set_derive_codebooks_exact: gaussian codebooks already set; mutually exclusive";
+        lloyd_opts_.max_bits = max_bits;
+        derive_codebooks_ = true;
+        exact_codebooks_ = true;
         has_codebooks_ = true;
     }
 

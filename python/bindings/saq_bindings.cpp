@@ -276,6 +276,12 @@ PYBIND11_MODULE(_saq_core, m) {
              "and set_gaussian_codebooks(). Builds per-dimension Lloyd codebooks "
              "from the (PCA-transformed) data at the bit-counts chosen by the "
              "allocator. This is the 'our method' Lloyd-codebook path.")
+        .def("set_derive_codebooks_exact",
+             [](IVF &self, size_t max_bits) { self.set_derive_codebooks_exact(max_bits); },
+             py::arg("max_bits") = 13,
+             "Like set_derive_codebooks() but derives EXACT (globally optimal) "
+             "per-dimension codebooks (divide-and-conquer DP) instead of Lloyd. "
+             "Exact, parameter-free (no restarts), faster than Lloyd.")
         .def_property_readonly("has_codebooks", &IVF::has_codebooks);
 
     // ================================================================
