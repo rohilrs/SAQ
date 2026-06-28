@@ -7,6 +7,7 @@
 #include <cassert>
 #include <fstream>
 #include <numeric>
+#include <random>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -52,9 +53,46 @@ void IVF::construct(const FloatRowMat &data, const FloatRowMat &centroids,
         // (PCA-transformed) data, then select each dimension's codebook at the
         // bit-count its segment was allocated in quant_plan.
         if (derive_codebooks_ && codebooks_.empty()) {
-            std::vector<CodebookResult> per_dim = exact_codebooks_
-                ? build_all_dims_exact(data, lloyd_opts_.max_bits)
-                : build_all_dims(data, lloyd_opts_);
+            // Both builders are ~O(N) per dim and fill only the codebook levels
+            // that segments are actually allocated, so train them on (a) just the
+            // max bits allocated in quant_plan, and (b) a representative sample
+            // (recommended_sample_size, ~200k) rather than the full corpus —
+            // codebook quality saturates well before full N. Result-preserving
+            // (a no-op when N<=sample, e.g. 200k) but bounds cost ~constant in N;
+            // without this, full-N derivation at multi-M scale exceeds walltime.
+            size_t max_alloc_bits = 1;
+            for (const auto& seg : saq_data_->quant_plan)
+                max_alloc_bits = std::max(max_alloc_bits,
+                                          static_cast<size_t>(seg.second));
+            max_alloc_bits = std::min(max_alloc_bits, lloyd_opts_.max_bits);
+
+            const size_t cb_N = static_cast<size_t>(data.rows());
+            const size_t cb_n = std::min(cb_N, recommended_sample_size(cb_N, max_alloc_bits));
+            const FloatRowMat* cb_data = &data;
+            FloatRowMat cb_sampled;
+            if (cb_n < cb_N) {
+                std::mt19937_64 rng(0xC0DEB00Bull);
+                std::vector<size_t> idx(cb_N);
+                std::iota(idx.begin(), idx.end(), size_t{0});
+                for (size_t i = 0; i < cb_n; ++i) {  // partial Fisher-Yates
+                    std::uniform_int_distribution<size_t> pick(i, cb_N - 1);
+                    std::swap(idx[i], idx[pick(rng)]);
+                }
+                cb_sampled.resize(static_cast<Eigen::Index>(cb_n), data.cols());
+                for (size_t i = 0; i < cb_n; ++i)
+                    cb_sampled.row(static_cast<Eigen::Index>(i)) =
+                        data.row(static_cast<Eigen::Index>(idx[i]));
+                cb_data = &cb_sampled;
+            }
+
+            std::vector<CodebookResult> per_dim;
+            if (exact_codebooks_) {
+                per_dim = build_all_dims_exact(*cb_data, max_alloc_bits);
+            } else {
+                LloydOpts o = lloyd_opts_;
+                o.max_bits = max_alloc_bits;
+                per_dim = build_all_dims(*cb_data, o);
+            }
 
             // Stash per-dim costs for the future allocation sub-project.
             saq_data_->codebook_costs.resize(per_dim.size());

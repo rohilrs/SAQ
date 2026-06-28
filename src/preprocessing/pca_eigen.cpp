@@ -1,10 +1,16 @@
 // src/preprocessing/pca_eigen.cpp
-// Compiled only when SAQ_USE_FAISS=OFF (Windows default).
-// Uses Eigen::BDCSVD for PCA. Cap: ~200K vectors recommended.
+// Compiled only when SAQ_USE_FAISS=OFF.
+// PCA via the (D x D) covariance matrix + symmetric eigensolver. For N >> D this
+// is dramatically faster than BDCSVD on the full N x D matrix (which was
+// ~O(N*D^2) with a huge constant and capped at ~200K vectors). The covariance
+// cross-product is one GEMM (parallelized by Eigen/OpenMP); the eigendecomp is
+// only O(D^3). Mathematically identical: eigenvectors of cov == right singular
+// vectors of the centered data; eigenvalues == singular_value^2/(N-1).
 #ifndef SAQ_USE_FAISS
 
 #include "saq/preprocessing/pca.h"
-#include <Eigen/SVD>
+#include <Eigen/Dense>
+#include <Eigen/Eigenvalues>
 
 namespace saq {
 
@@ -13,23 +19,29 @@ PCAResult PCAFit::fit(const FloatRowMat& X) const {
     const int N = static_cast<int>(X.rows());
     const int D = static_cast<int>(X.cols());
 
-    // 1. Compute mean (FloatVec is a row vector (1, D))
+    // 1. Mean (row vector 1 x D) and centered data.
     result.mean = X.colwise().mean();
-
-    // 2. Center data (no transpose: mean is already a row vector)
     FloatRowMat Xc = X.rowwise() - result.mean;
 
-    // 3. Covariance via SVD of centered data (economy mode)
-    //    SVD(Xc) = U S Vt  =>  cov = Vt^T diag(S^2/(N-1)) Vt
-    Eigen::BDCSVD<FloatRowMat> svd(Xc, Eigen::ComputeThinV);
-    result.rotation = svd.matrixV(); // (D, D) — columns = eigenvectors
-    // Singular values come back as a column vector; convert to our row-vector FloatVec
-    auto sv = svd.singularValues();
-    int Kmin = static_cast<int>(sv.size());
-    result.variances.resize(1, D);
-    for (int i = 0; i < Kmin;  ++i) result.variances[i] = sv[i] * sv[i] / (N - 1);
-    for (int i = Kmin; i < D; ++i) result.variances[i] = 0.0f;
+    // 2. Covariance (D x D) via one float GEMM (same precision as the prior
+    //    BDCSVD-on-float path), eigendecomposed in double for a stable solve.
+    Eigen::MatrixXd cov =
+        (Xc.transpose() * Xc).template cast<double>() / static_cast<double>(N - 1);
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(cov);
+    const Eigen::VectorXd& evals = es.eigenvalues();   // ascending
+    const Eigen::MatrixXd& evecs = es.eigenvectors();  // columns = eigenvectors
 
+    // 3. Emit rotation columns + variances ordered by DESCENDING variance, to
+    //    match the previous BDCSVD (singular values descending) convention that
+    //    downstream variance-ordered segmentation relies on.
+    result.rotation.resize(D, D);
+    result.variances.resize(1, D);
+    for (int i = 0; i < D; ++i) {
+        const int src = D - 1 - i;
+        result.rotation.col(i) = evecs.col(src).cast<float>();
+        const double v = evals[src];
+        result.variances[i] = static_cast<float>(v > 0.0 ? v : 0.0);
+    }
     return result;
 }
 
