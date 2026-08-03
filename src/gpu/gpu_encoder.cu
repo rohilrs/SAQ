@@ -6,6 +6,14 @@ namespace saq::gpu {
 // Max dims per lane: ceil(D_seg_max / 32). For D_seg up to 896, this is 28.
 constexpr int kMaxDimsPerLane = 32;
 
+// Broadcast a double from a specific warp lane (warp_broadcast_double is lane-0 only).
+__device__ __forceinline__ double shfl_double_from(double v, int src) {
+    int2 t = *reinterpret_cast<int2*>(&v);
+    t.x = __shfl_sync(0xffffffffu, t.x, src);
+    t.y = __shfl_sync(0xffffffffu, t.y, src);
+    return *reinterpret_cast<double*>(&t);
+}
+
 // ============================================================================
 // Fused CAQ Encode: subtract rotated centroid + encode + pack short/long codes
 // ============================================================================
@@ -27,7 +35,8 @@ __global__ void kernel_fused_caq_encode(
     uint16_t code_max,
     int caq_adj_rd_lmt,
     float caq_adj_eps,
-    int caq_ori_qB)
+    int caq_ori_qB,
+    int caq_sequential)
 {
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane_id = threadIdx.x % 32;
@@ -126,6 +135,57 @@ __global__ void kernel_fused_caq_encode(
     if (caq_adj_rd_lmt && oa_l2sqr > 0.0 && delta > 0.0f) {
         double re_eps = (double)caq_adj_eps * oa_l2sqr;
 
+      if (caq_sequential) {
+        // Faithful sequential Gauss-Seidel — bit-identical order to the reference CPU
+        // CAQEncoder::code_adjustment. Dims are visited in GLOBAL order; the owning
+        // lane adjusts its dim using the up-to-date running ip_o_oa / oa_l2sqr, then
+        // broadcasts them to the whole warp so the next dim sees the change. re_eps is
+        // held constant across rounds (matching the CPU), and each round ends with an
+        // exact correction (kills float drift). Slower than block-Jacobi (31 lanes idle
+        // per dim) but reproduces the reference encoder's local optimum.
+        for (int round = 1; round <= caq_adj_rd_lmt || caq_adj_rd_lmt == 0; ++round) {
+            int round_adj = 0;
+            for (size_t d = 0; d < D_seg; ++d) {
+                int owner = (int)(d / chunk);
+                int adj = 0;
+                if (lane_id == owner) {
+                    size_t i = d - start;
+                    float o = local_vec[i];
+                    int c = local_codes[i];
+                    double oa = (c + 0.5) * delta + v_mi;
+                    double oa_l2sqr_tmp = oa_l2sqr - oa * oa;
+                    double ip_delta = delta * o;
+                    while (c < (int)code_max) {
+                        double new_q = oa + delta;
+                        double new_length = oa_l2sqr_tmp + new_q * new_q;
+                        double new_ip = ip_o_oa + ip_delta;
+                        if ((ip_o_oa * ip_o_oa + re_eps) * new_length >= new_ip * new_ip * oa_l2sqr) break;
+                        c++; ip_o_oa = new_ip; oa = new_q; oa_l2sqr = new_length; adj++;
+                    }
+                    while (c > 0) {
+                        double new_q = oa - delta;
+                        double new_length = oa_l2sqr_tmp + new_q * new_q;
+                        double new_ip = ip_o_oa - ip_delta;
+                        if ((ip_o_oa * ip_o_oa + re_eps) * new_length >= new_ip * new_ip * oa_l2sqr) break;
+                        c--; ip_o_oa = new_ip; oa = new_q; oa_l2sqr = new_length; adj++;
+                    }
+                    local_codes[i] = c;
+                }
+                ip_o_oa = shfl_double_from(ip_o_oa, owner);
+                oa_l2sqr = shfl_double_from(oa_l2sqr, owner);
+                round_adj += __shfl_sync(0xffffffffu, adj, owner);
+            }
+            if (round_adj == 0) break;
+            double corr_oa_l2 = 0.0, corr_ip = 0.0;
+            for (size_t i = 0; i < my_dims; ++i) {
+                float o = local_vec[i];
+                double q = (local_codes[i] + 0.5) * delta + v_mi;
+                corr_ip += q * o; corr_oa_l2 += q * q;
+            }
+            oa_l2sqr = warp_broadcast_double(warp_reduce_sum_double(corr_oa_l2));
+            ip_o_oa = warp_broadcast_double(warp_reduce_sum_double(corr_ip));
+        }
+      } else {
         for (int round = 1; round <= caq_adj_rd_lmt || caq_adj_rd_lmt == 0; ++round) {
             int local_adj_cnt = 0;
 
@@ -174,6 +234,7 @@ __global__ void kernel_fused_caq_encode(
             ip_o_oa = warp_broadcast_double(ip_o_oa);
             re_eps = (double)caq_adj_eps * oa_l2sqr;
         }
+      }
     }
 
     // ---- Step 3b: DownUpSample ----
@@ -541,6 +602,7 @@ void launch_fused_caq_encode(
     size_t D_seg, size_t N, size_t K,
     size_t num_bits, uint16_t code_max,
     int caq_adj_rd_lmt, float caq_adj_eps, int caq_ori_qB,
+    int caq_sequential,
     cudaStream_t stream)
 {
     constexpr int kWarpsPerBlock = 4;
@@ -551,7 +613,8 @@ void launch_fused_caq_encode(
         d_vectors_rotated, d_rotated_centroids, d_cluster_ids,
         d_o_l2norm, d_fac_rescale, d_fac_error, d_ip_cent_oa,
         d_short_raw, d_long_raw,
-        D_seg, N, K, num_bits, code_max, caq_adj_rd_lmt, caq_adj_eps, caq_ori_qB);
+        D_seg, N, K, num_bits, code_max, caq_adj_rd_lmt, caq_adj_eps, caq_ori_qB,
+        caq_sequential);
     SAQ_CUDA_CHECK(cudaGetLastError());
 }
 

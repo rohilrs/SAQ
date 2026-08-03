@@ -397,6 +397,7 @@ __global__ void kernel_merge_topk(
     float* __restrict__ d_work_dists,          // [Q * max_total_cands] workspace
     uint32_t* __restrict__ d_work_ids,         // [Q * max_total_cands] workspace
     uint32_t* __restrict__ d_results,
+    float* __restrict__ d_results_dists,       // [Q * topk] output dists (nullable)
     size_t Q, size_t nprobe, size_t topk,
     size_t max_total_cands)
 {
@@ -430,9 +431,12 @@ __global__ void kernel_merge_topk(
                 uint32_t tmp_id = all_ids[i]; all_ids[i] = all_ids[best]; all_ids[best] = tmp_id;
             }
             d_results[q * topk + i] = all_ids[i];
+            if (d_results_dists) d_results_dists[q * topk + i] = all_dists[i];
         }
-        for (size_t i = total_cands; i < topk; ++i)
+        for (size_t i = total_cands; i < topk; ++i) {
             d_results[q * topk + i] = 0xFFFFFFFF;
+            if (d_results_dists) d_results_dists[q * topk + i] = INFINITY;
+        }
     }
 }
 
@@ -484,6 +488,7 @@ void launch_merge_topk(
     float* d_work_dists,
     uint32_t* d_work_ids,
     uint32_t* d_results,
+    float* d_results_dists,
     size_t Q, size_t nprobe, size_t topk,
     size_t max_total_cands,
     cudaStream_t stream)
@@ -492,7 +497,7 @@ void launch_merge_topk(
 
     kernel_merge_topk<<<Q, 1, 0, stream>>>(
         d_candidate_dists, d_candidate_ids, d_candidate_counts,
-        d_work_dists, d_work_ids, d_results,
+        d_work_dists, d_work_ids, d_results, d_results_dists,
         Q, nprobe, topk, max_total_cands);
     SAQ_CUDA_CHECK(cudaGetLastError());
 }

@@ -1,5 +1,6 @@
 #ifdef SAQ_USE_CUDA
 
+#include <cstdlib>
 #include "saq/gpu/gpu_ivf.h"
 #include "saq/gpu/gpu_utils.cuh"
 #include "saq/gpu/gpu_encoder.cuh"
@@ -243,12 +244,16 @@ void GpuIVF::construct(const FloatRowMat& data,
                     D_seg, N, K, num_bits, code_max,
                     bdata.cfg.caq_adj_rd_lmt, bdata.cfg.caq_adj_eps);
             } else {
+                // SAQ_GPU_CAQ_SEQUENTIAL=1 -> faithful sequential Gauss-Seidel CAQ that
+                // reproduces the reference CPU encoder (block-Jacobi otherwise).
+                static const int kCaqSeq = (std::getenv("SAQ_GPU_CAQ_SEQUENTIAL") != nullptr);
                 launch_fused_caq_encode(
                     d_rotated.get(), d_rotated_centroids.get(), d_cluster_ids.get(),
                     d_o_l2norm.get(), d_fac_rescale.get(), d_fac_error.get(), d_ip_cent_oa.get(),
                     d_short_raw.get(), d_long_raw.get(),
                     D_seg, N, K, num_bits, code_max,
-                    bdata.cfg.caq_adj_rd_lmt, bdata.cfg.caq_adj_eps, bdata.cfg.caq_ori_qB);
+                    bdata.cfg.caq_adj_rd_lmt, bdata.cfg.caq_adj_eps, bdata.cfg.caq_ori_qB,
+                    kCaqSeq);
             }
         } else {
             // No rotation: fused encode subtracts centroid inline from raw vectors

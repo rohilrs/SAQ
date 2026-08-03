@@ -75,6 +75,7 @@ void launch_merge_topk(
     float* d_work_dists,                        // [Q * max_total_cands] workspace
     uint32_t* d_work_ids,                       // [Q * max_total_cands] workspace
     uint32_t* d_results,                        // [Q * topk] output
+    float* d_results_dists,                     // [Q * topk] output dists (nullable)
     size_t Q, size_t nprobe, size_t topk,
     size_t max_total_cands,
     cudaStream_t stream = 0);

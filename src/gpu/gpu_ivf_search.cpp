@@ -17,7 +17,8 @@ namespace saq::gpu {
 void GpuIVF::search_batch(const FloatRowMat& queries,
                            size_t topk, size_t nprobe,
                            SearcherConfig cfg,
-                           PID* results) {
+                           PID* results,
+                           float* out_dists) {
     const size_t Q = queries.rows();
     const size_t D = num_dim_;
     const size_t K = num_cen_;
@@ -179,6 +180,7 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
     auto d_candidate_ids = device_alloc<uint32_t>(cand_buf_size);
     auto d_candidate_counts = device_alloc<uint32_t>(Q * nprobe);
     auto d_results = device_alloc<uint32_t>(Q * topk);
+    auto d_results_dists = device_alloc<float>(Q * topk);
 
     // Workspace for merge kernel
     size_t max_total_cands = nprobe * kMaxCandidatesPerBlock;
@@ -207,7 +209,7 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
     launch_merge_topk(
         d_candidate_dists.get(), d_candidate_ids.get(), d_candidate_counts.get(),
         d_work_dists.get(), d_work_ids.get(),
-        d_results.get(), Q, nprobe, topk, max_total_cands);
+        d_results.get(), d_results_dists.get(), Q, nprobe, topk, max_total_cands);
 
     SAQ_CUDA_CHECK(cudaDeviceSynchronize());
     auto merge_ms = kernel_timer.getElapsedTimeMicro() / 1000.0;
@@ -219,6 +221,10 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
 
     for (size_t i = 0; i < Q * topk; ++i) {
         results[i] = static_cast<PID>(h_results[i]);
+    }
+
+    if (out_dists != nullptr) {
+        download(out_dists, d_results_dists.get(), Q * topk);
     }
 
     auto total_ms = stopw.getElapsedTimeMicro() / 1000.0;

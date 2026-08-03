@@ -23,6 +23,7 @@ void launch_fused_caq_encode(
     size_t D_seg, size_t N, size_t K,
     size_t num_bits, uint16_t code_max,
     int caq_adj_rd_lmt, float caq_adj_eps, int caq_ori_qB,
+    int caq_sequential = 0,
     cudaStream_t stream = 0);
 
 /// No-rotation variant: reads raw vectors + centroids with segment offset.

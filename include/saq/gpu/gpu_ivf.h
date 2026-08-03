@@ -93,10 +93,14 @@ public:
     const GpuMemoryPool& get_pool() const { return pool_; }
 
     /// GPU-accelerated batch search.
+    /// If out_dists != nullptr it receives the final top-k ADC distances
+    /// (row-major [Q*topk], aligned with results) — needed to merge results
+    /// across DB shards by distance.
     void search_batch(const FloatRowMat& queries,
                       size_t topk, size_t nprobe,
                       SearcherConfig cfg,
-                      PID* results);
+                      PID* results,
+                      float* out_dists = nullptr);
 };
 
 } // namespace saq::gpu

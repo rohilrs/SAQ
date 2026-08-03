@@ -57,20 +57,33 @@ PYBIND11_MODULE(_saq_gpu, m) {
              "Build GPU IVF index from data, centroids, and cluster assignments.")
         .def("search_batch",
              [](gpu::GpuIVF &self, Eigen::Ref<const FloatRowMat> queries,
-                size_t topk, size_t nprobe, SearcherConfig searcher_cfg) {
+                size_t topk, size_t nprobe, SearcherConfig searcher_cfg,
+                bool return_dists) -> py::object {
                  size_t nq = static_cast<size_t>(queries.rows());
                  py::array_t<uint32_t> results({static_cast<py::ssize_t>(nq),
                                                  static_cast<py::ssize_t>(topk)});
                  auto *results_ptr = static_cast<PID *>(results.mutable_data());
+                 if (!return_dists) {
+                     {
+                         py::gil_scoped_release release;
+                         self.search_batch(queries, topk, nprobe, searcher_cfg, results_ptr);
+                     }
+                     return std::move(results);
+                 }
+                 py::array_t<float> dists({static_cast<py::ssize_t>(nq),
+                                           static_cast<py::ssize_t>(topk)});
+                 auto *dists_ptr = static_cast<float *>(dists.mutable_data());
                  {
                      py::gil_scoped_release release;
-                     self.search_batch(queries, topk, nprobe, searcher_cfg, results_ptr);
+                     self.search_batch(queries, topk, nprobe, searcher_cfg, results_ptr, dists_ptr);
                  }
-                 return results;
+                 return py::make_tuple(std::move(results), std::move(dists));
              },
              py::arg("queries"), py::arg("topk"), py::arg("nprobe"),
              py::arg("config") = SearcherConfig(),
-             "GPU batch search. Returns uint32 array of shape (nq, topk).")
+             py::arg("return_dists") = false,
+             "GPU batch search. Returns uint32 (nq,topk) IDs; if return_dists=True "
+             "returns (ids, dists) where dists are the top-k ADC distances.")
         .def_property_readonly("num_data", &gpu::GpuIVF::num_data)
         .def_property_readonly("num_dim", &gpu::GpuIVF::num_dim)
         .def_property_readonly("k", &gpu::GpuIVF::k)
