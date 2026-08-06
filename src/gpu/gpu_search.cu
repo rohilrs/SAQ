@@ -2,6 +2,7 @@
 #include "saq/gpu/gpu_utils.cuh"
 
 #include <cfloat>
+#include <cuda_fp16.h>
 
 namespace saq::gpu {
 
@@ -17,14 +18,17 @@ __device__ __forceinline__ float warp_reduce_min(float val) {
 
 /// Build LUT for one codebook (4 query dims → 16 entries via subset sums).
 /// Same as CPU pack_lut: LUT[j] = LUT[j - lowbit(j)] + query[kPos[j]]
-__device__ void build_codebook_lut(const float* query4, float* lut16) {
+__device__ void build_codebook_lut(const float* query4, __half* lut16) {
     // kPos maps 4-bit pattern to which query dim to add
     constexpr int kPos[16] = {3,3,2,3,1,3,2,3,0,3,2,3,1,3,2,3};
-    lut16[0] = 0.0f;
+    // Build in fp32 (exact subset-sum recurrence), then store fp16 to halve smem footprint.
+    float tmp[16];
+    tmp[0] = 0.0f;
     for (int j = 1; j < 16; ++j) {
         int lb = j & (-j);  // lowbit
-        lut16[j] = lut16[j - lb] + query4[kPos[j]];
+        tmp[j] = tmp[j - lb] + query4[kPos[j]];
     }
+    for (int j = 0; j < 16; ++j) lut16[j] = __float2half(tmp[j]);
 }
 
 /// Compute inner product between codebook-quantized vector and query segment.
@@ -153,8 +157,8 @@ __global__ void kernel_search(
     // [after consts): work-stealing counter
     // [after counter): per-segment residual query (for stage 3 accurate distance)
     constexpr int kConstsPerSeg = 7;  // delta, sum_vl_lut, sum_q_resid, q_l2sqr_resid, q_l2norm_resid, one_over_sqrtD, sq_delta
-    float* smem_lut_f = (float*)smem_raw;
-    float* smem_consts_f = smem_lut_f + total_codebooks * 16;
+    __half* smem_lut_h = (__half*)smem_raw;
+    float* smem_consts_f = (float*)(smem_lut_h + total_codebooks * 16);
     int* smem_work = (int*)(smem_consts_f + num_segments * kConstsPerSeg);
     float* smem_resid_query = (float*)((char*)(smem_work + 1));
     // smem_resid_query: [total_D_seg] floats — residual query = rotated_query - centroid
@@ -184,7 +188,7 @@ __global__ void kernel_search(
 
         // Build LUT from residual query
         for (size_t cb = threadIdx.x; cb < seg.num_codebooks; cb += blockDim.x) {
-            float* dst = smem_lut_f + (seg_cb_offsets[s] + cb) * 16;
+            __half* dst = smem_lut_h + (seg_cb_offsets[s] + cb) * 16;
             build_codebook_lut(resid_seg + cb * 4, dst);
         }
 
@@ -286,7 +290,7 @@ __global__ void kernel_search(
                             + (size_t)global_block * 32 * seg.num_codebooks;
                         const uint8_t* my_codes = short_base + lane * seg.num_codebooks;
                         for (size_t cb = 0; cb < seg.num_codebooks; ++cb) {
-                            lut_sum += smem_lut_f[(seg_cb_offsets[s] + cb) * 16 + my_codes[cb]];
+                            lut_sum += __half2float(smem_lut_h[(seg_cb_offsets[s] + cb) * 16 + my_codes[cb]]);
                         }
                     }
 
@@ -464,7 +468,7 @@ void launch_search(
     // Compute shared memory size
     size_t total_codebooks = total_D_seg / 4;
     constexpr int kConstsPerSeg = 7;
-    size_t shmem_bytes = total_codebooks * 16 * sizeof(float)          // LUT
+    size_t shmem_bytes = total_codebooks * 16 * sizeof(__half)         // LUT (fp16 to halve smem -> higher occupancy)
                        + num_segments * kConstsPerSeg * sizeof(float)  // constants
                        + sizeof(int)                                    // work counter
                        + total_D_seg * sizeof(float)                    // residual query
