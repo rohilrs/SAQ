@@ -8,7 +8,8 @@ namespace saq::gpu {
 // Input:  flat_short[i] has D_seg/8 bytes per vector, 1-bit-per-dim, descending
 //         bit order (dim 0 → bit 7 of byte 0).
 // Output: GPU blocked layout — 1 byte per codebook (4 dims) per vector,
-//         organized as blocks of 32 vectors.
+//         transposed within blocks of 32 vectors: [cb_group][vec 0..31][4 cbs],
+//         so each lane's uint32 load of its 4 codes coalesces across the warp.
 // ---------------------------------------------------------------------------
 __global__ void kernel_scatter_short_codes(
     const uint8_t* __restrict__ flat_short,
@@ -30,6 +31,7 @@ __global__ void kernel_scatter_short_codes(
     size_t num_codebooks = D_seg / 4;
 
     const uint8_t* src = flat_short + i * (D_seg / 8);
+    size_t num_cb_groups = (num_codebooks + 3) / 4;
 
     for (size_t cb = 0; cb < num_codebooks; ++cb) {
         size_t dim_base = cb * 4;
@@ -43,8 +45,9 @@ __global__ void kernel_scatter_short_codes(
             uint8_t bit = (src[byte_idx] >> bit_pos) & 1;
             code4 |= (bit << (3 - j));  // dim 0 → bit 3, dim 3 → bit 0
         }
-        size_t dst_idx = (size_t)global_block * 32 * num_codebooks
-                       + (size_t)vec_in_block * num_codebooks + cb;
+        size_t dst_idx = (size_t)global_block * num_cb_groups * 4 * 32
+                       + (cb / 4) * 4 * 32
+                       + (size_t)vec_in_block * 4 + (cb % 4);
         pool_short[dst_idx] = code4;
     }
 }
@@ -65,41 +68,49 @@ void launch_scatter_short_codes(
 }
 
 // ---------------------------------------------------------------------------
-// Long code scatter: flat → per-cluster contiguous in pool.
+// Long code scatter: flat → uint32 words transposed within 32-vector blocks:
+// [block][word][vec 0..31]. Word w of a vector holds its bytes 4w..4w+3
+// (little-endian, preserving the LSB-first bit stream). Clusters are padded
+// to whole blocks; padding stays zero from the pool memset.
 // ---------------------------------------------------------------------------
 __global__ void kernel_scatter_long_codes(
     const uint8_t* __restrict__ flat_long,
     uint8_t* __restrict__ pool_long,
     const uint32_t* __restrict__ d_cluster_offsets,
+    const uint32_t* __restrict__ d_block_offsets,
     const uint32_t* __restrict__ d_cluster_ids,
-    size_t long_bytes_per_vec, size_t N)
+    size_t long_bytes_per_vec, size_t long_words_per_vec, size_t N)
 {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
 
     uint32_t c = d_cluster_ids[i];
     uint32_t pos = static_cast<uint32_t>(i) - d_cluster_offsets[c];
+    uint32_t vec_in_block = pos % 32;
+    uint32_t global_block = d_block_offsets[c] + pos / 32;
 
     const uint8_t* src = flat_long + i * long_bytes_per_vec;
-    uint8_t* dst = pool_long + ((size_t)d_cluster_offsets[c] + pos) * long_bytes_per_vec;
+    uint8_t* dst_block = pool_long + (size_t)global_block * 32 * long_words_per_vec * 4;
 
     for (size_t b = 0; b < long_bytes_per_vec; ++b) {
-        dst[b] = src[b];
+        dst_block[((b / 4) * 32 + vec_in_block) * 4 + (b % 4)] = src[b];
     }
 }
 
 void launch_scatter_long_codes(
     const uint8_t* flat_long, uint8_t* pool_long,
-    const uint32_t* d_cluster_offsets, const uint32_t* d_cluster_ids,
+    const uint32_t* d_cluster_offsets, const uint32_t* d_block_offsets,
+    const uint32_t* d_cluster_ids,
     size_t long_bytes_per_vec, size_t N,
     cudaStream_t stream)
 {
     if (N == 0 || long_bytes_per_vec == 0) return;
+    size_t long_words_per_vec = (long_bytes_per_vec + 3) / 4;
     int threads = 256;
     int blocks = (int)((N + threads - 1) / threads);
     kernel_scatter_long_codes<<<blocks, threads, 0, stream>>>(
-        flat_long, pool_long, d_cluster_offsets, d_cluster_ids,
-        long_bytes_per_vec, N);
+        flat_long, pool_long, d_cluster_offsets, d_block_offsets, d_cluster_ids,
+        long_bytes_per_vec, long_words_per_vec, N);
 }
 
 // ---------------------------------------------------------------------------

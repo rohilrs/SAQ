@@ -346,8 +346,8 @@ void GpuIVF::construct(const FloatRowMat& data,
         if (long_code_bytes > 0) {
             launch_scatter_long_codes(
                 d_long_raw.get(), pool_.segments[seg].long_codes.get(),
-                pool_.d_cluster_offsets.get(), d_cluster_ids.get(),
-                long_code_bytes, N);
+                pool_.d_cluster_offsets.get(), pool_.d_block_offsets.get(),
+                d_cluster_ids.get(), long_code_bytes, N);
         }
 
         SAQ_CUDA_CHECK(cudaDeviceSynchronize());

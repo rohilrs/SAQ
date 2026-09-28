@@ -13,17 +13,19 @@ namespace saq::gpu {
 /// Device-side per-segment descriptor for search kernel.
 /// Uploaded once after construct; contains pool pointers and segment metadata.
 struct GpuSegmentDescriptor {
-    uint8_t* short_codes;          // base pointer in pool
-    uint8_t* long_codes;           // base pointer in pool
+    uint8_t* short_codes;          // base pointer in pool; per block: [cb_group][vec 0..31][4 cbs]
+    uint8_t* long_codes;           // base pointer in pool; per block: [word][vec 0..31] uint32 words
     float* factor_o_l2norm;        // base pointer in pool (blocked layout)
     float* factor_ip_cent_oa;      // base pointer in pool (blocked layout)
     float* factor_rescale;         // base pointer in pool (per-vector)
     float* factor_error;           // base pointer in pool (per-vector)
     float* centroids;              // base pointer in pool
     size_t num_codebooks;          // D_seg / 4
+    size_t num_cb_groups;          // ceil(num_codebooks / 4); short block stride = 128 * this
     size_t D_seg;
     size_t num_bits;
     size_t long_bytes_per_vec;     // D_seg * (bits-1) / 8, or 0 for bits <= 1
+    size_t long_words_per_vec;     // ceil(long_bytes_per_vec / 4); long block stride = 32 * this words
     float* codebook_centroids;     // nullptr = uniform mode; else [D_seg * entries_per_dim]
     size_t codebook_entries_per_dim; // 1 << num_bits, or 0
 };

@@ -142,10 +142,12 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
         sd.factor_error = sp.factor_error.get();
         sd.centroids = sp.centroids.get();
         sd.num_codebooks = quant_plan[s].first / 4;
+        sd.num_cb_groups = (sd.num_codebooks + 3) / 4;
         sd.D_seg = quant_plan[s].first;
         sd.num_bits = quant_plan[s].second;
         sd.long_bytes_per_vec = (quant_plan[s].second > 1)
             ? quant_plan[s].first * (quant_plan[s].second - 1) / 8 : 0;
+        sd.long_words_per_vec = (sd.long_bytes_per_vec + 3) / 4;
 
         // Codebook pointers (nullptr if no codebook for this segment)
         sd.codebook_centroids = sp.codebook_centroids.get();

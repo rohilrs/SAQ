@@ -14,6 +14,7 @@
 #ifdef SAQ_USE_CUDA
 
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -93,6 +94,7 @@ int main(int argc, char** argv) {
         try {
             StopW sw;
             gpu::GpuIVF gpu_ivf(N, D, K, cfg);
+            std::srand(42);  // deterministic rotations so A/B builds are comparable
             gpu_ivf.set_variance(variances.row(0));
             gpu_ivf.construct(vectors, centroids, cids.data());
             auto gpu_ms = sw.getElapsedTimeMicro() / 1000.0;
@@ -120,6 +122,7 @@ int main(int argc, char** argv) {
 
         // Re-build GPU index for search (need the gpu_ivf object to persist)
         gpu::GpuIVF gpu_ivf2(N, D, K, cfg);
+        std::srand(42);  // deterministic rotations so A/B builds are comparable
         gpu_ivf2.set_variance(variances.row(0));
         gpu_ivf2.construct(vectors, centroids, cids.data());
 
@@ -127,10 +130,12 @@ int main(int argc, char** argv) {
         search_cfg.dist_type = DistType::L2Sqr;
 
         std::vector<PID> gpu_results(Q * topk);
+        std::vector<float> gpu_result_dists(Q * topk);
 
         try {
             StopW sw;
-            gpu_ivf2.search_batch(queries, topk, nprobe, search_cfg, gpu_results.data());
+            gpu_ivf2.search_batch(queries, topk, nprobe, search_cfg, gpu_results.data(),
+                                  gpu_result_dists.data());
             auto gpu_search_ms = sw.getElapsedTimeMicro() / 1000.0;
             LOG(INFO) << "GPU batch search: Q=" << Q << " nprobe=" << nprobe
                       << " topk=" << topk
@@ -151,6 +156,16 @@ int main(int argc, char** argv) {
             }
             double recall = 100.0 * correct / (Q * std::min(topk, (size_t)gt.cols()));
             LOG(INFO) << "GPU Recall@" << topk << " = " << recall << "%";
+
+            // A/B verification: dump [Q*topk] ids then [Q*topk] float dists, binary.
+            if (const char* dump_path = std::getenv("SAQ_DUMP_RESULTS")) {
+                std::ofstream f(dump_path, std::ios::binary);
+                f.write(reinterpret_cast<const char*>(gpu_results.data()),
+                        gpu_results.size() * sizeof(PID));
+                f.write(reinterpret_cast<const char*>(gpu_result_dists.data()),
+                        gpu_result_dists.size() * sizeof(float));
+                LOG(INFO) << "Dumped ids+dists to " << dump_path;
+            }
         } catch (const std::exception& e) {
             LOG(ERROR) << "GPU search failed: " << e.what();
         }

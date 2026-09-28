@@ -35,69 +35,83 @@ __device__ void build_codebook_lut(const float* query4, __half* lut16) {
 /// Each dimension's code indexes into the codebook to get the centroid value,
 /// then we compute dot product with the residual query.
 ///
-/// Short codes are in fastscan layout: num_codebooks nibbles per vector.
-/// Each nibble packs 4 dims: dim0→bit3, dim1→bit2, dim2→bit1, dim3→bit0.
-/// Long codes are bit-compacted: (num_bits-1) bits per dim.
+/// Short codes are block-transposed: per 32-vector block, [cb_group][vec][4 cbs];
+/// each nibble packs 4 dims: dim0→bit3, dim1→bit2, dim2→bit1, dim3→bit0.
+/// Long codes are block-transposed uint32 words ([word][vec] per block) holding
+/// the LSB-first (num_bits-1)-bit-per-dim stream.
 __device__ float gpu_codebook_ip(
     const float* __restrict__ resid_query,    // [D_seg]
     const float* __restrict__ codebook,       // [D_seg * entries_per_dim]
-    const uint8_t* __restrict__ short_code,   // fastscan nibbles [num_codebooks]
-    const uint8_t* __restrict__ long_code,    // bit-packed lower bits
+    const uint8_t* __restrict__ short_block,  // this 32-vector block's short codes
+    const uint32_t* __restrict__ long_block,  // this block's long-code words, or nullptr
+    int lane,
     size_t D_seg, size_t num_bits,
     size_t entries_per_dim)
 {
     size_t ex_bits = (num_bits > 1) ? num_bits - 1 : 0;
     size_t num_codebooks = D_seg / 4;
+    uint32_t low_mask = ex_bits ? ((1u << ex_bits) - 1u) : 0u;
     float ip = 0.0f;
 
-    for (size_t d = 0; d < D_seg; ++d) {
-        // Extract MSB from fastscan nibble layout
-        size_t cb_idx = d / 4;          // which codebook (nibble)
-        int sub = (int)(d % 4);         // position within the 4-dim group
-        int bit_in_nibble = 3 - sub;    // dim0→bit3, dim1→bit2, etc.
-        int msb = (short_code[cb_idx] >> bit_in_nibble) & 1;
+    uint64_t bit_buf = 0;
+    unsigned bits_have = 0;
+    size_t next_word = 0;
 
-        int code_low = 0;
-        if (ex_bits > 0 && long_code) {
-            size_t bit_offset = d * ex_bits;
-            for (size_t b = 0; b < ex_bits; ++b) {
-                size_t gbit = bit_offset + b;
-                if ((long_code[gbit / 8] >> (gbit % 8)) & 1)
-                    code_low |= (1 << b);
+    for (size_t cb = 0; cb < num_codebooks; ++cb) {
+        uint8_t nibble = short_block[(cb / 4) * 4 * 32 + (size_t)lane * 4 + (cb % 4)];
+        for (int j = 0; j < 4; ++j) {
+            size_t d = cb * 4 + j;
+            int msb = (nibble >> (3 - j)) & 1;  // dim0→bit3, dim1→bit2, etc.
+
+            int code_low = 0;
+            if (ex_bits > 0 && long_block) {
+                if (bits_have < ex_bits) {
+                    bit_buf |= (uint64_t)long_block[next_word * 32 + lane] << bits_have;
+                    bits_have += 32;
+                    ++next_word;
+                }
+                code_low = (int)(bit_buf & low_mask);
+                bit_buf >>= ex_bits;
+                bits_have -= ex_bits;
             }
-        }
-        int full_code = (msb << ex_bits) | code_low;
+            int full_code = (msb << ex_bits) | code_low;
 
-        float centroid_val = __ldg(&codebook[d * entries_per_dim + full_code]);
-        ip += centroid_val * resid_query[d];
+            float centroid_val = __ldg(&codebook[d * entries_per_dim + full_code]);
+            ip += centroid_val * resid_query[d];
+        }
     }
     return ip;
 }
 
 /// Unpack and compute IP between query and variable-bit long code.
-/// Long codes store (num_bits-1) bits per dim, bit-compacted.
+/// Long codes store (num_bits-1) bits per dim LSB-first, as uint32 words
+/// transposed within the 32-vector block: word w of vector `lane` sits at
+/// long_block[w * 32 + lane], so the warp's loads coalesce.
 __device__ float gpu_long_code_ip(
     const float* query_seg,
-    const uint8_t* long_code,
+    const uint32_t* long_block,
+    int lane,
     size_t D_seg, size_t num_bits)
 {
     if (num_bits <= 1) return 0.0f;
 
     size_t ex_bits = num_bits - 1;
+    uint32_t low_mask = (1u << ex_bits) - 1u;
     float ip = 0.0f;
 
+    uint64_t bit_buf = 0;
+    unsigned bits_have = 0;
+    size_t next_word = 0;
+
     for (size_t d = 0; d < D_seg; ++d) {
-        // Extract ex_bits starting at bit position d * ex_bits
-        size_t bit_offset = d * ex_bits;
-        int code_val = 0;
-        for (size_t b = 0; b < ex_bits; ++b) {
-            size_t global_bit = bit_offset + b;
-            size_t byte_pos = global_bit / 8;
-            size_t bit_pos = global_bit % 8;
-            if ((long_code[byte_pos] >> bit_pos) & 1)
-                code_val |= (1 << b);
+        if (bits_have < ex_bits) {
+            bit_buf |= (uint64_t)long_block[next_word * 32 + lane] << bits_have;
+            bits_have += 32;
+            ++next_word;
         }
-        ip += query_seg[d] * (float)code_val;
+        ip += query_seg[d] * (float)(bit_buf & low_mask);
+        bit_buf >>= ex_bits;
+        bits_have -= ex_bits;
     }
     return ip;
 }
@@ -264,17 +278,17 @@ __global__ void kernel_search(
                 if (seg.codebook_centroids != nullptr) {
                     // ---- Codebook distance path ----
                     const float* resid_seg = smem_resid_query + seg_dim_offsets[s];
-                    // Short codes in fastscan layout: num_codebooks nibbles per vector
-                    const uint8_t* short_code = seg.short_codes
-                        + (size_t)global_block * 32 * seg.num_codebooks
-                        + lane * seg.num_codebooks;
-                    const uint8_t* long_code = (seg.long_bytes_per_vec > 0)
-                        ? seg.long_codes + vec_offset * seg.long_bytes_per_vec
+                    // Short/long codes are transposed within the 32-vector block
+                    const uint8_t* short_block = seg.short_codes
+                        + (size_t)global_block * seg.num_cb_groups * 4 * 32;
+                    const uint32_t* long_block = (seg.long_bytes_per_vec > 0)
+                        ? (const uint32_t*)seg.long_codes
+                          + (size_t)global_block * 32 * seg.long_words_per_vec
                         : nullptr;
 
                     float cb_ip = gpu_codebook_ip(
                         resid_seg, seg.codebook_centroids,
-                        short_code, long_code,
+                        short_block, long_block, lane,
                         seg.D_seg, seg.num_bits,
                         seg.codebook_entries_per_dim);
 
@@ -286,20 +300,29 @@ __global__ void kernel_search(
 
                     float lut_sum = 0.0f;
                     {
-                        const uint8_t* short_base = seg.short_codes
-                            + (size_t)global_block * 32 * seg.num_codebooks;
-                        const uint8_t* my_codes = short_base + lane * seg.num_codebooks;
-                        for (size_t cb = 0; cb < seg.num_codebooks; ++cb) {
-                            lut_sum += __half2float(smem_lut_h[(seg_cb_offsets[s] + cb) * 16 + my_codes[cb]]);
+                        // Block-transposed layout: lane's 4 consecutive nibble-codes
+                        // sit in one uint32; the warp's loads span 128 contiguous bytes.
+                        const uint32_t* short_words = (const uint32_t*)(seg.short_codes
+                            + (size_t)global_block * seg.num_cb_groups * 4 * 32);
+                        const __half* lut_seg = smem_lut_h + seg_cb_offsets[s] * 16;
+                        for (size_t cbg = 0; cbg < seg.num_cb_groups; ++cbg) {
+                            uint32_t codes4 = short_words[cbg * 32 + lane];
+                            size_t cb_base = cbg * 4;
+                            size_t nsub = seg.num_codebooks - cb_base;
+                            if (nsub > 4) nsub = 4;
+                            for (size_t k = 0; k < nsub; ++k) {
+                                lut_sum += __half2float(
+                                    lut_seg[(cb_base + k) * 16 + ((codes4 >> (8 * k)) & 0xFFu)]);
+                            }
                         }
                     }
 
                     float full_ip;
                     if (seg.num_bits > 1 && seg.long_bytes_per_vec > 0) {
                         const float* resid_seg = smem_resid_query + seg_dim_offsets[s];
-                        const uint8_t* long_code = seg.long_codes
-                            + vec_offset * seg.long_bytes_per_vec;
-                        float ext_ip = gpu_long_code_ip(resid_seg, long_code,
+                        const uint32_t* long_block = (const uint32_t*)seg.long_codes
+                            + (size_t)global_block * 32 * seg.long_words_per_vec;
+                        float ext_ip = gpu_long_code_ip(resid_seg, long_block, lane,
                                                          seg.D_seg, seg.num_bits);
                         full_ip = lut_sum + ext_ip * sq_delta_s
                                 + (-1.0f + sq_delta_s / 2.0f) * sum_q_s;

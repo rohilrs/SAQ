@@ -64,12 +64,12 @@ BitAllocationResult BitAllocatorGreedy::AllocateJoint(const Eigen::MatrixXf &mse
     // that merges two segments removes one segment's overhead).
     std::vector<size_t> bits(num_blocks, 0);
     while (true) {
-        ssize_t best_i = -1;
+        std::ptrdiff_t best_i = -1;
         double  best_drop = -std::numeric_limits<double>::infinity();
         for (size_t i = 0; i < num_blocks; ++i) {
             if (bits[i] >= max_bits) continue;
             const double drop = block_mse[i][bits[i]] - block_mse[i][bits[i] + 1];
-            if (drop > best_drop) { best_drop = drop; best_i = static_cast<ssize_t>(i); }
+            if (drop > best_drop) { best_drop = drop; best_i = static_cast<std::ptrdiff_t>(i); }
         }
         if (best_i < 0) break;  // every block at max_bits already
 

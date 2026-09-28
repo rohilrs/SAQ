@@ -18,12 +18,13 @@ void launch_scatter_short_codes(
     size_t D_seg, size_t N, size_t num_bits,
     cudaStream_t stream = 0);
 
-/// Scatter long codes: flat → per-cluster contiguous in pool.
+/// Scatter long codes: flat → uint32 words transposed within 32-vector blocks.
 /// Precondition: vectors sorted by cluster ID.
 void launch_scatter_long_codes(
     const uint8_t* flat_long,
     uint8_t* pool_long,
     const uint32_t* d_cluster_offsets,
+    const uint32_t* d_block_offsets,
     const uint32_t* d_cluster_ids,
     size_t long_bytes_per_vec, size_t N,
     cudaStream_t stream = 0);

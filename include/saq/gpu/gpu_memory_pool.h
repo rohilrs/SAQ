@@ -95,10 +95,16 @@ struct GpuMemoryPool {
             sp.factor_o_l2norm   = device_alloc<float>(total_blocks_ * KFastScanSize);
             sp.factor_ip_cent_oa = device_alloc<float>(total_blocks_ * KFastScanSize);
 
-            size_t short_bytes = bits ? total_blocks_ * num_codebooks * KFastScanSize : 0;
+            // Short codes: transposed within 32-vector blocks so warp reads coalesce.
+            // Per block: [cb_group][vec 0..31][4 cbs] = 128 bytes per cb-group.
+            size_t num_cb_groups = (num_codebooks + 3) / 4;
+            size_t short_bytes = bits ? total_blocks_ * num_cb_groups * 4 * KFastScanSize : 0;
             sp.short_codes = device_alloc<uint8_t>(short_bytes > 0 ? short_bytes : 1);
 
-            size_t long_total = long_bytes_per_vec * total_vecs_;
+            // Long codes: uint32 words transposed within 32-vector blocks, so clusters
+            // are padded to whole blocks. Per block: [word][vec 0..31].
+            size_t long_words_per_vec = (long_bytes_per_vec + 3) / 4;
+            size_t long_total = total_blocks_ * KFastScanSize * long_words_per_vec * 4;
             sp.long_codes = device_alloc<uint8_t>(long_total > 0 ? long_total : 1);
 
             sp.factor_rescale = device_alloc<float>(total_vecs_ > 0 ? total_vecs_ : 1);
@@ -133,14 +139,17 @@ struct GpuMemoryPool {
             seg.d_factor_ip_cent_oa = sp.factor_ip_cent_oa.get() + blk_off * KFastScanSize;
 
             if (bits > 0) {
+                size_t num_cb_groups = (num_codebooks + 3) / 4;
                 seg.d_short_codes = sp.short_codes.get()
-                    + blk_off * num_codebooks * KFastScanSize;
+                    + blk_off * num_cb_groups * 4 * KFastScanSize;
             } else {
                 seg.d_short_codes = nullptr;
             }
 
             if (long_bytes_per_vec > 0) {
-                seg.d_long_codes = sp.long_codes.get() + vec_off * long_bytes_per_vec;
+                size_t long_words_per_vec = (long_bytes_per_vec + 3) / 4;
+                seg.d_long_codes = sp.long_codes.get()
+                    + blk_off * KFastScanSize * long_words_per_vec * 4;
             } else {
                 seg.d_long_codes = nullptr;
             }
