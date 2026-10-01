@@ -10,7 +10,12 @@
 ///   Stage 3: Accurate distance computation for candidates (compAccurateDist)
 
 #include <bit>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+
+#include <fmt/core.h>
 #include <immintrin.h>
 #include <limits>
 #include <stdint.h>
@@ -64,6 +69,11 @@ class SAQSearcher : public SaqCluEstimator<kDistType> {
 #if defined(__AVX512F__)
     template <bool enable_var = true>
     void searchCluster(const SaqCluData *saq_clust, ResultPool &KNNs) {
+        // Diagnostic kill-switches for isolating recall loss per stage
+        // (env-gated; all false in normal operation).
+        static const bool kNoVarPrune = std::getenv("SAQ_DIAG_NO_VARPRUNE") != nullptr;
+        static const bool kNoS2Break  = std::getenv("SAQ_DIAG_NO_S2BREAK") != nullptr;
+        static const bool kNoS3Gate   = std::getenv("SAQ_DIAG_NO_S3GATE") != nullptr;
         auto clus_num = saq_clust->num_segments_;
         CHECK_EQ(clus_num, estimators_.size());
 
@@ -98,7 +108,7 @@ class SAQSearcher : public SaqCluEstimator<kDistType> {
                 }
 
                 mi = _mm512_reduce_min_ps(_mm512_min_ps(curr_dist512[0], curr_dist512[1]));
-                if (mi > distk) {
+                if (mi > distk && !kNoVarPrune) {
                     continue;
                 }
             }
@@ -120,12 +130,38 @@ class SAQSearcher : public SaqCluEstimator<kDistType> {
                 curr_dist512[1] = _mm512_add_ps(curr_dist512[1], cd[1]);
 
                 mi = _mm512_reduce_min_ps(_mm512_min_ps(curr_dist512[0], curr_dist512[1]));
-                if (mi > distk) {
+                if (mi > distk && !kNoS2Break) {
                     break;
                 }
             }
 
-            if (mi <= distk) {
+            static const bool kNanCount = std::getenv("SAQ_DIAG_NANCOUNT") != nullptr;
+            if (kNanCount && std::isnan(mi)) {
+                float PORTABLE_ALIGN64 cur[KFastScanSize];
+                float PORTABLE_ALIGN64 seg_dist[KFastScanSize];
+                _mm512_store_ps(cur, curr_dist512[0]);
+                _mm512_store_ps(cur + 16, curr_dist512[1]);
+                std::string culprit;
+                for (size_t j = 0; j < KFastScanSize && culprit.empty(); ++j) {
+                    if (!std::isnan(cur[j])) continue;
+                    culprit = fmt::format("lane {} blk {} num_vec {}:", j, blk_idx,
+                                          saq_clust->num_vec_);
+                    for (size_t c_i = 0; c_i < clus_num; ++c_i) {
+                        _mm512_store_ps(seg_dist, clu_dist512_[c_i * FAST_ARRAY]);
+                        _mm512_store_ps(seg_dist + 16, clu_dist512_[c_i * FAST_ARRAY + 1]);
+                        const auto &seg = saq_clust->get_segment(c_i);
+                        culprit += fmt::format(" [seg{} b{} cd {} o {}]", c_i, seg.num_bits_,
+                                               seg_dist[j], seg.factor_o_l2norm(blk_idx)[j]);
+                    }
+                }
+                LOG_EVERY_N(WARNING, 1000) << "mi NaN: " << culprit
+                                           << " (occurrence " << google::COUNTER << ")";
+            }
+
+            // NaN-robust form of (mi <= distk): a NaN lane (e.g. from garbage
+            // padding factors) must not silently discard the block's 31 valid
+            // lanes — the per-lane gate and idx bound below handle them.
+            if (!(mi > distk) || kNoS2Break) {
                 _mm512_store_ps(curr_dist, curr_dist512[0]);
                 _mm512_store_ps(curr_dist + 16, curr_dist512[1]);
 
@@ -134,7 +170,7 @@ class SAQSearcher : public SaqCluEstimator<kDistType> {
                     _mm512_store_ps(clu_dist_ + c_i * KFastScanSize + 16, clu_dist512_[c_i * FAST_ARRAY + 1]);
                 }
                 for (size_t j = 0; j < KFastScanSize; ++j) {
-                    if (curr_dist[j] < distk) {
+                    if (curr_dist[j] < distk || kNoS3Gate) {
                         auto idx = blk_begin + j;
                         if (idx >= num_points) {
                             break;
@@ -143,7 +179,7 @@ class SAQSearcher : public SaqCluEstimator<kDistType> {
                         for (size_t c_i = 0; c_i < clus_num; ++c_i) {
                             auto &estimator = estimators_[c_i];
                             acc_dist += estimator.compAccurateDist(idx) - clu_dist_[c_i * KFastScanSize + j];
-                            if (acc_dist >= distk) {
+                            if (acc_dist >= distk && !kNoS3Gate) {
                                 break;
                             }
                         }

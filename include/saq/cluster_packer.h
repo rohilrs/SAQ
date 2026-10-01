@@ -52,6 +52,17 @@ class ClusterPacker {
                                       shortcode_byte_num_ * KFastScanSize * total_blocks_)
                                 : make_unique_array<uint8_t>(0)),
           long_code_(1, num_dim_pad_) {
+        // Zero the staging buffers: store_and_pack() fills entries only for
+        // real vectors, but finalize_and_store() copies FULL blocks into the
+        // cluster arrays — the last block's padding lanes would otherwise carry
+        // heap garbage (NaN/Inf float patterns) into factor_o_l2norm, which
+        // poisons the searcher's block-min distance estimates.
+        std::memset(fac_o_l2norm_.get(), 0, sizeof(float) * KFastScanSize * total_blocks_);
+        std::memset(fac_ip_cent_oa_.get(), 0, sizeof(float) * KFastScanSize * total_blocks_);
+        if (num_bits_) {
+            std::memset(short_codes_.get(), 0,
+                        shortcode_byte_num_ * KFastScanSize * total_blocks_);
+        }
     }
 
     /**

@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <stdlib.h>
 #include <vector>
@@ -191,6 +192,11 @@ class SaqCluData {
         if (quant_plan.size() == 1) {
             auto blk_bytes = (shortb_factors_fcnt_ * sizeof(float) + shortb_code_bytes_);
             short_code_ = align_mm<64, uint8_t>(blk_bytes * num_blocks_);
+            // Zero the whole buffer: the padding lanes of the last partial block
+            // are never written by the packer, and garbage there (NaN/Inf float
+            // patterns in the factor slots) propagates into block-min distance
+            // estimates and can void the searcher's block gate.
+            std::memset(short_code_, 0, blk_bytes * num_blocks_);
             shortb_code_bytes_ = blk_bytes;
             short_factors_ = nullptr;
             shortb_factors_fcnt_ = 0;
@@ -211,6 +217,12 @@ class SaqCluData {
             // TODO: optimize layout of short factors and codes
             short_factors_ = align_mm<64, float>(shortb_factors_fcnt_ * num_blocks_);
             short_code_ = align_mm<64, uint8_t>(shortb_code_bytes_ * num_blocks_);
+            // Zero both: padding lanes of the last partial block are never
+            // written by the packer, and garbage floats (NaN/Inf) in the factor
+            // slots propagate into block-min distance estimates, voiding the
+            // searcher's block gate (silently dropping all 32 lanes).
+            std::memset(short_factors_, 0, shortb_factors_fcnt_ * num_blocks_ * sizeof(float));
+            std::memset(short_code_, 0, shortb_code_bytes_ * num_blocks_);
             size_t shortb_factors_begin = 0;
             size_t shortb_code_begin = 0;
             for (size_t i = 0; i < quant_plan.size(); ++i) {
