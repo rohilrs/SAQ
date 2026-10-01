@@ -155,8 +155,10 @@ __global__ void kernel_search(
 
     // Compute shared memory layout
     size_t total_codebooks = 0;
-    size_t seg_cb_offsets[8]; // max 8 segments
-    size_t seg_dim_offsets[8];
+    // Max 16 segments — injected plans (LP allocator) can exceed the DP
+    // allocator's typical 3-4 segments; host side CHECKs the same bound.
+    size_t seg_cb_offsets[16];
+    size_t seg_dim_offsets[16];
     size_t dim_offset = 0;
     for (size_t s = 0; s < num_segments; ++s) {
         seg_cb_offsets[s] = total_codebooks;
@@ -235,8 +237,11 @@ __global__ void kernel_search(
     // This guarantees correct recall at the cost of computing more distances.
     int lane = threadIdx.x % 32;
 
-    // Per-warp candidate buffer
-    constexpr int kWarpMaxCandidates = 64;
+    // Per-warp candidate buffer. Sized so a SINGLE block can hold a full
+    // top-100 even when it scans an entire flat (K=1, no-IVF) index: worst
+    // case all of the true top-k land in one warp's work-stealing share, so
+    // each warp must retain >= topk candidates (evict-worst keeps cap-1).
+    constexpr int kWarpMaxCandidates = 128;
     float warp_cand_dists[kWarpMaxCandidates];
     uint32_t warp_cand_ids[kWarpMaxCandidates];
     int warp_cand_count = 0;

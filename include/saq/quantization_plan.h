@@ -175,6 +175,10 @@ class SaqDataMaker {
     const FloatRowMat *rotated_data_ = nullptr;
     bool rotated_data_set_ = false;
 
+    /// Externally injected plan — set by set_quant_plan(); overrides all allocators.
+    QuantPlanT injected_plan_;
+    bool plan_injected_ = false;
+
   public:
     /// @brief Construct a SaqDataMaker with the given config and dimension.
     explicit SaqDataMaker(QuantizeConfig cfg, size_t num_dim)
@@ -204,6 +208,35 @@ class SaqDataMaker {
         rotated_data_set_ = true;
     }
 
+    /// @brief Inject an explicit quantization plan, bypassing the DP/greedy
+    ///        allocators (used to run externally computed allocations, e.g. the
+    ///        LP allocator, through the engine).
+    ///
+    /// Must be called BEFORE set_variance()/compute_variance() — those finalize
+    /// the plan. Constraints (checked): each segment's dim_length is a positive
+    /// multiple of kDimPaddingSize, bits <= kMaxQuantBit (0 bits allowed:
+    /// unquantized segment), and lengths sum to the padded dimension.
+    void set_quant_plan(QuantPlanT plan) {
+        CHECK(!is_variance_set())
+            << "set_quant_plan: must be called before set_variance()/compute_variance()";
+        CHECK(!plan.empty()) << "set_quant_plan: empty plan";
+        size_t dim_sum = 0;
+        for (const auto &[dim_len, bits] : plan) {
+            CHECK_GT(dim_len, 0u) << "set_quant_plan: zero-length segment";
+            CHECK_EQ(dim_len % kDimPaddingSize, 0u)
+                << "set_quant_plan: segment length " << dim_len
+                << " is not a multiple of " << kDimPaddingSize;
+            CHECK_LE(bits, kMaxQuantBit)
+                << "set_quant_plan: segment bits " << bits << " exceeds cap";
+            dim_sum += dim_len;
+        }
+        CHECK_EQ(dim_sum, num_dim_padded_)
+            << "set_quant_plan: segment lengths sum to " << dim_sum
+            << " but padded dimension is " << num_dim_padded_;
+        injected_plan_ = std::move(plan);
+        plan_injected_ = true;
+    }
+
     /// @brief Set per-dimension variance directly; pads with zeros if needed.
     void set_variance(FloatVec vars) {
         if (data_->data_variance.cols() < static_cast<int>(num_dim_padded_)) {
@@ -225,6 +258,7 @@ class SaqDataMaker {
     /// @brief Analyze config and run the appropriate allocator.
     ///
     /// Dispatch order:
+    ///   0. Injected plan (set_quant_plan) → use it verbatim
     ///   1. No segmentation → equal_segmentation(1)
     ///   2. Equal-segment override → equal_segmentation(seg_eqseg)
     ///   3. Greedy + rotated data available → build_mse_table_for_allocation + BitAllocatorGreedy
@@ -232,6 +266,11 @@ class SaqDataMaker {
     ///   5. DP (default) → dynamic_programming(variance, avg_bits)
     void analyze_plan() {
         DCHECK_EQ(num_dim_padded_ % kDimPaddingSize, 0);
+
+        if (plan_injected_) {
+            data_->quant_plan = injected_plan_;
+            return;
+        }
 
         if (!data_->cfg.enable_segmentation) {
             data_->quant_plan = equal_segmentation(1);

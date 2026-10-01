@@ -25,6 +25,9 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
     const auto& quant_plan = saq_data_->quant_plan;
     const auto& base_datas = saq_data_->base_datas;
     size_t num_segments = quant_plan.size();
+    // kernel_search holds per-segment offsets in fixed arrays of 16.
+    CHECK_LE(num_segments, 16u)
+        << "GPU search supports at most 16 segments (kernel_search fixed arrays)";
 
     LOG(INFO) << "GPU batch search: Q=" << Q << " topk=" << topk << " nprobe=" << nprobe;
     StopW stopw;

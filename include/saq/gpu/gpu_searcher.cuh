@@ -49,7 +49,11 @@ struct QuerySegmentConstants {
 };
 
 /// Maximum candidates a single (query, cluster) block can output.
-constexpr size_t kMaxCandidatesPerBlock = 256;
+// 4 warps x (kWarpMaxCandidates-1) candidates must fit without truncation
+// (the block writer drops overflow UNSORTED, which can lose true top-k
+// members in flat/K=1 scans). Doubles the candidate buffers' host memory:
+// Q x nprobe x 512 x 8B (~820MB at Q=1000, nprobe=200).
+constexpr size_t kMaxCandidatesPerBlock = 512;
 
 /// Launch the main search kernel: build LUT + 3-stage search.
 /// Grid: dim3(Q, nprobe), Block: 128 threads (4 warps).

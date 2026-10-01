@@ -227,6 +227,12 @@ class IVF {
         saq_data_maker_->set_variance(std::move(vars));
     }
 
+    /// Inject an explicit quantization plan (list of (dim_length, bits) segments),
+    /// bypassing the DP/greedy allocators. Call before set_variance().
+    void set_quant_plan(SaqData::QuantPlanT plan) {
+        saq_data_maker_->set_quant_plan(std::move(plan));
+    }
+
     void printQPlan(const SaqData *data) {
         LOG(INFO) << "Dynamic bits allocation plan:";
         size_t dims_sum = 0;

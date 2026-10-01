@@ -83,6 +83,10 @@ public:
 
     void set_variance(FloatVec vars);
 
+    /// Inject an explicit quantization plan (list of (dim_length, bits) segments),
+    /// bypassing the DP/greedy allocators. Call before set_variance().
+    void set_quant_plan(SaqData::QuantPlanT plan);
+
     /// GPU-accelerated index construction.
     void construct(const FloatRowMat& data,
                    const FloatRowMat& centroids,

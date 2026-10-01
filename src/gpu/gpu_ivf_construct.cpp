@@ -28,6 +28,10 @@ void GpuIVF::set_variance(FloatVec vars) {
     saq_data_maker_->set_variance(std::move(vars));
 }
 
+void GpuIVF::set_quant_plan(SaqData::QuantPlanT plan) {
+    saq_data_maker_->set_quant_plan(std::move(plan));
+}
+
 void GpuIVF::construct(const FloatRowMat& data,
                        const FloatRowMat& centroids,
                        const PID* cluster_ids) {

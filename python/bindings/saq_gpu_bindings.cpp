@@ -146,6 +146,15 @@ PYBIND11_MODULE(_saq_gpu, m) {
              },
              py::arg("codebooks"),
              "Set per-segment, per-dimension codebooks for GPU index.")
+        .def("set_quant_plan",
+             [](gpu::GpuIVF &self, std::vector<std::pair<size_t, size_t>> plan) {
+                 self.set_quant_plan(std::move(plan));
+             },
+             py::arg("plan"),
+             "Inject an explicit quantization plan as a list of (dim_length, bits) "
+             "tuples, bypassing the DP/greedy allocators. Call before set_variance(). "
+             "Each dim_length must be a positive multiple of 64 and lengths must sum "
+             "to the padded dimension; bits <= 13 (0 = unquantized segment).")
         .def_property_readonly("has_codebooks", &gpu::GpuIVF::has_codebooks);
 }
 

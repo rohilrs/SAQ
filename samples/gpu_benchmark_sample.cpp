@@ -13,6 +13,8 @@
 
 #ifdef SAQ_USE_CUDA
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -35,6 +37,24 @@
 #include "saq/code_helper.h"
 
 using namespace saq;
+
+/// SAQ_QUANT_PLAN=<path> injects an explicit quantization plan (one
+/// "dim_len bits" pair per line, whitespace-separated) into every index built
+/// below, bypassing the engine's DP allocator. Empty result = no injection.
+static SaqData::QuantPlanT load_plan_from_env() {
+    SaqData::QuantPlanT plan;
+    const char* path = std::getenv("SAQ_QUANT_PLAN");
+    if (!path) return plan;
+    std::ifstream f(path);
+    CHECK(f.is_open()) << "SAQ_QUANT_PLAN: cannot open " << path;
+    size_t dim_len, bits;
+    while (f >> dim_len >> bits) plan.emplace_back(dim_len, bits);
+    CHECK(!plan.empty()) << "SAQ_QUANT_PLAN: no (dim_len, bits) pairs in " << path;
+    std::string desc;
+    for (const auto& [d, b] : plan) desc += " " + std::to_string(d) + "d/" + std::to_string(b) + "b";
+    LOG(INFO) << "SAQ_QUANT_PLAN: injecting " << plan.size() << " segments:" << desc;
+    return plan;
+}
 
 int main(int argc, char** argv) {
     google::InitGoogleLogging(argv[0]);
@@ -88,6 +108,9 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < N; ++i)
         cids[i] = static_cast<PID>(cluster_ids_mat(i, 0));
 
+    // Optional explicit plan injection (must be set before set_variance).
+    const SaqData::QuantPlanT injected_plan = load_plan_from_env();
+
     // ---- GPU Encode ----
     {
         LOG(INFO) << "--- GPU Encode ---";
@@ -95,6 +118,7 @@ int main(int argc, char** argv) {
             StopW sw;
             gpu::GpuIVF gpu_ivf(N, D, K, cfg);
             std::srand(42);  // deterministic rotations so A/B builds are comparable
+            if (!injected_plan.empty()) gpu_ivf.set_quant_plan(injected_plan);
             gpu_ivf.set_variance(variances.row(0));
             gpu_ivf.construct(vectors, centroids, cids.data());
             auto gpu_ms = sw.getElapsedTimeMicro() / 1000.0;
@@ -123,6 +147,7 @@ int main(int argc, char** argv) {
         // Re-build GPU index for search (need the gpu_ivf object to persist)
         gpu::GpuIVF gpu_ivf2(N, D, K, cfg);
         std::srand(42);  // deterministic rotations so A/B builds are comparable
+        if (!injected_plan.empty()) gpu_ivf2.set_quant_plan(injected_plan);
         gpu_ivf2.set_variance(variances.row(0));
         gpu_ivf2.construct(vectors, centroids, cids.data());
 
@@ -172,11 +197,18 @@ int main(int argc, char** argv) {
     }
 
     // ---- CPU Encode + Distance Diagnostic ----
+    // SAQ_SKIP_CPU=1 skips the whole CPU section — at scale (2M x 20K queries,
+    // flat scan) the CPU encode+recall diagnostic dominates GPU-node walltime.
+    if (std::getenv("SAQ_SKIP_CPU")) {
+        LOG(INFO) << "SAQ_SKIP_CPU set — skipping CPU encode + diagnostics.";
+        return 0;
+    }
     {
         LOG(INFO) << "--- CPU Encode (" << num_threads << " threads) ---";
         StopW sw;
         IVF cpu_ivf(N, D, K, cfg);
         std::srand(42);  // Seed BEFORE set_variance (which triggers rotation generation)
+        if (!injected_plan.empty()) cpu_ivf.set_quant_plan(injected_plan);
         cpu_ivf.set_variance(variances.row(0));
         cpu_ivf.construct(vectors, centroids, cids.data(), num_threads);
         auto cpu_ms = sw.getElapsedTimeMicro() / 1000.0;
@@ -192,6 +224,12 @@ int main(int argc, char** argv) {
         // Run CPU search for query 0
         SearcherConfig diag_cfg;
         diag_cfg.dist_type = DistType::L2Sqr;
+        // SAQ_VARS_BOUND_M overrides the stage-1 variance-prune multiplier for
+        // the CPU search (diagnostic: huge value = prune-free reference).
+        if (const char* m_env = std::getenv("SAQ_VARS_BOUND_M")) {
+            diag_cfg.searcher_vars_bound_m = std::stof(m_env);
+            LOG(INFO) << "SAQ_VARS_BOUND_M=" << diag_cfg.searcher_vars_bound_m;
+        }
         std::vector<PID> cpu_res(100);
         cpu_ivf.search<DistType::L2Sqr>(diag_queries.row(0), 100, nprobe, diag_cfg, cpu_res.data());
         LOG(INFO) << "CPU top-5 for query 0: " << cpu_res[0] << " " << cpu_res[1]
@@ -209,6 +247,7 @@ int main(int argc, char** argv) {
         // Re-run GPU search on a fresh index with SAME random seed as CPU
         gpu::GpuIVF gpu_diag(N, D, K, cfg);
         std::srand(42);  // Same seed BEFORE set_variance
+        if (!injected_plan.empty()) gpu_diag.set_quant_plan(injected_plan);
         gpu_diag.set_variance(variances.row(0));
         gpu_diag.construct(vectors, centroids, cids.data());
         std::vector<PID> gpu_diag_res(100);
@@ -251,6 +290,59 @@ int main(int argc, char** argv) {
             }
             double cpu_recall = 100.0 * correct / (diag_queries.rows() * std::min(topk2, (size_t)gt.cols()));
             LOG(INFO) << "CPU Recall@" << topk2 << " = " << cpu_recall << "%";
+
+            // Per-query CPU ids dump for CPU-vs-GPU divergence analysis.
+            if (const char* dump_path = std::getenv("SAQ_DUMP_CPU_RESULTS")) {
+                std::ofstream f(dump_path, std::ios::binary);
+                f.write(reinterpret_cast<const char*>(cpu_batch_res.data()),
+                        cpu_batch_res.size() * sizeof(PID));
+                LOG(INFO) << "Dumped CPU ids to " << dump_path;
+            }
+
+            // SAQ_CPU_ESTIMATE_DIAG=<nq>: gate-free CPU reference via estimate()
+            // (accurate distance for EVERY probed vector, no pruning) + fast-
+            // estimate error stats on true neighbors. Separates "CPU accurate
+            // distances wrong" from "3-stage gating losses".
+            if (const char* diag_env = std::getenv("SAQ_CPU_ESTIMATE_DIAG")) {
+                size_t nq = std::min((size_t)std::stoul(diag_env), (size_t)diag_queries.rows());
+                size_t hits = 0;
+                double err_sum = 0, err_sq = 0, err_max = -1e30;
+                size_t err_n = 0;
+                for (size_t q = 0; q < nq; ++q) {
+                    std::vector<std::pair<PID, float>> dist_list;
+                    std::vector<float> fast_list;
+                    cpu_ivf.estimate<DistType::L2Sqr>(diag_queries.row(q), nprobe, diag_cfg,
+                                                      dist_list, &fast_list);
+                    std::vector<size_t> ord(dist_list.size());
+                    for (size_t i = 0; i < ord.size(); ++i) ord[i] = i;
+                    size_t take = std::min(topk2, ord.size());
+                    std::partial_sort(ord.begin(), ord.begin() + take, ord.end(),
+                        [&](size_t a, size_t b) { return dist_list[a].second < dist_list[b].second; });
+                    std::vector<PID> top(take);
+                    for (size_t i = 0; i < take; ++i) top[i] = dist_list[ord[i]].first;
+                    for (size_t k = 0; k < topk2; ++k) {
+                        PID g = (PID)gt(q, k);
+                        for (size_t r = 0; r < take; ++r)
+                            if (top[r] == g) { hits++; break; }
+                        // fast-estimate error on this true neighbor if probed
+                        for (size_t i = 0; i < dist_list.size(); ++i) {
+                            if (dist_list[i].first == g) {
+                                double e = (double)fast_list[i] - dist_list[i].second;
+                                err_sum += e; err_sq += e * e; err_n++;
+                                if (e > err_max) err_max = e;
+                                break;
+                            }
+                        }
+                    }
+                }
+                double rec = 100.0 * hits / (nq * topk2);
+                double mean = err_n ? err_sum / err_n : 0;
+                double sd = err_n ? std::sqrt(std::max(0.0, err_sq / err_n - mean * mean)) : 0;
+                LOG(INFO) << "[EST DIAG] gate-free CPU Recall@" << topk2 << " = " << rec
+                          << "% over " << nq << " queries";
+                LOG(INFO) << "[EST DIAG] fast-est error on probed GT neighbors: mean " << mean
+                          << " sd " << sd << " max " << err_max << " (n=" << err_n << ")";
+            }
         }
 
         // Also check: how many of GPU top-100 are in CPU top-100?
