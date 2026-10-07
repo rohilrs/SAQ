@@ -5,6 +5,7 @@
 /// comparing timing against CPU encode via IVF::construct.
 ///
 /// Usage: gpu_benchmark_sample <data_dir> <bpd> <K> [num_threads] [nprobe]
+/// SAQ_DERIVE_CODEBOOKS=1: per-dim Lloyd codebooks (native derivation) instead of uniform CAQ.
 ///   data_dir:      Path to dataset (e.g., data/datasets/dbpedia_100k)
 ///   bpd:           Bits per dimension (e.g., 2.0)
 ///   K:             Number of clusters (e.g., 4096)
@@ -119,6 +120,7 @@ int main(int argc, char** argv) {
             gpu::GpuIVF gpu_ivf(N, D, K, cfg);
             std::srand(42);  // deterministic rotations so A/B builds are comparable
             if (!injected_plan.empty()) gpu_ivf.set_quant_plan(injected_plan);
+            if (std::getenv("SAQ_DERIVE_CODEBOOKS")) gpu_ivf.set_derive_codebooks();
             gpu_ivf.set_variance(variances.row(0));
             gpu_ivf.construct(vectors, centroids, cids.data());
             auto gpu_ms = sw.getElapsedTimeMicro() / 1000.0;
@@ -148,6 +150,7 @@ int main(int argc, char** argv) {
         gpu::GpuIVF gpu_ivf2(N, D, K, cfg);
         std::srand(42);  // deterministic rotations so A/B builds are comparable
         if (!injected_plan.empty()) gpu_ivf2.set_quant_plan(injected_plan);
+            if (std::getenv("SAQ_DERIVE_CODEBOOKS")) gpu_ivf2.set_derive_codebooks();
         gpu_ivf2.set_variance(variances.row(0));
         gpu_ivf2.construct(vectors, centroids, cids.data());
 
@@ -248,6 +251,7 @@ int main(int argc, char** argv) {
         gpu::GpuIVF gpu_diag(N, D, K, cfg);
         std::srand(42);  // Same seed BEFORE set_variance
         if (!injected_plan.empty()) gpu_diag.set_quant_plan(injected_plan);
+            if (std::getenv("SAQ_DERIVE_CODEBOOKS")) gpu_diag.set_derive_codebooks();
         gpu_diag.set_variance(variances.row(0));
         gpu_diag.construct(vectors, centroids, cids.data());
         std::vector<PID> gpu_diag_res(100);
