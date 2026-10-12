@@ -6,6 +6,9 @@
 ///
 /// Usage: gpu_benchmark_sample <data_dir> <bpd> <K> [num_threads] [nprobe]
 /// SAQ_DERIVE_CODEBOOKS=1: per-dim Lloyd codebooks (native derivation) instead of uniform CAQ.
+///   SAQ_DERIVE_SAMPLE=<n>: train codebooks on an n-point sample (0/unset = full data).
+///   SAQ_DERIVE_MAXBITS=<b>: highest codebook bit-width to build (default 13; use the
+///   plan's max to skip unused large codebooks).
 ///   data_dir:      Path to dataset (e.g., data/datasets/dbpedia_100k)
 ///   bpd:           Bits per dimension (e.g., 2.0)
 ///   K:             Number of clusters (e.g., 4096)
@@ -55,6 +58,15 @@ static SaqData::QuantPlanT load_plan_from_env() {
     for (const auto& [d, b] : plan) desc += " " + std::to_string(d) + "d/" + std::to_string(b) + "b";
     LOG(INFO) << "SAQ_QUANT_PLAN: injecting " << plan.size() << " segments:" << desc;
     return plan;
+}
+
+/// LloydOpts for native codebook derivation, from SAQ_DERIVE_SAMPLE /
+/// SAQ_DERIVE_MAXBITS (defaults: full data, max_bits 13).
+static LloydOpts derive_opts_from_env() {
+    LloydOpts opts;
+    if (const char* s = std::getenv("SAQ_DERIVE_SAMPLE")) opts.sample_size = std::strtoul(s, nullptr, 10);
+    if (const char* s = std::getenv("SAQ_DERIVE_MAXBITS")) opts.max_bits = std::strtoul(s, nullptr, 10);
+    return opts;
 }
 
 int main(int argc, char** argv) {
@@ -120,7 +132,7 @@ int main(int argc, char** argv) {
             gpu::GpuIVF gpu_ivf(N, D, K, cfg);
             std::srand(42);  // deterministic rotations so A/B builds are comparable
             if (!injected_plan.empty()) gpu_ivf.set_quant_plan(injected_plan);
-            if (std::getenv("SAQ_DERIVE_CODEBOOKS")) gpu_ivf.set_derive_codebooks();
+            if (std::getenv("SAQ_DERIVE_CODEBOOKS")) gpu_ivf.set_derive_codebooks(derive_opts_from_env());
             gpu_ivf.set_variance(variances.row(0));
             gpu_ivf.construct(vectors, centroids, cids.data());
             auto gpu_ms = sw.getElapsedTimeMicro() / 1000.0;
@@ -150,7 +162,7 @@ int main(int argc, char** argv) {
         gpu::GpuIVF gpu_ivf2(N, D, K, cfg);
         std::srand(42);  // deterministic rotations so A/B builds are comparable
         if (!injected_plan.empty()) gpu_ivf2.set_quant_plan(injected_plan);
-            if (std::getenv("SAQ_DERIVE_CODEBOOKS")) gpu_ivf2.set_derive_codebooks();
+            if (std::getenv("SAQ_DERIVE_CODEBOOKS")) gpu_ivf2.set_derive_codebooks(derive_opts_from_env());
         gpu_ivf2.set_variance(variances.row(0));
         gpu_ivf2.construct(vectors, centroids, cids.data());
 
@@ -251,7 +263,7 @@ int main(int argc, char** argv) {
         gpu::GpuIVF gpu_diag(N, D, K, cfg);
         std::srand(42);  // Same seed BEFORE set_variance
         if (!injected_plan.empty()) gpu_diag.set_quant_plan(injected_plan);
-            if (std::getenv("SAQ_DERIVE_CODEBOOKS")) gpu_diag.set_derive_codebooks();
+            if (std::getenv("SAQ_DERIVE_CODEBOOKS")) gpu_diag.set_derive_codebooks(derive_opts_from_env());
         gpu_diag.set_variance(variances.row(0));
         gpu_diag.construct(vectors, centroids, cids.data());
         std::vector<PID> gpu_diag_res(100);
