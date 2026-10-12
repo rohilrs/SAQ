@@ -113,8 +113,16 @@ int main(int argc, char** argv) {
     cfg.enable_segmentation = true;
     cfg.single.quant_type = BaseQuantType::CAQ;
     cfg.single.caq_adj_rd_lmt = 6;
+    // SAQ_CAQ_ADJ_LMT overrides the CAQ code-adjustment round limit (0 = pure
+    // nearest-centroid in codebook mode, the paper's literal quantizer).
+    if (const char* s = std::getenv("SAQ_CAQ_ADJ_LMT"))
+        cfg.single.caq_adj_rd_lmt = std::atoi(s);
     cfg.single.use_fastscan = true;
     cfg.single.random_rotation = true;
+    // SAQ_NO_ROTATION=1 disables per-segment random rotation. Required for
+    // codebook mode: derived codebooks are trained on unrotated columns, and
+    // the paper's per-dim quantizer has no rotation step.
+    if (std::getenv("SAQ_NO_ROTATION")) cfg.single.random_rotation = false;
 
     // Prepare cluster IDs
     std::vector<PID> cids(N);

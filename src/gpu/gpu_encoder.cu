@@ -1,6 +1,8 @@
 #include "saq/gpu/gpu_encoder.cuh"
 #include "saq/gpu/gpu_utils.cuh"
 
+#include <glog/logging.h>
+
 namespace saq::gpu {
 
 // Max dims per lane: ceil(D_seg_max / 32). For D_seg up to 896, this is 28.
@@ -605,6 +607,9 @@ void launch_fused_caq_encode(
     int caq_sequential,
     cudaStream_t stream)
 {
+    CHECK_LE(D_seg, (size_t)32 * kMaxDimsPerLane)
+        << "segment of " << D_seg << " dims overflows the encoder's per-lane "
+        << "local buffers (kMaxDimsPerLane=" << kMaxDimsPerLane << "); split the plan";
     constexpr int kWarpsPerBlock = 4;
     constexpr int kBlockSize = 32 * kWarpsPerBlock;
     int grid = ((int)N + kWarpsPerBlock - 1) / kWarpsPerBlock;
@@ -631,6 +636,9 @@ void launch_fused_caq_encode_no_rotation(
     int caq_adj_rd_lmt, float caq_adj_eps, int caq_ori_qB,
     cudaStream_t stream)
 {
+    CHECK_LE(D_seg, (size_t)32 * kMaxDimsPerLane)
+        << "segment of " << D_seg << " dims overflows the encoder's per-lane "
+        << "local buffers (kMaxDimsPerLane=" << kMaxDimsPerLane << "); split the plan";
     constexpr int kWarpsPerBlock = 4;
     constexpr int kBlockSize = 32 * kWarpsPerBlock;
     int grid = ((int)N + kWarpsPerBlock - 1) / kWarpsPerBlock;
@@ -910,6 +918,9 @@ void launch_fused_codebook_encode(
     cudaStream_t stream)
 {
     if (N == 0) return;
+    CHECK_LE(D_seg, (size_t)32 * kMaxDimsPerLane)
+        << "segment of " << D_seg << " dims overflows the encoder's per-lane "
+        << "local buffers (kMaxDimsPerLane=" << kMaxDimsPerLane << "); split the plan";
     constexpr int kWarpsPerBlock = 4;
     constexpr int kBlockSize = 32 * kWarpsPerBlock;
     int grid = ((int)N + kWarpsPerBlock - 1) / kWarpsPerBlock;

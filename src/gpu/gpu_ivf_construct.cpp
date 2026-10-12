@@ -65,6 +65,15 @@ void GpuIVF::construct(const FloatRowMat& data,
 
     // Build segment codebooks if codebook mode is active
     if (has_codebooks_) {
+        // Codebooks are trained/injected in the unrotated (PCA) basis; encoding
+        // through a per-segment random rotation would quantize rotated data
+        // with mismatched codebooks (measured: error floor ~8x CAQ's at 8 bpd,
+        // recall below the method's own 4-bpd result). Disable random_rotation
+        // in codebook mode.
+        for (const auto& bdata : base_datas) {
+            CHECK(!bdata.rotator) << "codebook mode requires random_rotation=false: "
+                "segment rotators would encode rotated data against unrotated codebooks";
+        }
         // Native data-driven derivation: build per-dim Lloyd codebooks from the
         // (PCA-transformed) data, then select each dimension's codebook at the
         // bit-count its segment was allocated in quant_plan.

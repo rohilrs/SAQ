@@ -49,6 +49,12 @@ void IVF::construct(const FloatRowMat &data, const FloatRowMat &centroids,
 
     // Build segment codebooks if codebook mode is active
     if (has_codebooks_) {
+        // Codebooks live in the unrotated (PCA) basis; per-segment random
+        // rotation would encode rotated data against mismatched codebooks.
+        for (const auto& bdata : saq_data_->base_datas) {
+            CHECK(!bdata.rotator) << "codebook mode requires random_rotation=false: "
+                "segment rotators would encode rotated data against unrotated codebooks";
+        }
         // Native data-driven derivation: build per-dim Lloyd codebooks from the
         // (PCA-transformed) data, then select each dimension's codebook at the
         // bit-count its segment was allocated in quant_plan.
