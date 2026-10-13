@@ -208,6 +208,7 @@ __global__ void kernel_search(
             build_codebook_lut(resid_seg + cb * 4, dst);
         }
 
+
         // Compute residual query constants (thread 0 does sequential sum)
         if (threadIdx.x == 0) {
             float sum_q_resid = 0.0f;
@@ -291,11 +292,57 @@ __global__ void kernel_search(
                           + (size_t)global_block * 32 * seg.long_words_per_vec
                         : nullptr;
 
-                    float cb_ip = gpu_codebook_ip(
-                        resid_seg, seg.codebook_centroids,
-                        short_block, long_block, lane,
-                        seg.D_seg, seg.num_bits,
-                        seg.codebook_entries_per_dim);
+                    float cb_ip;
+                    if (seg.fused_codes) {
+                        // Byte-fused decode: coalesced byte load, in-register
+                        // slice extract, L1-resident codebook load + fma. No
+                        // sequential bit-buffer dependency (the split-stream
+                        // path's bottleneck). Width-specialized branches with
+                        // literal shifts/strides: a runtime-parameterized loop
+                        // measured 2-3x slower (no unroll/scheduling), and smem
+                        // tables lose to bank conflicts vs L1-hit codebooks.
+                        const uint8_t* fb = seg.fused_codes
+                            + (size_t)global_block * 32 * seg.fused_bytes_per_vec;
+                        const float* cbk = seg.codebook_centroids;
+                        float ip = 0.0f;
+                        if (seg.num_bits == 8) {
+                            for (size_t d = 0; d < seg.D_seg; ++d)
+                                ip += __ldg(&cbk[d * 256 + fb[d * 32 + lane]])
+                                      * resid_seg[d];
+                        } else if (seg.num_bits == 4) {
+                            for (size_t c8 = 0; c8 < seg.fused_bytes_per_vec; ++c8) {
+                                unsigned v = fb[c8 * 32 + lane];
+                                size_t d = c8 * 2;
+                                ip += __ldg(&cbk[d * 16 + (v >> 4)]) * resid_seg[d]
+                                    + __ldg(&cbk[(d + 1) * 16 + (v & 15u)]) * resid_seg[d + 1];
+                            }
+                        } else if (seg.num_bits == 2) {
+                            for (size_t c8 = 0; c8 < seg.fused_bytes_per_vec; ++c8) {
+                                unsigned v = fb[c8 * 32 + lane];
+                                size_t d = c8 * 4;
+                                ip += __ldg(&cbk[d * 4 + ((v >> 6) & 3u)]) * resid_seg[d]
+                                    + __ldg(&cbk[(d + 1) * 4 + ((v >> 4) & 3u)]) * resid_seg[d + 1]
+                                    + __ldg(&cbk[(d + 2) * 4 + ((v >> 2) & 3u)]) * resid_seg[d + 2]
+                                    + __ldg(&cbk[(d + 3) * 4 + (v & 3u)]) * resid_seg[d + 3];
+                            }
+                        } else {  // num_bits == 1
+                            for (size_t c8 = 0; c8 < seg.fused_bytes_per_vec; ++c8) {
+                                unsigned v = fb[c8 * 32 + lane];
+                                size_t d = c8 * 8;
+                                #pragma unroll
+                                for (int j = 0; j < 8; ++j)
+                                    ip += __ldg(&cbk[(d + j) * 2 + ((v >> (7 - j)) & 1u)])
+                                          * resid_seg[d + j];
+                            }
+                        }
+                        cb_ip = ip;
+                    } else {
+                        cb_ip = gpu_codebook_ip(
+                            resid_seg, seg.codebook_centroids,
+                            short_block, long_block, lane,
+                            seg.D_seg, seg.num_bits,
+                            seg.codebook_entries_per_dim);
+                    }
 
                     ip_o_q = rescale * cb_ip;
                 } else {
@@ -486,6 +533,7 @@ void launch_search(
     const uint32_t* d_centroid_ids,
     size_t Q, size_t nprobe, size_t topk,
     size_t num_segments, size_t total_D_seg,
+    size_t /*fused_table_halfs*/,
     float* d_candidate_dists,
     uint32_t* d_candidate_ids,
     uint32_t* d_candidate_counts,

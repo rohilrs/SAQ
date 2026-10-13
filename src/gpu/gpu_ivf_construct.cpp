@@ -152,7 +152,7 @@ void GpuIVF::construct(const FloatRowMat& data,
     // 4. Allocate GPU memory via pool
     phase_timer.reset();
     pool_ = GpuMemoryPool{};  // reset if previously used
-    pool_.allocate(K, cluster_sizes, quant_plan);
+    pool_.allocate(K, cluster_sizes, quant_plan, /*fused_codes_eligible=*/has_codebooks_);
 
     // Set up cluster views
     gpu_clusters_.clear();
@@ -361,6 +361,18 @@ void GpuIVF::construct(const FloatRowMat& data,
                 d_long_raw.get(), pool_.segments[seg].long_codes.get(),
                 pool_.d_cluster_offsets.get(), pool_.d_block_offsets.get(),
                 d_cluster_ids.get(), long_code_bytes, N);
+        }
+
+        // Byte-fused repack (codebook mode, width dividing 8): byte-aligned
+        // codes for the fused decode path, from the just-scattered streams.
+        if (pool_.segments[seg].fused_bytes_per_vec > 0) {
+            size_t ncb_groups = ((D_seg / 4) + 3) / 4;
+            size_t lwpv = (long_code_bytes + 3) / 4;
+            launch_fused_repack(
+                pool_.segments[seg].short_codes.get(),
+                pool_.segments[seg].long_codes.get(),
+                pool_.segments[seg].fused_codes.get(),
+                pool_.total_blocks_, D_seg, num_bits, ncb_groups, lwpv);
         }
 
         SAQ_CUDA_CHECK(cudaDeviceSynchronize());

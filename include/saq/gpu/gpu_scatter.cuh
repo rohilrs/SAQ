@@ -48,6 +48,15 @@ void launch_scatter_factors(
     size_t N,
     cudaStream_t stream = 0);
 
+/// Repack blocked short+long codebook-mode codes into byte-fused layout
+/// (codebook mode, segment width dividing 8). See kernel for the layout.
+void launch_fused_repack(
+    const uint8_t* d_short_codes, const uint8_t* d_long_codes,
+    uint8_t* d_fused, size_t total_blocks,
+    size_t D_seg, size_t num_bits,
+    size_t num_cb_groups, size_t long_words_per_vec,
+    cudaStream_t stream = 0);
+
 /// Copy centroids into pool (simple D2D memcpy, same contiguous layout).
 void copy_centroids_to_pool(
     const float* d_centroids_seg,

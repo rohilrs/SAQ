@@ -28,6 +28,12 @@ struct GpuSegmentDescriptor {
     size_t long_words_per_vec;     // ceil(long_bytes_per_vec / 4); long block stride = 32 * this words
     float* codebook_centroids;     // nullptr = uniform mode; else [D_seg * entries_per_dim]
     size_t codebook_entries_per_dim; // 1 << num_bits, or 0
+    // Byte-fused codes (codebook mode, width dividing 8): per block,
+    // byte column c of vector `lane` at fused_codes[block*32*fused_bpv + c*32 + lane].
+    // A byte holds 8/num_bits whole dims, dim j in bits [8-b(j+1), 8-bj).
+    // nullptr = decode via short/long streams (fallback / fused disabled).
+    uint8_t* fused_codes;
+    size_t fused_bytes_per_vec;    // D_seg * num_bits / 8 when fused, else 0
 };
 
 /// Device-side per-cluster descriptor for search kernel.
@@ -67,6 +73,7 @@ void launch_search(
     const uint32_t* d_centroid_ids,             // [Q * nprobe]
     size_t Q, size_t nprobe, size_t topk,
     size_t num_segments, size_t total_D_seg,
+    size_t fused_table_halfs,                   // smem __half entries for byte-fused tables
     float* d_candidate_dists,                   // [Q * nprobe * kMaxCandidatesPerBlock]
     uint32_t* d_candidate_ids,                  // [Q * nprobe * kMaxCandidatesPerBlock]
     uint32_t* d_candidate_counts,               // [Q * nprobe]

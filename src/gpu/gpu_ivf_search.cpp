@@ -7,6 +7,7 @@
 #include "saq/initializer.h"
 #include "saq/stopw.h"
 
+#include <cstdlib>
 #include <vector>
 #include <algorithm>
 
@@ -155,6 +156,13 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
         // Codebook pointers (nullptr if no codebook for this segment)
         sd.codebook_centroids = sp.codebook_centroids.get();
         sd.codebook_entries_per_dim = sp.codebook_entries_per_dim;
+
+        // Byte-fused decode path (SAQ_FUSED_DECODE=1): only where the repack
+        // buffer exists (codebook mode, width dividing 8); nullptr = fallback.
+        const bool want_fused = std::getenv("SAQ_FUSED_DECODE") != nullptr;
+        sd.fused_codes = (want_fused && sp.fused_bytes_per_vec > 0)
+            ? sp.fused_codes.get() : nullptr;
+        sd.fused_bytes_per_vec = sd.fused_codes ? sp.fused_bytes_per_vec : 0;
     }
 
     std::vector<GpuClusterDescriptor> h_clu_descs(K);
@@ -196,13 +204,23 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
     auto upload_ms = stopw.getElapsedTimeMicro() / 1000.0 - centroid_ms - prep_ms;
     LOG(INFO) << "[SEARCH TIMING] Upload: " << upload_ms << " ms";
 
+    // Shared-memory budget for the byte-fused decode tables (mirrors the
+    // kernel's per-segment table modes).
+    size_t fused_table_halfs = 0;
+    for (const auto& sd : h_seg_descs) {
+        if (sd.fused_codes && sd.num_bits >= 1 && sd.num_bits <= 2)
+            fused_table_halfs += sd.fused_bytes_per_vec * 256;
+        else if (sd.fused_codes && sd.num_bits == 4)
+            fused_table_halfs += sd.D_seg * 16;
+    }
+
     // 4. Launch search kernel
     StopW kernel_timer;
     launch_search(
         d_seg_descs.get(), d_clu_descs.get(),
         pool_.d_block_offsets.get(), pool_.d_cluster_offsets.get(),
         d_rotated_queries.get(), d_query_consts.get(), d_centroid_ids.get(),
-        Q, nprobe, topk, num_segments, total_D_seg,
+        Q, nprobe, topk, num_segments, total_D_seg, fused_table_halfs,
         d_candidate_dists.get(), d_candidate_ids.get(), d_candidate_counts.get());
 
     SAQ_CUDA_CHECK(cudaDeviceSynchronize());

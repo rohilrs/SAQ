@@ -26,6 +26,8 @@ struct GpuMemoryPool {
         DevicePtr<float>   factor_error;
         DevicePtr<float>   codebook_centroids;      // [D_seg * codebook_entries_per_dim], dim-major
         size_t             codebook_entries_per_dim = 0;  // 1 << seg_bits, or 0 if no codebook
+        DevicePtr<uint8_t> fused_codes;             // byte-aligned codes, block-transposed; codebook mode, bits | 8
+        size_t             fused_bytes_per_vec = 0;
     };
 
     size_t K_ = 0;
@@ -48,7 +50,8 @@ struct GpuMemoryPool {
 
     void allocate(size_t K,
                   const std::vector<size_t>& cluster_sizes,
-                  const std::vector<std::pair<size_t, size_t>>& quant_plan) {
+                  const std::vector<std::pair<size_t, size_t>>& quant_plan,
+                  bool fused_codes_eligible = false) {
         assert(segments.empty() && "Pool already allocated; destroy and recreate");
 
         K_ = K;
@@ -109,6 +112,15 @@ struct GpuMemoryPool {
 
             sp.factor_rescale = device_alloc<float>(total_vecs_ > 0 ? total_vecs_ : 1);
             sp.factor_error   = device_alloc<float>(total_vecs_ > 0 ? total_vecs_ : 1);
+
+            // Byte-fused code storage (codebook mode, width dividing 8): one
+            // byte holds 8/bits whole dims; repacked from short/long streams
+            // after scatter. Same bytes/vector as the split streams.
+            if (fused_codes_eligible && bits > 0 && 8 % bits == 0) {
+                sp.fused_bytes_per_vec = D_seg * bits / 8;
+                sp.fused_codes = device_alloc<uint8_t>(
+                    total_blocks_ * KFastScanSize * sp.fused_bytes_per_vec);
+            }
         }
     }
 

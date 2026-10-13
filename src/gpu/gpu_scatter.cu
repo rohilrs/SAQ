@@ -180,4 +180,87 @@ void copy_centroids_to_pool(
         K * D_seg * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 }
 
+
+// ---------------------------------------------------------------------------
+// Byte-fused repack (codebook mode, width dividing 8)
+// Reads the blocked short (1-bit msb nibbles) + long (LSB-first ex-bit words)
+// streams and writes byte-aligned codes: byte column c of vector `lane` in
+// block b at fused[b*32*fused_bpv + c*32 + lane]; a byte holds 8/num_bits
+// whole dims, dim j in bits [8 - num_bits*(j+1), 8 - num_bits*j).
+// One thread per (block, lane); same unpack order as gpu_codebook_ip.
+// ---------------------------------------------------------------------------
+__global__ void kernel_fused_repack(
+    const uint8_t* __restrict__ short_codes,
+    const uint8_t* __restrict__ long_codes,
+    uint8_t* __restrict__ fused,
+    size_t total_blocks,
+    size_t D_seg, size_t num_bits,
+    size_t num_cb_groups, size_t long_words_per_vec)
+{
+    size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= total_blocks * 32) return;
+    size_t blk = t / 32;
+    int lane = (int)(t % 32);
+
+    const uint8_t* short_block = short_codes + blk * num_cb_groups * 4 * 32;
+    const uint32_t* long_block = (num_bits > 1)
+        ? (const uint32_t*)long_codes + blk * 32 * long_words_per_vec
+        : nullptr;
+    size_t fused_bpv = D_seg * num_bits / 8;
+    uint8_t* dst = fused + blk * 32 * fused_bpv;
+
+    size_t ex_bits = (num_bits > 1) ? num_bits - 1 : 0;
+    uint32_t low_mask = ex_bits ? ((1u << ex_bits) - 1u) : 0u;
+    size_t dims_per_byte = 8 / num_bits;
+
+    uint64_t bit_buf = 0;
+    unsigned bits_have = 0;
+    size_t next_word = 0;
+
+    uint8_t out = 0;
+    size_t in_byte = 0, out_col = 0;
+    size_t num_codebooks = D_seg / 4;
+    for (size_t cb = 0; cb < num_codebooks; ++cb) {
+        uint8_t nibble = short_block[(cb / 4) * 4 * 32 + (size_t)lane * 4 + (cb % 4)];
+        for (int j = 0; j < 4; ++j) {
+            int msb = (nibble >> (3 - j)) & 1;
+            int code_low = 0;
+            if (ex_bits > 0 && long_block) {
+                if (bits_have < ex_bits) {
+                    bit_buf |= (uint64_t)long_block[next_word * 32 + lane] << bits_have;
+                    bits_have += 32;
+                    ++next_word;
+                }
+                code_low = (int)(bit_buf & low_mask);
+                bit_buf >>= ex_bits;
+                bits_have -= ex_bits;
+            }
+            int full_code = (msb << ex_bits) | code_low;
+            ++in_byte;
+            out |= (uint8_t)(full_code << (8 - num_bits * in_byte));
+            if (in_byte == dims_per_byte) {
+                dst[out_col * 32 + lane] = out;
+                out = 0; in_byte = 0; ++out_col;
+            }
+        }
+    }
+}
+
+void launch_fused_repack(
+    const uint8_t* d_short_codes, const uint8_t* d_long_codes,
+    uint8_t* d_fused, size_t total_blocks,
+    size_t D_seg, size_t num_bits,
+    size_t num_cb_groups, size_t long_words_per_vec,
+    cudaStream_t stream)
+{
+    if (total_blocks == 0) return;
+    size_t threads = total_blocks * 32;
+    int block = 256;
+    int grid = (int)((threads + block - 1) / block);
+    kernel_fused_repack<<<grid, block, 0, stream>>>(
+        d_short_codes, d_long_codes, d_fused, total_blocks,
+        D_seg, num_bits, num_cb_groups, long_words_per_vec);
+    SAQ_CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace saq::gpu
