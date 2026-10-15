@@ -327,10 +327,60 @@ __global__ void kernel_search(
                             uint32_t cnt = seg.layout_runs[2 * r + 1];
                             switch (pat) {
                             case 0x8u:
+                                // The slot table is the identity exactly when
+                                // the whole layout is one uniform-8 run (ffd
+                                // with all-equal widths assigns byte t = dim t).
+                                // A partial 8-run inside a mixed layout holds
+                                // arbitrary dims, so spot checks are not safe.
+                                if (seg.n_layout_runs == 1) {
+                                    for (uint32_t cc = 0; cc < cnt; ++cc, ++col) {
+                                        unsigned v = fb[col * 32 + lane];
+                                        ip += __ldg(&cbk[col * 256 + v]) * resid_seg[col];
+                                    }
+                                    slot += cnt;
+                                } else {
+                                    for (uint32_t cc = 0; cc < cnt; ++cc, ++col) {
+                                        unsigned v = fb[col * 32 + lane];
+                                        unsigned dm = smem_slot_dims[slot++];
+                                        ip += __ldg(&cbk[dm * 256 + v]) * resid_seg[dm];
+                                    }
+                                }
+                                break;
+                            case 0x233u:  // 3, 3, 2
                                 for (uint32_t cc = 0; cc < cnt; ++cc, ++col) {
                                     unsigned v = fb[col * 32 + lane];
-                                    unsigned dm = smem_slot_dims[slot++];
-                                    ip += __ldg(&cbk[dm * 256 + v]) * resid_seg[dm];
+                                    unsigned d0 = smem_slot_dims[slot++];
+                                    unsigned d1 = smem_slot_dims[slot++];
+                                    unsigned d2 = smem_slot_dims[slot++];
+                                    ip += __ldg(&cbk[d0 * 256 + (v >> 5)]) * resid_seg[d0]
+                                        + __ldg(&cbk[d1 * 256 + ((v >> 2) & 7u)]) * resid_seg[d1]
+                                        + __ldg(&cbk[d2 * 256 + (v & 3u)]) * resid_seg[d2];
+                                }
+                                break;
+                            case 0x224u:  // 4, 2, 2
+                                for (uint32_t cc = 0; cc < cnt; ++cc, ++col) {
+                                    unsigned v = fb[col * 32 + lane];
+                                    unsigned d0 = smem_slot_dims[slot++];
+                                    unsigned d1 = smem_slot_dims[slot++];
+                                    unsigned d2 = smem_slot_dims[slot++];
+                                    ip += __ldg(&cbk[d0 * 256 + (v >> 4)]) * resid_seg[d0]
+                                        + __ldg(&cbk[d1 * 256 + ((v >> 2) & 3u)]) * resid_seg[d1]
+                                        + __ldg(&cbk[d2 * 256 + (v & 3u)]) * resid_seg[d2];
+                                }
+                                break;
+                            case 0x11222u:  // 2, 2, 2, 1, 1
+                                for (uint32_t cc = 0; cc < cnt; ++cc, ++col) {
+                                    unsigned v = fb[col * 32 + lane];
+                                    unsigned d0 = smem_slot_dims[slot++];
+                                    unsigned d1 = smem_slot_dims[slot++];
+                                    unsigned d2 = smem_slot_dims[slot++];
+                                    unsigned d3 = smem_slot_dims[slot++];
+                                    unsigned d4 = smem_slot_dims[slot++];
+                                    ip += __ldg(&cbk[d0 * 256 + (v >> 6)]) * resid_seg[d0]
+                                        + __ldg(&cbk[d1 * 256 + ((v >> 4) & 3u)]) * resid_seg[d1]
+                                        + __ldg(&cbk[d2 * 256 + ((v >> 2) & 3u)]) * resid_seg[d2]
+                                        + __ldg(&cbk[d3 * 256 + ((v >> 1) & 1u)]) * resid_seg[d3]
+                                        + __ldg(&cbk[d4 * 256 + (v & 1u)]) * resid_seg[d4];
                                 }
                                 break;
                             case 0x35u:  // 5-bit field then 3-bit field
