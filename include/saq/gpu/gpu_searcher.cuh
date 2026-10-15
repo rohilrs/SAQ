@@ -34,6 +34,15 @@ struct GpuSegmentDescriptor {
     // nullptr = decode via short/long streams (fallback / fused disabled).
     uint8_t* fused_codes;
     size_t fused_bytes_per_vec;    // D_seg * num_bits / 8 when fused, else 0
+    // Heterogeneous byte layout (mixed-width bytes from the joint LP's
+    // packing patterns). Non-null slot_dims enables the pattern-run decode:
+    // byte columns are sorted into runs of equal pattern; slots are the
+    // dims of each column in decode order (MSB field first). runs[] holds
+    // 2 uint32 per run: packed widths (4 bits each, MSB field in the low
+    // nibble) and the run's column count. Codebooks are 256-padded per dim.
+    const uint16_t* layout_slot_dims;  // [n_slots] dim index per slot
+    const uint32_t* layout_runs;       // [2 * n_layout_runs]
+    size_t n_layout_runs;
 };
 
 /// Device-side per-cluster descriptor for search kernel.

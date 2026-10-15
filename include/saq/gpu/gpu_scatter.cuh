@@ -48,6 +48,18 @@ void launch_scatter_factors(
     size_t N,
     cudaStream_t stream = 0);
 
+/// Pack per-dim codes [N x D] into the heterogeneous fused byte layout,
+/// block-transposed: byte column c of vector `lane` in global block b at
+/// fused[b*32*n_bytes + c*32 + lane]. Per-dim metadata: target column
+/// (pattern-sorted), left-shift to place the field, width (0 = skip).
+void launch_het_pack(
+    const uint8_t* d_codes, uint8_t* d_fused,
+    const uint16_t* d_target_col, const uint8_t* d_shift, const uint8_t* d_width,
+    const uint32_t* d_cluster_offsets, const uint32_t* d_block_offsets,
+    const uint32_t* d_cluster_ids,
+    size_t N, size_t D, size_t n_bytes,
+    cudaStream_t stream = 0);
+
 /// Repack blocked short+long codebook-mode codes into byte-fused layout
 /// (codebook mode, segment width dividing 8). See kernel for the layout.
 void launch_fused_repack(

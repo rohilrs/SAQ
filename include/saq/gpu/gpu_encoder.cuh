@@ -43,6 +43,24 @@ void launch_fused_caq_encode_no_rotation(
 /// Codebook-aware encode: binary search quantization with per-dimension codebooks.
 /// codebook_centroids: [D_seg * entries_per_dim], dim-major layout.
 /// Output codes go into d_short_raw/d_long_raw as packed indices (same layout as uniform).
+/// Heterogeneous codebook encode: per-dim widths (0..8), codebooks padded to
+/// cb_pad entries per dim. Writes per-dim codes to d_codes_out [N x D_seg]
+/// plus the usual per-vector factors; byte packing happens separately
+/// (launch_het_pack) from the layout.
+void launch_het_codebook_encode(
+    const float* d_vectors_rotated,
+    const float* d_rotated_centroids,
+    const uint32_t* d_cluster_ids,
+    const float* d_codebook_centroids,   // [D_seg * cb_pad]
+    const uint8_t* d_widths,             // [D_seg]
+    size_t cb_pad,
+    float* d_o_l2norm, float* d_fac_rescale,
+    float* d_fac_error, float* d_ip_cent_oa,
+    uint8_t* d_codes_out,
+    size_t D_seg, size_t N, size_t K,
+    int caq_adj_rd_lmt, float caq_adj_eps,
+    cudaStream_t stream = 0);
+
 void launch_fused_codebook_encode(
     const float* d_vectors_rotated,
     const float* d_rotated_centroids,

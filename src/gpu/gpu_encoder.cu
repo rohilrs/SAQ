@@ -935,4 +935,173 @@ void launch_fused_codebook_encode(
     SAQ_CUDA_CHECK(cudaGetLastError());
 }
 
+
+// ============================================================================
+// Heterogeneous codebook encode: per-dim widths, codebooks padded to cb_pad.
+// Same structure as kernel_fused_codebook_encode (one warp per vector, each
+// lane a contiguous dim chunk) but nent varies per dim and the output is a
+// per-dim code array; byte packing is a separate kernel (layout-driven).
+// ============================================================================
+__global__ void kernel_het_codebook_encode(
+    const float* __restrict__ d_vectors_rotated,
+    const float* __restrict__ d_rotated_centroids,
+    const uint32_t* __restrict__ d_cluster_ids,
+    const float* __restrict__ d_codebook_centroids,
+    const uint8_t* __restrict__ d_widths,
+    size_t cb_pad,
+    float* __restrict__ d_o_l2norm,
+    float* __restrict__ d_fac_rescale,
+    float* __restrict__ d_fac_error,
+    float* __restrict__ d_ip_cent_oa,
+    uint8_t* __restrict__ d_codes_out,
+    size_t D_seg, size_t N, size_t K,
+    int caq_adj_rd_lmt, float caq_adj_eps)
+{
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane_id = threadIdx.x % 32;
+    if ((size_t)warp_id >= N) return;
+
+    uint32_t cid = d_cluster_ids[warp_id];
+    size_t chunk = (D_seg + 31) / 32;
+    size_t start = lane_id * chunk;
+    size_t end = min(start + chunk, D_seg);
+    size_t my_dims = (end > start) ? end - start : 0;
+
+    const float* vec_rot = d_vectors_rotated + (size_t)warp_id * D_seg;
+    const float* cent_rot = d_rotated_centroids + (size_t)cid * D_seg;
+
+    float local_vec[kMaxDimsPerLane];
+    int local_codes[kMaxDimsPerLane];
+    for (size_t i = 0; i < my_dims; ++i)
+        local_vec[i] = vec_rot[start + i] - cent_rot[start + i];
+
+    // ---- Step 1: nearest-codeword per dim at that dim's width ----
+    double partial_o_l2sqr = 0.0, partial_ip_o_oa = 0.0, partial_oa_l2sqr = 0.0;
+    for (size_t i = 0; i < my_dims; ++i) {
+        float o = local_vec[i];
+        partial_o_l2sqr += (double)o * o;
+        size_t gd = start + i;
+        int nent_j = 1 << d_widths[gd];
+        const float* cb_dim = d_codebook_centroids + gd * cb_pad;
+        int c = (nent_j > 1) ? codebook_nearest(cb_dim, nent_j, o) : 0;
+        local_codes[i] = c;
+        float oa = __ldg(&cb_dim[c]);
+        partial_ip_o_oa += (double)o * oa;
+        partial_oa_l2sqr += (double)oa * oa;
+    }
+    double o_l2sqr = warp_broadcast_double(warp_reduce_sum_double(partial_o_l2sqr));
+    double ip_o_oa = warp_broadcast_double(warp_reduce_sum_double(partial_ip_o_oa));
+    double oa_l2sqr = warp_broadcast_double(warp_reduce_sum_double(partial_oa_l2sqr));
+
+    // ---- Step 2: codebook-aware code adjustment (per-dim nent bounds) ----
+    if (caq_adj_rd_lmt && oa_l2sqr > 0.0) {
+        double re_eps = (double)caq_adj_eps * oa_l2sqr;
+        for (int round = 1; round <= caq_adj_rd_lmt; ++round) {
+            int local_adj_cnt = 0;
+            for (size_t i = 0; i < my_dims; ++i) {
+                float o = local_vec[i];
+                int c = local_codes[i];
+                size_t gd = start + i;
+                int nent_j = 1 << d_widths[gd];
+                if (nent_j <= 1) continue;
+                const float* cb_dim = d_codebook_centroids + gd * cb_pad;
+                float oa = __ldg(&cb_dim[c]);
+                double oa_l2sqr_tmp = oa_l2sqr - (double)oa * oa;
+                while (c + 1 < nent_j) {
+                    float new_oa = __ldg(&cb_dim[c + 1]);
+                    double new_length = oa_l2sqr_tmp + (double)new_oa * new_oa;
+                    double new_ip = ip_o_oa + (double)o * (new_oa - oa);
+                    if ((ip_o_oa * ip_o_oa + re_eps) * new_length >= new_ip * new_ip * oa_l2sqr)
+                        break;
+                    c++; ip_o_oa = new_ip; oa = new_oa;
+                    oa_l2sqr = oa_l2sqr_tmp + (double)oa * oa;
+                    local_adj_cnt++;
+                }
+                while (c > 0) {
+                    float new_oa = __ldg(&cb_dim[c - 1]);
+                    double new_length = oa_l2sqr_tmp + (double)new_oa * new_oa;
+                    double new_ip = ip_o_oa + (double)o * (new_oa - oa);
+                    if ((ip_o_oa * ip_o_oa + re_eps) * new_length >= new_ip * new_ip * oa_l2sqr)
+                        break;
+                    c--; ip_o_oa = new_ip; oa = new_oa;
+                    oa_l2sqr = oa_l2sqr_tmp + (double)oa * oa;
+                    local_adj_cnt++;
+                }
+                local_codes[i] = c;
+            }
+            int total_adj = warp_broadcast_int(warp_reduce_sum_int(local_adj_cnt));
+            if (total_adj == 0) break;
+            double corr_oa_l2 = 0.0, corr_ip = 0.0;
+            for (size_t i = 0; i < my_dims; ++i) {
+                size_t gd = start + i;
+                float oa = __ldg(&d_codebook_centroids[gd * cb_pad + local_codes[i]]);
+                corr_ip += (double)oa * local_vec[i];
+                corr_oa_l2 += (double)oa * oa;
+            }
+            oa_l2sqr = warp_broadcast_double(warp_reduce_sum_double(corr_oa_l2));
+            ip_o_oa = warp_broadcast_double(warp_reduce_sum_double(corr_ip));
+            re_eps = (double)caq_adj_eps * oa_l2sqr;
+        }
+    }
+
+    // ---- Step 3: factors (same semantics as the uniform codebook path) ----
+    float fac_rescale = (ip_o_oa != 0.0) ? (float)(o_l2sqr / ip_o_oa) : 0.0f;
+    float o_l2norm = sqrtf((float)o_l2sqr);
+    constexpr float kConstEpsilon = 1.9f;
+    float fac_error = 0.0f;
+    if (ip_o_oa > 0.0 && D_seg > 1) {
+        fac_error = (float)(o_l2sqr * kConstEpsilon *
+            sqrt(((o_l2sqr * oa_l2sqr) / (ip_o_oa * ip_o_oa) - 1.0) / (D_seg - 1)));
+    }
+    float ip_c_oa;
+    {
+        double partial_ip = 0.0;
+        for (size_t i = 0; i < my_dims; ++i) {
+            size_t gd = start + i;
+            float oa = __ldg(&d_codebook_centroids[gd * cb_pad + local_codes[i]]);
+            partial_ip += (double)cent_rot[gd] * oa;
+        }
+        ip_c_oa = (float)warp_broadcast_double(warp_reduce_sum_double(partial_ip));
+    }
+    if (lane_id == 0) {
+        d_o_l2norm[warp_id] = o_l2norm;
+        d_fac_rescale[warp_id] = fac_rescale;
+        d_fac_error[warp_id] = fac_error;
+        d_ip_cent_oa[warp_id] = ip_c_oa;
+    }
+
+    // ---- Step 4: write per-dim codes ----
+    for (size_t i = 0; i < my_dims; ++i)
+        d_codes_out[(size_t)warp_id * D_seg + start + i] = (uint8_t)local_codes[i];
+}
+
+void launch_het_codebook_encode(
+    const float* d_vectors_rotated,
+    const float* d_rotated_centroids,
+    const uint32_t* d_cluster_ids,
+    const float* d_codebook_centroids,
+    const uint8_t* d_widths,
+    size_t cb_pad,
+    float* d_o_l2norm, float* d_fac_rescale,
+    float* d_fac_error, float* d_ip_cent_oa,
+    uint8_t* d_codes_out,
+    size_t D_seg, size_t N, size_t K,
+    int caq_adj_rd_lmt, float caq_adj_eps,
+    cudaStream_t stream)
+{
+    if (N == 0) return;
+    CHECK_LE(D_seg, (size_t)32 * kMaxDimsPerLane)
+        << "segment of " << D_seg << " dims overflows the encoder's per-lane "
+        << "local buffers (kMaxDimsPerLane=" << kMaxDimsPerLane << "); split the plan";
+    constexpr int kWarpsPerBlock = 4;
+    constexpr int kBlockSize = 32 * kWarpsPerBlock;
+    int grid = ((int)N + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    kernel_het_codebook_encode<<<grid, kBlockSize, 0, stream>>>(
+        d_vectors_rotated, d_rotated_centroids, d_cluster_ids,
+        d_codebook_centroids, d_widths, cb_pad,
+        d_o_l2norm, d_fac_rescale, d_fac_error, d_ip_cent_oa,
+        d_codes_out, D_seg, N, K, caq_adj_rd_lmt, caq_adj_eps);
+    SAQ_CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace saq::gpu

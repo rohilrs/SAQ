@@ -41,6 +41,20 @@ class GpuIVF {
     bool      derive_codebooks_ = false;  // derive natively from data in construct()
     LloydOpts lloyd_opts_{};
 
+    // Heterogeneous byte layout (stage-2 fused decode): per-dim widths and
+    // byte placement from the joint LP via ffd packing. Device metadata is
+    // built in construct(); the search descriptor points at it.
+    bool has_byte_layout_ = false;
+    std::vector<int> layout_widths_, layout_byte_idx_, layout_bit_off_;
+    size_t layout_n_bytes_ = 0;
+    DevicePtr<uint16_t> d_layout_slot_dims_;
+    DevicePtr<uint32_t> d_layout_runs_;
+    size_t n_layout_runs_ = 0;
+    DevicePtr<uint8_t> d_layout_widths_;     // per dim, for the encoder
+    DevicePtr<uint16_t> d_layout_target_col_; // per dim, pattern-sorted column
+    DevicePtr<uint8_t> d_layout_shift_;      // per dim, shift to LSB-align field
+    DevicePtr<uint8_t> d_het_codes_;         // transient [N x D] per-dim codes
+
 
 public:
     GpuIVF() = default;
@@ -86,6 +100,19 @@ public:
     /// Inject an explicit quantization plan (list of (dim_length, bits) segments),
     /// bypassing the DP/greedy allocators. Call before set_variance().
     void set_quant_plan(SaqData::QuantPlanT plan);
+
+    /// Inject a heterogeneous byte layout (per-dim widths + ffd byte placement,
+    /// from the joint LP). Requires codebook mode, no rotation, and a single
+    /// (D, 1) quant plan (the plan's streams are unused; codes live only in
+    /// the fused byte layout). bit_off counts from the byte's MSB side.
+    void set_byte_layout(std::vector<int> widths,
+                         std::vector<int> byte_idx,
+                         std::vector<int> bit_off) {
+        layout_widths_ = std::move(widths);
+        layout_byte_idx_ = std::move(byte_idx);
+        layout_bit_off_ = std::move(bit_off);
+        has_byte_layout_ = true;
+    }
 
     /// GPU-accelerated index construction.
     void construct(const FloatRowMat& data,

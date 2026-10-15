@@ -159,10 +159,23 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
 
         // Byte-fused decode path (SAQ_FUSED_DECODE=1): only where the repack
         // buffer exists (codebook mode, width dividing 8); nullptr = fallback.
-        const bool want_fused = std::getenv("SAQ_FUSED_DECODE") != nullptr;
-        sd.fused_codes = (want_fused && sp.fused_bytes_per_vec > 0)
-            ? sp.fused_codes.get() : nullptr;
-        sd.fused_bytes_per_vec = sd.fused_codes ? sp.fused_bytes_per_vec : 0;
+        // The heterogeneous layout has no stream fallback, so it is always
+        // fused and carries the pattern-run metadata.
+        if (has_byte_layout_ && s == 0) {
+            sd.fused_codes = sp.fused_codes.get();
+            sd.fused_bytes_per_vec = sp.fused_bytes_per_vec;
+            sd.layout_slot_dims = d_layout_slot_dims_.get();
+            sd.layout_runs = d_layout_runs_.get();
+            sd.n_layout_runs = n_layout_runs_;
+        } else {
+            const bool want_fused = std::getenv("SAQ_FUSED_DECODE") != nullptr;
+            sd.fused_codes = (want_fused && sp.fused_bytes_per_vec > 0)
+                ? sp.fused_codes.get() : nullptr;
+            sd.fused_bytes_per_vec = sd.fused_codes ? sp.fused_bytes_per_vec : 0;
+            sd.layout_slot_dims = nullptr;
+            sd.layout_runs = nullptr;
+            sd.n_layout_runs = 0;
+        }
     }
 
     std::vector<GpuClusterDescriptor> h_clu_descs(K);
@@ -206,12 +219,13 @@ void GpuIVF::search_batch(const FloatRowMat& queries,
 
     // Shared-memory budget for the byte-fused decode tables (mirrors the
     // kernel's per-segment table modes).
+    // Extra dynamic smem: heterogeneous slot-dim table (uint16 per slot,
+    // sized in __half units for the launch interface).
     size_t fused_table_halfs = 0;
-    for (const auto& sd : h_seg_descs) {
-        if (sd.fused_codes && sd.num_bits >= 1 && sd.num_bits <= 2)
-            fused_table_halfs += sd.fused_bytes_per_vec * 256;
-        else if (sd.fused_codes && sd.num_bits == 4)
-            fused_table_halfs += sd.D_seg * 16;
+    if (has_byte_layout_) {
+        size_t n_slots = 0;
+        for (int wj : layout_widths_) n_slots += (wj > 0);
+        fused_table_halfs = n_slots;  // n_slots * 2 bytes
     }
 
     // 4. Launch search kernel

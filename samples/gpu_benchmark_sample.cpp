@@ -60,6 +60,26 @@ static SaqData::QuantPlanT load_plan_from_env() {
     return plan;
 }
 
+/// SAQ_BYTE_LAYOUT=<path> injects a heterogeneous byte layout (stage-2 fused
+/// decode): first line "D n_bytes", then D rows "width byte_idx bit_off"
+/// (bit_off from the byte's MSB side). Requires SAQ_DERIVE_CODEBOOKS=1 and
+/// SAQ_NO_ROTATION=1; the quant plan is forced to a single (D, 1) segment.
+struct ByteLayout { std::vector<int> w, bi, bo; size_t n_bytes = 0; };
+static ByteLayout load_byte_layout_from_env() {
+    ByteLayout L;
+    const char* path = std::getenv("SAQ_BYTE_LAYOUT");
+    if (!path) return L;
+    std::ifstream f(path);
+    CHECK(f.is_open()) << "SAQ_BYTE_LAYOUT: cannot open " << path;
+    size_t D;
+    CHECK(f >> D >> L.n_bytes) << "SAQ_BYTE_LAYOUT: bad header";
+    L.w.resize(D); L.bi.resize(D); L.bo.resize(D);
+    for (size_t j = 0; j < D; ++j)
+        CHECK(f >> L.w[j] >> L.bi[j] >> L.bo[j]) << "SAQ_BYTE_LAYOUT: row " << j;
+    LOG(INFO) << "SAQ_BYTE_LAYOUT: " << D << " dims in " << L.n_bytes << " bytes";
+    return L;
+}
+
 /// LloydOpts for native codebook derivation, from SAQ_DERIVE_SAMPLE /
 /// SAQ_DERIVE_MAXBITS (defaults: full data, max_bits 13).
 static LloydOpts derive_opts_from_env() {
@@ -131,6 +151,7 @@ int main(int argc, char** argv) {
 
     // Optional explicit plan injection (must be set before set_variance).
     const SaqData::QuantPlanT injected_plan = load_plan_from_env();
+    const ByteLayout byte_layout = load_byte_layout_from_env();
 
     // ---- GPU Encode ----
     {
@@ -139,7 +160,10 @@ int main(int argc, char** argv) {
             StopW sw;
             gpu::GpuIVF gpu_ivf(N, D, K, cfg);
             std::srand(42);  // deterministic rotations so A/B builds are comparable
-            if (!injected_plan.empty()) gpu_ivf.set_quant_plan(injected_plan);
+            if (!byte_layout.w.empty()) {
+                gpu_ivf.set_quant_plan({{byte_layout.w.size(), 1}});
+                gpu_ivf.set_byte_layout(byte_layout.w, byte_layout.bi, byte_layout.bo);
+            } else if (!injected_plan.empty()) gpu_ivf.set_quant_plan(injected_plan);
             if (std::getenv("SAQ_DERIVE_CODEBOOKS")) gpu_ivf.set_derive_codebooks(derive_opts_from_env());
             gpu_ivf.set_variance(variances.row(0));
             gpu_ivf.construct(vectors, centroids, cids.data());
@@ -169,7 +193,10 @@ int main(int argc, char** argv) {
         // Re-build GPU index for search (need the gpu_ivf object to persist)
         gpu::GpuIVF gpu_ivf2(N, D, K, cfg);
         std::srand(42);  // deterministic rotations so A/B builds are comparable
-        if (!injected_plan.empty()) gpu_ivf2.set_quant_plan(injected_plan);
+        if (!byte_layout.w.empty()) {
+            gpu_ivf2.set_quant_plan({{byte_layout.w.size(), 1}});
+            gpu_ivf2.set_byte_layout(byte_layout.w, byte_layout.bi, byte_layout.bo);
+        } else if (!injected_plan.empty()) gpu_ivf2.set_quant_plan(injected_plan);
             if (std::getenv("SAQ_DERIVE_CODEBOOKS")) gpu_ivf2.set_derive_codebooks(derive_opts_from_env());
         gpu_ivf2.set_variance(variances.row(0));
         gpu_ivf2.construct(vectors, centroids, cids.data());
@@ -222,8 +249,10 @@ int main(int argc, char** argv) {
     // ---- CPU Encode + Distance Diagnostic ----
     // SAQ_SKIP_CPU=1 skips the whole CPU section — at scale (2M x 20K queries,
     // flat scan) the CPU encode+recall diagnostic dominates GPU-node walltime.
-    if (std::getenv("SAQ_SKIP_CPU")) {
-        LOG(INFO) << "SAQ_SKIP_CPU set — skipping CPU encode + diagnostics.";
+    if (std::getenv("SAQ_SKIP_CPU") || !byte_layout.w.empty()) {
+        LOG(INFO) << "Skipping CPU encode + diagnostics ("
+                  << (std::getenv("SAQ_SKIP_CPU") ? "SAQ_SKIP_CPU" : "byte layout has no CPU path")
+                  << ").";
         return 0;
     }
     {
@@ -270,7 +299,10 @@ int main(int argc, char** argv) {
         // Re-run GPU search on a fresh index with SAME random seed as CPU
         gpu::GpuIVF gpu_diag(N, D, K, cfg);
         std::srand(42);  // Same seed BEFORE set_variance
-        if (!injected_plan.empty()) gpu_diag.set_quant_plan(injected_plan);
+        if (!byte_layout.w.empty()) {
+            gpu_diag.set_quant_plan({{byte_layout.w.size(), 1}});
+            gpu_diag.set_byte_layout(byte_layout.w, byte_layout.bi, byte_layout.bo);
+        } else if (!injected_plan.empty()) gpu_diag.set_quant_plan(injected_plan);
             if (std::getenv("SAQ_DERIVE_CODEBOOKS")) gpu_diag.set_derive_codebooks(derive_opts_from_env());
         gpu_diag.set_variance(variances.row(0));
         gpu_diag.construct(vectors, centroids, cids.data());

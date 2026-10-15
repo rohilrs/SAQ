@@ -51,7 +51,8 @@ struct GpuMemoryPool {
     void allocate(size_t K,
                   const std::vector<size_t>& cluster_sizes,
                   const std::vector<std::pair<size_t, size_t>>& quant_plan,
-                  bool fused_codes_eligible = false) {
+                  bool fused_codes_eligible = false,
+                  size_t fused_bpv_override = 0) {
         assert(segments.empty() && "Pool already allocated; destroy and recreate");
 
         K_ = K;
@@ -116,7 +117,13 @@ struct GpuMemoryPool {
             // Byte-fused code storage (codebook mode, width dividing 8): one
             // byte holds 8/bits whole dims; repacked from short/long streams
             // after scatter. Same bytes/vector as the split streams.
-            if (fused_codes_eligible && bits > 0 && 8 % bits == 0) {
+            if (fused_bpv_override > 0 && s == 0) {
+                // Heterogeneous byte layout: fused size comes from the layout
+                // (mixed-width bytes), not from a uniform segment width.
+                sp.fused_bytes_per_vec = fused_bpv_override;
+                sp.fused_codes = device_alloc<uint8_t>(
+                    total_blocks_ * KFastScanSize * sp.fused_bytes_per_vec);
+            } else if (fused_codes_eligible && bits > 0 && 8 % bits == 0) {
                 sp.fused_bytes_per_vec = D_seg * bits / 8;
                 sp.fused_codes = device_alloc<uint8_t>(
                     total_blocks_ * KFastScanSize * sp.fused_bytes_per_vec);
@@ -169,6 +176,24 @@ struct GpuMemoryPool {
             seg.d_long_factor_rescale = sp.factor_rescale.get() + vec_off;
             seg.d_long_factor_error   = sp.factor_error.get() + vec_off;
         }
+    }
+
+    /// Upload per-dim codebooks PADDED to a fixed entry count (heterogeneous
+    /// widths): dim j's 2^b_j centroids land at [j*pad .. j*pad+2^b_j), rest 0.
+    void upload_segment_codebooks_padded(size_t seg_idx,
+                                         const std::vector<DimensionCodebook>& dim_cbs,
+                                         size_t pad_entries) {
+        auto& sp = segments[seg_idx];
+        size_t D_seg = quant_plan_[seg_idx].first;
+        sp.codebook_entries_per_dim = pad_entries;
+        std::vector<float> flat(D_seg * pad_entries, 0.0f);
+        for (size_t d = 0; d < D_seg; ++d) {
+            size_t ne = dim_cbs[d].num_entries;
+            for (size_t e = 0; e < ne && e < pad_entries; ++e)
+                flat[d * pad_entries + e] = dim_cbs[d].centroids[e];
+        }
+        sp.codebook_centroids = device_alloc<float>(D_seg * pad_entries);
+        upload(sp.codebook_centroids.get(), flat.data(), D_seg * pad_entries);
     }
 
     /// Upload codebooks for a segment. Called from construct after SaqData codebooks are built.

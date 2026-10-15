@@ -1,5 +1,6 @@
 #include "saq/gpu/gpu_scatter.cuh"
 #include "saq/gpu/gpu_utils.cuh"
+#include <cassert>
 
 namespace saq::gpu {
 
@@ -260,6 +261,62 @@ void launch_fused_repack(
     kernel_fused_repack<<<grid, block, 0, stream>>>(
         d_short_codes, d_long_codes, d_fused, total_blocks,
         D_seg, num_bits, num_cb_groups, long_words_per_vec);
+    SAQ_CUDA_CHECK(cudaGetLastError());
+}
+
+
+// ---------------------------------------------------------------------------
+// Heterogeneous byte pack: per-dim codes [N x D] -> fused byte layout,
+// block-transposed. One thread per vector; a local byte buffer is assembled
+// then written column-major into the vector's block. Construct-time only.
+// ---------------------------------------------------------------------------
+__global__ void kernel_het_pack(
+    const uint8_t* __restrict__ d_codes,
+    uint8_t* __restrict__ d_fused,
+    const uint16_t* __restrict__ d_target_col,
+    const uint8_t* __restrict__ d_shift,
+    const uint8_t* __restrict__ d_width,
+    const uint32_t* __restrict__ d_cluster_offsets,
+    const uint32_t* __restrict__ d_block_offsets,
+    const uint32_t* __restrict__ d_cluster_ids,
+    size_t N, size_t D, size_t n_bytes)
+{
+    constexpr size_t kMaxLayoutBytes = 2048;
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    uint8_t buf[kMaxLayoutBytes];
+    for (size_t t = 0; t < n_bytes; ++t) buf[t] = 0;
+    const uint8_t* codes = d_codes + i * D;
+    for (size_t d = 0; d < D; ++d) {
+        if (d_width[d] == 0) continue;
+        buf[d_target_col[d]] |= (uint8_t)(codes[d] << d_shift[d]);
+    }
+
+    uint32_t c = d_cluster_ids[i];
+    uint32_t pos = (uint32_t)i - d_cluster_offsets[c];
+    uint32_t global_block = d_block_offsets[c] + pos / 32;
+    uint32_t lane = pos % 32;
+    uint8_t* dst = d_fused + (size_t)global_block * 32 * n_bytes;
+    for (size_t t = 0; t < n_bytes; ++t)
+        dst[t * 32 + lane] = buf[t];
+}
+
+void launch_het_pack(
+    const uint8_t* d_codes, uint8_t* d_fused,
+    const uint16_t* d_target_col, const uint8_t* d_shift, const uint8_t* d_width,
+    const uint32_t* d_cluster_offsets, const uint32_t* d_block_offsets,
+    const uint32_t* d_cluster_ids,
+    size_t N, size_t D, size_t n_bytes,
+    cudaStream_t stream)
+{
+    if (N == 0) return;
+    assert(n_bytes <= 2048 && "raise kMaxLayoutBytes in kernel_het_pack");
+    int block = 128;
+    int grid = (int)((N + block - 1) / block);
+    kernel_het_pack<<<grid, block, 0, stream>>>(
+        d_codes, d_fused, d_target_col, d_shift, d_width,
+        d_cluster_offsets, d_block_offsets, d_cluster_ids, N, D, n_bytes);
     SAQ_CUDA_CHECK(cudaGetLastError());
 }
 

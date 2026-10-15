@@ -178,6 +178,24 @@ __global__ void kernel_search(
     int* smem_work = (int*)(smem_consts_f + num_segments * kConstsPerSeg);
     float* smem_resid_query = (float*)((char*)(smem_work + 1));
     // smem_resid_query: [total_D_seg] floats — residual query = rotated_query - centroid
+    // smem_slot_dims: heterogeneous-layout slot table (dim index per slot),
+    // preloaded once per block; lanes read the same slot simultaneously
+    // (broadcast, conflict-free).
+    uint16_t* smem_slot_dims = (uint16_t*)(smem_resid_query + total_D_seg);
+    int het_n_slots = 0;
+    for (size_t s = 0; s < num_segments; ++s) {
+        const auto& sd = d_seg_descs[s];
+        if (sd.layout_slot_dims) {
+            for (size_t r = 0; r < sd.n_layout_runs; ++r) {
+                uint32_t pat = sd.layout_runs[2 * r], cnt = sd.layout_runs[2 * r + 1];
+                int nf = 0;
+                for (uint32_t pp = pat; pp; pp >>= 4) ++nf;
+                het_n_slots += nf * (int)cnt;
+            }
+            for (int i = threadIdx.x; i < het_n_slots; i += blockDim.x)
+                smem_slot_dims[i] = sd.layout_slot_dims[i];
+        }
+    }
 
     // ---- Phase 0: Build LUT from (query - centroid) ----
     // For L2 distance, the CPU builds LUT from the residual query.
@@ -293,7 +311,106 @@ __global__ void kernel_search(
                         : nullptr;
 
                     float cb_ip;
-                    if (seg.fused_codes) {
+                    if (seg.layout_slot_dims) {
+                        // Heterogeneous byte layout: pattern-run decode. Byte
+                        // columns are pre-sorted into runs of equal pattern
+                        // (offset-ordered widths, 4 bits per field, MSB-side
+                        // field in the low nibble). Hot patterns get literal
+                        // shifts; the default walks the nibbles.
+                        const uint8_t* fb = seg.fused_codes
+                            + (size_t)global_block * 32 * seg.fused_bytes_per_vec;
+                        const float* cbk = seg.codebook_centroids;
+                        float ip = 0.0f;
+                        size_t col = 0, slot = 0;
+                        for (size_t r = 0; r < seg.n_layout_runs; ++r) {
+                            uint32_t pat = seg.layout_runs[2 * r];
+                            uint32_t cnt = seg.layout_runs[2 * r + 1];
+                            switch (pat) {
+                            case 0x8u:
+                                for (uint32_t cc = 0; cc < cnt; ++cc, ++col) {
+                                    unsigned v = fb[col * 32 + lane];
+                                    unsigned dm = smem_slot_dims[slot++];
+                                    ip += __ldg(&cbk[dm * 256 + v]) * resid_seg[dm];
+                                }
+                                break;
+                            case 0x35u:  // 5-bit field then 3-bit field
+                                for (uint32_t cc = 0; cc < cnt; ++cc, ++col) {
+                                    unsigned v = fb[col * 32 + lane];
+                                    unsigned d0 = smem_slot_dims[slot++];
+                                    unsigned d1 = smem_slot_dims[slot++];
+                                    ip += __ldg(&cbk[d0 * 256 + (v >> 3)]) * resid_seg[d0]
+                                        + __ldg(&cbk[d1 * 256 + (v & 7u)]) * resid_seg[d1];
+                                }
+                                break;
+                            case 0x26u:  // 6 then 2
+                                for (uint32_t cc = 0; cc < cnt; ++cc, ++col) {
+                                    unsigned v = fb[col * 32 + lane];
+                                    unsigned d0 = smem_slot_dims[slot++];
+                                    unsigned d1 = smem_slot_dims[slot++];
+                                    ip += __ldg(&cbk[d0 * 256 + (v >> 2)]) * resid_seg[d0]
+                                        + __ldg(&cbk[d1 * 256 + (v & 3u)]) * resid_seg[d1];
+                                }
+                                break;
+                            case 0x17u:  // 7 then 1
+                                for (uint32_t cc = 0; cc < cnt; ++cc, ++col) {
+                                    unsigned v = fb[col * 32 + lane];
+                                    unsigned d0 = smem_slot_dims[slot++];
+                                    unsigned d1 = smem_slot_dims[slot++];
+                                    ip += __ldg(&cbk[d0 * 256 + (v >> 1)]) * resid_seg[d0]
+                                        + __ldg(&cbk[d1 * 256 + (v & 1u)]) * resid_seg[d1];
+                                }
+                                break;
+                            case 0x44u:  // 4 then 4
+                                for (uint32_t cc = 0; cc < cnt; ++cc, ++col) {
+                                    unsigned v = fb[col * 32 + lane];
+                                    unsigned d0 = smem_slot_dims[slot++];
+                                    unsigned d1 = smem_slot_dims[slot++];
+                                    ip += __ldg(&cbk[d0 * 256 + (v >> 4)]) * resid_seg[d0]
+                                        + __ldg(&cbk[d1 * 256 + (v & 15u)]) * resid_seg[d1];
+                                }
+                                break;
+                            case 0x2222u:  // four 2-bit fields
+                                for (uint32_t cc = 0; cc < cnt; ++cc, ++col) {
+                                    unsigned v = fb[col * 32 + lane];
+                                    unsigned d0 = smem_slot_dims[slot++];
+                                    unsigned d1 = smem_slot_dims[slot++];
+                                    unsigned d2 = smem_slot_dims[slot++];
+                                    unsigned d3 = smem_slot_dims[slot++];
+                                    ip += __ldg(&cbk[d0 * 256 + ((v >> 6) & 3u)]) * resid_seg[d0]
+                                        + __ldg(&cbk[d1 * 256 + ((v >> 4) & 3u)]) * resid_seg[d1]
+                                        + __ldg(&cbk[d2 * 256 + ((v >> 2) & 3u)]) * resid_seg[d2]
+                                        + __ldg(&cbk[d3 * 256 + (v & 3u)]) * resid_seg[d3];
+                                }
+                                break;
+                            case 0x11111111u:  // eight 1-bit fields
+                                for (uint32_t cc = 0; cc < cnt; ++cc, ++col) {
+                                    unsigned v = fb[col * 32 + lane];
+                                    #pragma unroll
+                                    for (int k = 0; k < 8; ++k) {
+                                        unsigned dm = smem_slot_dims[slot++];
+                                        ip += __ldg(&cbk[dm * 256 + ((v >> (7 - k)) & 1u)])
+                                              * resid_seg[dm];
+                                    }
+                                }
+                                break;
+                            default: {  // generic: walk the pattern nibbles
+                                unsigned w[8]; int nf = 0;
+                                for (uint32_t pp = pat; pp; pp >>= 4) w[nf++] = pp & 15u;
+                                for (uint32_t cc = 0; cc < cnt; ++cc, ++col) {
+                                    unsigned v = fb[col * 32 + lane];
+                                    unsigned off = 0;
+                                    for (int k = 0; k < nf; ++k) {
+                                        unsigned code = (v >> (8u - off - w[k])) & ((1u << w[k]) - 1u);
+                                        unsigned dm = smem_slot_dims[slot++];
+                                        ip += __ldg(&cbk[dm * 256 + code]) * resid_seg[dm];
+                                        off += w[k];
+                                    }
+                                }
+                            }
+                            }
+                        }
+                        cb_ip = ip;
+                    } else if (seg.fused_codes) {
                         // Byte-fused decode: coalesced byte load, in-register
                         // slice extract, L1-resident codebook load + fma. No
                         // sequential bit-buffer dependency (the split-stream
@@ -533,7 +650,7 @@ void launch_search(
     const uint32_t* d_centroid_ids,
     size_t Q, size_t nprobe, size_t topk,
     size_t num_segments, size_t total_D_seg,
-    size_t /*fused_table_halfs*/,
+    size_t fused_table_halfs,
     float* d_candidate_dists,
     uint32_t* d_candidate_ids,
     uint32_t* d_candidate_counts,
@@ -548,6 +665,7 @@ void launch_search(
                        + num_segments * kConstsPerSeg * sizeof(float)  // constants
                        + sizeof(int)                                    // work counter
                        + total_D_seg * sizeof(float)                    // residual query
+                       + fused_table_halfs * sizeof(__half)             // het slot-dim table (uint16 per slot)
                        + kMaxCandidatesPerBlock * (sizeof(float) + sizeof(uint32_t)); // candidate buffer
 
     dim3 grid(Q, nprobe);

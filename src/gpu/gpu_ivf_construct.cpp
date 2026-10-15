@@ -63,6 +63,72 @@ void GpuIVF::construct(const FloatRowMat& data,
 
     LOG(INFO) << "Quantization plan: " << num_segments << " segments";
 
+    // Heterogeneous byte layout: validate, then build the pattern-sorted
+    // column metadata the pack and decode use. Pattern key = offset-ordered
+    // field widths packed 4 bits each (MSB-side field in the low nibble).
+    std::vector<uint16_t> h_target_col, h_slot_dims;
+    std::vector<uint8_t> h_shift, h_width;
+    std::vector<uint32_t> h_runs;
+    if (has_byte_layout_) {
+        CHECK(has_codebooks_) << "byte layout requires codebook mode";
+        CHECK_EQ(num_segments, 1u) << "byte layout requires a single-segment plan";
+        CHECK_EQ(quant_plan[0].first, D) << "byte layout plan must cover all dims";
+        CHECK_EQ(layout_widths_.size(), D);
+        layout_n_bytes_ = 0;
+        for (size_t j = 0; j < D; ++j)
+            if (layout_byte_idx_[j] >= 0)
+                layout_n_bytes_ = std::max(layout_n_bytes_, (size_t)layout_byte_idx_[j] + 1);
+        // fields per original byte, offset-ordered
+        std::vector<std::vector<std::pair<int, int>>> fields(layout_n_bytes_); // (off, dim)
+        for (size_t j = 0; j < D; ++j)
+            if (layout_widths_[j] > 0)
+                fields[layout_byte_idx_[j]].push_back({layout_bit_off_[j], (int)j});
+        std::vector<uint32_t> pat(layout_n_bytes_, 0);
+        for (size_t t = 0; t < layout_n_bytes_; ++t) {
+            std::sort(fields[t].begin(), fields[t].end());
+            uint32_t key = 0;
+            for (size_t k = 0; k < fields[t].size(); ++k)
+                key |= (uint32_t)layout_widths_[fields[t][k].second] << (4 * k);
+            pat[t] = key;
+        }
+        std::vector<size_t> col_order(layout_n_bytes_);
+        std::iota(col_order.begin(), col_order.end(), 0u);
+        std::stable_sort(col_order.begin(), col_order.end(),
+                         [&](size_t a, size_t b) { return pat[a] < pat[b]; });
+        std::vector<uint16_t> new_col(layout_n_bytes_);
+        for (size_t nc = 0; nc < layout_n_bytes_; ++nc)
+            new_col[col_order[nc]] = (uint16_t)nc;
+        h_target_col.resize(D, 0); h_shift.resize(D, 0); h_width.resize(D, 0);
+        for (size_t j = 0; j < D; ++j) {
+            h_width[j] = (uint8_t)layout_widths_[j];
+            if (layout_widths_[j] > 0) {
+                h_target_col[j] = new_col[layout_byte_idx_[j]];
+                h_shift[j] = (uint8_t)(8 - layout_bit_off_[j] - layout_widths_[j]);
+            }
+        }
+        for (size_t nc = 0; nc < layout_n_bytes_; ++nc) {
+            size_t t = col_order[nc];
+            for (auto& f : fields[t]) h_slot_dims.push_back((uint16_t)f.second);
+            if (h_runs.size() >= 2 && h_runs[h_runs.size() - 2] == pat[t])
+                h_runs.back() += 1;
+            else { h_runs.push_back(pat[t]); h_runs.push_back(1); }
+        }
+        n_layout_runs_ = h_runs.size() / 2;
+        LOG(INFO) << "Byte layout: " << layout_n_bytes_ << " bytes/vec, "
+                  << h_slot_dims.size() << " slots, " << n_layout_runs_
+                  << " pattern runs";
+        d_layout_target_col_ = device_alloc<uint16_t>(D);
+        d_layout_shift_ = device_alloc<uint8_t>(D);
+        d_layout_widths_ = device_alloc<uint8_t>(D);
+        d_layout_slot_dims_ = device_alloc<uint16_t>(h_slot_dims.size());
+        d_layout_runs_ = device_alloc<uint32_t>(h_runs.size());
+        upload(d_layout_target_col_.get(), h_target_col.data(), D);
+        upload(d_layout_shift_.get(), h_shift.data(), D);
+        upload(d_layout_widths_.get(), h_width.data(), D);
+        upload(d_layout_slot_dims_.get(), h_slot_dims.data(), h_slot_dims.size());
+        upload(d_layout_runs_.get(), h_runs.data(), h_runs.size());
+    }
+
     // Build segment codebooks if codebook mode is active
     if (has_codebooks_) {
         // Codebooks are trained/injected in the unrotated (PCA) basis; encoding
@@ -92,9 +158,12 @@ void GpuIVF::construct(const FloatRowMat& data,
             size_t gdim = 0;
             for (size_t s = 0; s < quant_plan.size(); ++s) {
                 const size_t dim_len = quant_plan[s].first;
-                const size_t bits    = quant_plan[s].second;
                 codebooks_explicit_[s].reserve(dim_len);
                 for (size_t j = 0; j < dim_len; ++j, ++gdim) {
+                    // Heterogeneous layout: each dim at its own width;
+                    // otherwise the segment's uniform width.
+                    const size_t bits = has_byte_layout_
+                        ? (size_t)layout_widths_[gdim] : quant_plan[s].second;
                     CHECK_LT(gdim, per_dim.size());
                     CHECK_LT(bits, per_dim[gdim].codebooks.size())
                         << "lloyd_opts_.max_bits too small for allocated bits=" << bits;
@@ -152,7 +221,8 @@ void GpuIVF::construct(const FloatRowMat& data,
     // 4. Allocate GPU memory via pool
     phase_timer.reset();
     pool_ = GpuMemoryPool{};  // reset if previously used
-    pool_.allocate(K, cluster_sizes, quant_plan, /*fused_codes_eligible=*/has_codebooks_);
+    pool_.allocate(K, cluster_sizes, quant_plan, /*fused_codes_eligible=*/has_codebooks_,
+                   /*fused_bpv_override=*/has_byte_layout_ ? layout_n_bytes_ : 0);
 
     // Set up cluster views
     gpu_clusters_.clear();
@@ -169,7 +239,10 @@ void GpuIVF::construct(const FloatRowMat& data,
         for (size_t s = 0; s < num_segments; ++s) {
             const auto& seg_cbs = saq_data_->segment_codebooks[s];
             if (!seg_cbs.empty()) {
-                pool_.upload_segment_codebooks(s, seg_cbs);
+                if (has_byte_layout_)
+                    pool_.upload_segment_codebooks_padded(s, seg_cbs, 256);
+                else
+                    pool_.upload_segment_codebooks(s, seg_cbs);
             }
         }
         LOG(INFO) << "Uploaded codebooks to GPU";
@@ -289,6 +362,20 @@ void GpuIVF::construct(const FloatRowMat& data,
                     cent_seg.row(c) = centroids.row(c).segment(dim_offset, D_seg);
                 upload(d_cent_seg.get(), cent_seg.data(), K * D_seg);
 
+                if (has_byte_layout_) {
+                    // Heterogeneous widths: per-dim nearest-codeword encode to
+                    // a transient code array; bytes are packed after scatter.
+                    if (!d_het_codes_) d_het_codes_ = device_alloc<uint8_t>(N * D_seg);
+                    launch_het_codebook_encode(
+                        d_vec_seg.get(), d_cent_seg.get(), d_cluster_ids.get(),
+                        pool_.segments[seg].codebook_centroids.get(),
+                        d_layout_widths_.get(),
+                        pool_.segments[seg].codebook_entries_per_dim,
+                        d_o_l2norm.get(), d_fac_rescale.get(), d_fac_error.get(), d_ip_cent_oa.get(),
+                        d_het_codes_.get(),
+                        D_seg, N, K,
+                        bdata.cfg.caq_adj_rd_lmt, bdata.cfg.caq_adj_eps);
+                } else {
                 launch_fused_codebook_encode(
                     d_vec_seg.get(), d_cent_seg.get(), d_cluster_ids.get(),
                     pool_.segments[seg].codebook_centroids.get(),
@@ -297,6 +384,7 @@ void GpuIVF::construct(const FloatRowMat& data,
                     d_short_raw.get(), d_long_raw.get(),
                     D_seg, N, K, num_bits, code_max,
                     bdata.cfg.caq_adj_rd_lmt, bdata.cfg.caq_adj_eps);
+                }
             } else {
                 launch_fused_caq_encode_no_rotation(
                     d_vectors.get(), d_centroids_raw_.get(), d_cluster_ids.get(),
@@ -363,9 +451,18 @@ void GpuIVF::construct(const FloatRowMat& data,
                 d_cluster_ids.get(), long_code_bytes, N);
         }
 
+        // Heterogeneous layout: pack per-dim codes into the fused byte layout.
+        if (has_byte_layout_ && seg == 0) {
+            launch_het_pack(
+                d_het_codes_.get(), pool_.segments[seg].fused_codes.get(),
+                d_layout_target_col_.get(), d_layout_shift_.get(), d_layout_widths_.get(),
+                pool_.d_cluster_offsets.get(), pool_.d_block_offsets.get(),
+                d_cluster_ids.get(), N, D_seg, layout_n_bytes_);
+        }
+
         // Byte-fused repack (codebook mode, width dividing 8): byte-aligned
         // codes for the fused decode path, from the just-scattered streams.
-        if (pool_.segments[seg].fused_bytes_per_vec > 0) {
+        if (!has_byte_layout_ && pool_.segments[seg].fused_bytes_per_vec > 0) {
             size_t ncb_groups = ((D_seg / 4) + 3) / 4;
             size_t lwpv = (long_code_bytes + 3) / 4;
             launch_fused_repack(
